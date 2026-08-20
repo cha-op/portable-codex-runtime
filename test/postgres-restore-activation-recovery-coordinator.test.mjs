@@ -22,6 +22,8 @@ import {
   createPostgresDetachedRestoreOperationalLeaseBudget,
 } from "../src/postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
@@ -1800,6 +1802,8 @@ function createTestOperationalLeaseBudget() {
 }
 
 function createPhysicalPublicationBinding(rawPublication, rawLifecycle) {
+  const stateOwnerId = `state-owner:${"a".repeat(64)}`;
+  const supervisorId = "coordinator-physical-supervisor-001";
   const unexpected = async function unexpectedPhysicalProvider() {
     throw new Error("unrelated physical provider must not run");
   };
@@ -1819,12 +1823,25 @@ function createPhysicalPublicationBinding(rawPublication, rawLifecycle) {
       settlementGraceMilliseconds: 1_000,
     }),
     supervisor: Object.freeze({
-      contractVersion: 2,
+      contractVersion:
+        POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
-      supervisorId: "coordinator-physical-supervisor-001",
+      stateOwnerId,
+      supervisorId,
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+    supervisorStateCollectionSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisorStateCollector: Object.freeze({
+      collectTerminalState: unexpected,
+      contractVersion:
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId,
+      supervisorId,
+    }),
   }).publication;
 }
 

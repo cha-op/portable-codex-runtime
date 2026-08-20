@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { readFile } from "node:fs/promises";
+import { mkdtemp, readFile, realpath, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { FilesystemOperationJournal } from "../../../src/filesystem-operation-journal.mjs";
 import {
@@ -10,6 +12,14 @@ import {
 import {
   createPostgresDetachedRestorePlan,
 } from "../../../src/postgres-detached-restore-plan.mjs";
+import {
+  createPodmanWriterSupervisor,
+  createPodmanWriterSupervisorBundle,
+} from "../../../src/podman-writer-supervisor.mjs";
+import {
+  createPodmanWriterSupervisorStateBundle,
+  preparePodmanWriterSupervisorStateOwner,
+} from "../../../src/podman-writer-supervisor-state.mjs";
 import {
   POSTGRES_DETACHED_RESTORE_STABLE_PLAN_PROVISIONING_CONFIRMED,
 } from "../../../src/postgres-detached-restore-stable-plan-registry.mjs";
@@ -40,6 +50,8 @@ const BACKEND_ID = "deployment-capture-only-backend";
 const SESSION_ID = "019f8800-0000-7000-8000-000000000001";
 const THREAD_ID = "019f8800-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"b".repeat(64)}`;
+const SUPERVISOR_ID = "deployment-supervisor-001";
 const OCI_MANIFEST_MEDIA_TYPE =
   "application/vnd.oci.image.manifest.v1+json";
 const OCI_CONFIG_MEDIA_TYPE =
@@ -53,6 +65,7 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../../../migrations/authority/006-writer-stop-capture-handoff.sql", import.meta.url),
   new URL("../../../migrations/authority/007-detached-restore-stable-plans.sql", import.meta.url),
   new URL("../../../migrations/authority/008-filesystem-image-provider-heads.sql", import.meta.url),
+  new URL("../../../migrations/authority/009-writer-supervisor-state-gc.sql", import.meta.url),
 ]);
 const LIFECYCLE_PHYSICAL_METHODS = Object.freeze([
   "captureCheckpoint",
@@ -76,6 +89,69 @@ const SUPERVISOR_PHYSICAL_METHODS = Object.freeze([
   "reconcileWriterLaunch",
   "stopWriter",
 ]);
+
+let deploymentSupervisorFixture = null;
+
+function supervisorOptions(parent, stateBundle, bundled) {
+  const options = {
+    configuredAttachmentRoot: parent,
+    images: Object.freeze({
+      [IMAGE_DIGEST]: Object.freeze({
+        architecture: "amd64",
+        codexVersion: "0.0.0-test",
+        imageReference: `localhost/portable-codex@${IMAGE_DIGEST}`,
+        os: "linux",
+      }),
+    }),
+    podmanEnvironment: Object.freeze({
+      HOME: "/var/empty/podman",
+      XDG_RUNTIME_DIR: "/run/user/1000",
+    }),
+    podmanExecutable: "/usr/bin/podman",
+    supervisorId: SUPERVISOR_ID,
+    writerCommand: Object.freeze(["/usr/local/bin/codex", "app-server"]),
+    writerEnvironment: Object.freeze({
+      CODEX_HOME: "/session/.codex",
+      LANG: "C.UTF-8",
+    }),
+  };
+  if (bundled) {
+    options.stateBundle = stateBundle;
+  } else {
+    options.state = stateBundle.state;
+    options.stateOwnerId = stateBundle.stateOwnerId;
+  }
+  return Object.freeze(options);
+}
+
+function supervisorBundle(parent, stateBundle) {
+  return createPodmanWriterSupervisorBundle(
+    supervisorOptions(parent, stateBundle, true),
+  );
+}
+
+async function prepareDeploymentSupervisorFixture() {
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "postgres-deployment-supervisor-"),
+  );
+  const stateRoot = join(parent, "state");
+  try {
+    const owner = await preparePodmanWriterSupervisorStateOwner({
+      expectedStateOwnerId: null,
+      root: stateRoot,
+    });
+    const stateBundle = createPodmanWriterSupervisorStateBundle({ owner });
+    return Object.freeze({
+      bundle: supervisorBundle(parent, stateBundle),
+      parent,
+      stateBundle,
+      stateRoot,
+    });
+  } catch (error) {
+    await rm(parent, { force: true, recursive: true });
+    throw error;
+  }
+}
 
 function exactKeys(value, expected) {
   assert.deepEqual(Reflect.ownKeys(value).sort(), [...expected].sort());
@@ -243,13 +319,14 @@ function physicalPolicyFixture() {
     publicationSettlement: physicalPolicyGroup(PUBLICATION_PHYSICAL_METHODS),
     resolveRestoreDestinationSettlement: physicalPolicy(),
     supervisorSettlement: physicalPolicyGroup(SUPERVISOR_PHYSICAL_METHODS),
+    supervisorStateCollectionSettlement: physicalPolicy(),
   };
   assert.equal(
     Object.values(fixture)
       .flatMap((group) =>
         "deadlineMilliseconds" in group ? [group] : Object.values(group),
       ).length,
-    19,
+    20,
   );
   return fixture;
 }
@@ -258,6 +335,7 @@ function deploymentPhysicalPolicyLeaves(options) {
   return [
     ...Object.values(options.runtime.launch.imagePlanProviderSettlement),
     ...Object.values(options.runtime.launch.supervisorSettlement),
+    options.runtime.launch.supervisorStateCollectionSettlement,
     ...Object.values(options.runtime.storage.lifecycleBackendSettlement),
     ...Object.values(options.runtime.storage.publicationSettlement),
     options.runtime.storage.resolveRestoreDestinationSettlement,
@@ -278,21 +356,6 @@ function assertPhysicalInvocationContext(context, seen) {
   assert.equal(seen.has(context.invocation), false);
   seen.add(context);
   seen.add(context.invocation);
-}
-
-function assertSupervisorPhysicalRequest(input, seen) {
-  assert.equal(Object.getPrototypeOf(input), null);
-  assert.equal(Object.isFrozen(input), true);
-  assert.equal(input.contractVersion, 2);
-  assert.equal(Object.getPrototypeOf(input.invocation), null);
-  assert.equal(Object.isFrozen(input.invocation), true);
-  assert.deepEqual(Reflect.ownKeys(input.invocation), []);
-  assert(input.signal instanceof AbortSignal);
-  assert.equal(input.signal.aborted, false);
-  assert.equal(seen.has(input.invocation), false);
-  assert.equal(seen.has(input.signal), false);
-  seen.add(input.invocation);
-  seen.add(input.signal);
 }
 
 function unexpected(calls, key) {
@@ -357,6 +420,7 @@ function publication(calls) {
 }
 
 function validOptions() {
+  assert.notEqual(deploymentSupervisorFixture, null);
   const calls = {
     fleetGate: 0,
     image: 0,
@@ -378,9 +442,6 @@ function validOptions() {
     planGateOverride: null,
     resolverInputs: [],
     resolveRestoreDestinationOverride: null,
-    supervisorContexts: [],
-    supervisorLaunchOverride: null,
-    supervisorReconcileOverride: null,
   };
   const policies = physicalPolicyFixture();
   const options = {
@@ -461,43 +522,12 @@ function validOptions() {
         }),
         imagePlanProviderSettlement: policies.imagePlanProviderSettlement,
         stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
-        supervisor: Object.freeze({
-          contractVersion: 2,
-          async launchWriter(input) {
-            calls.supervisor += 1;
-            assert.equal(arguments.length, 1);
-            assertSupervisorPhysicalRequest(
-              input,
-              controls.physicalInvocationContexts,
-            );
-            controls.supervisorContexts.push({
-              input,
-              method: "launchWriter",
-            });
-            if (controls.supervisorLaunchOverride !== null) {
-              return controls.supervisorLaunchOverride(input);
-            }
-            throw new Error("supervisor launch must not run");
-          },
-          async reconcileWriterLaunch(input) {
-            calls.supervisor += 1;
-            assert.equal(arguments.length, 1);
-            assertSupervisorPhysicalRequest(
-              input,
-              controls.physicalInvocationContexts,
-            );
-            controls.supervisorContexts.push({
-              input,
-              method: "reconcileWriterLaunch",
-            });
-            if (controls.supervisorReconcileOverride !== null) {
-              return controls.supervisorReconcileOverride(input);
-            }
-            throw new Error("supervisor reconcile must not run");
-          },
-          supervisorId: "deployment-supervisor-001",
-        }),
+        supervisor: deploymentSupervisorFixture.bundle.supervisor,
         supervisorSettlement: policies.supervisorSettlement,
+        supervisorStateCollectionSettlement:
+          policies.supervisorStateCollectionSettlement,
+        supervisorStateCollector:
+          deploymentSupervisorFixture.bundle.supervisorStateCollector,
       },
       operationalLease: {
         databaseRequestMilliseconds: 30_000,
@@ -520,6 +550,7 @@ function validOptions() {
           currentLaunch: 1,
           generation: 1,
           launchAttempt: 1,
+          supervisorStateGc: 1,
         },
         onStep() {
           calls.onStep += 1;
@@ -919,7 +950,7 @@ async function zeroIoAndLifecycle() {
       assert.equal(client.listenerCount("error"), 1);
     }
   }
-  assert.equal(fakePgState().cursors.size, 4);
+  assert.equal(fakePgState().cursors.size, 5);
   assert.equal(calls.onStep >= 1, true);
   for (const key of ["image", "provider", "publication", "supervisor"]) {
     assert.equal(calls[key], 0);
@@ -1282,7 +1313,7 @@ async function hostileOptions() {
     options.postgres.timeouts.queryMilliseconds = value;
     cases.push(options);
   }
-  for (let leafIndex = 0; leafIndex < 19; leafIndex += 1) {
+  for (let leafIndex = 0; leafIndex < 20; leafIndex += 1) {
     for (const field of [
       "deadlineMilliseconds",
       "settlementGraceMilliseconds",
@@ -1368,6 +1399,26 @@ async function exactPhysicalConfigRejection() {
   }
   {
     const { options } = validOptions();
+    options.runtime.launch.supervisorStateCollector = Object.freeze({
+      ...options.runtime.launch.supervisorStateCollector,
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    });
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
+    options.runtime.launch.supervisor = Object.freeze({
+      ...options.runtime.launch.supervisor,
+      stateOwnerId: options.runtime.recovery.recoveryScopeId,
+    });
+    options.runtime.launch.supervisorStateCollector = Object.freeze({
+      ...options.runtime.launch.supervisorStateCollector,
+      stateOwnerId: options.runtime.recovery.recoveryScopeId,
+    });
+    cases.push(options);
+  }
+  {
+    const { options } = validOptions();
     options.runtime.storage.extra = true;
     cases.push(options);
   }
@@ -1414,6 +1465,81 @@ async function exactPhysicalConfigRejection() {
     );
     assert.equal(fakePgState().pools.length, before, `case ${index}`);
   }
+}
+
+function assertSupervisorBundlePairRejected(supervisor, supervisorStateCollector) {
+  configureFakePg();
+  const { calls, options } = validOptions();
+  options.runtime.launch.supervisor = supervisor;
+  options.runtime.launch.supervisorStateCollector = supervisorStateCollector;
+  const before = fakePgState().pools.length;
+  assert.throws(
+    () => createPostgresDetachedRestoreDeployment(options),
+    (error) =>
+      assertDeploymentError(
+        error,
+        "invalid_postgres_detached_restore_deployment_options",
+      ),
+  );
+  assertNoConstructionEffects(calls, before);
+}
+
+async function acceptSupervisorBundlePair(supervisor, supervisorStateCollector) {
+  configureFakePg();
+  const { calls, options } = validOptions();
+  options.runtime.launch.supervisor = supervisor;
+  options.runtime.launch.supervisorStateCollector = supervisorStateCollector;
+  const deployment = createPostgresDetachedRestoreDeployment(options);
+  assert.equal(fakePgState().pools.length, 4);
+  assertStatusReceipt(await deployment.stop(), "stopped");
+  assert.equal(calls.supervisor, 0);
+}
+
+async function supervisorBundleProvenance() {
+  const fixture = deploymentSupervisorFixture;
+  assert.notEqual(fixture, null);
+  const first = fixture.bundle;
+  await acceptSupervisorBundlePair(
+    first.supervisor,
+    first.supervisorStateCollector,
+  );
+
+  const direct = createPodmanWriterSupervisor(
+    supervisorOptions(fixture.parent, fixture.stateBundle, false),
+  );
+  assertSupervisorBundlePairRejected(
+    direct,
+    first.supervisorStateCollector,
+  );
+  assertSupervisorBundlePairRejected(
+    Object.freeze({ ...first.supervisor }),
+    Object.freeze({ ...first.supervisorStateCollector }),
+  );
+
+  const restartedOwner = await preparePodmanWriterSupervisorStateOwner({
+    expectedStateOwnerId: fixture.stateBundle.stateOwnerId,
+    root: fixture.stateRoot,
+  });
+  const restartedStateBundle = createPodmanWriterSupervisorStateBundle({
+    owner: restartedOwner,
+  });
+  const restarted = supervisorBundle(fixture.parent, restartedStateBundle);
+  assert.equal(
+    restarted.supervisor.stateOwnerId,
+    first.supervisor.stateOwnerId,
+  );
+  assertSupervisorBundlePairRejected(
+    first.supervisor,
+    restarted.supervisorStateCollector,
+  );
+  assertSupervisorBundlePairRejected(
+    restarted.supervisor,
+    first.supervisorStateCollector,
+  );
+  await acceptSupervisorBundlePair(
+    restarted.supervisor,
+    restarted.supervisorStateCollector,
+  );
 }
 
 async function exactOperationalLeaseConfigRejection() {
@@ -2348,6 +2474,7 @@ const scenarios = Object.freeze({
   "partial-construction-failure": partialConstructionFailure,
   "stop-waits-for-pool-acknowledgements":
     stopWaitsForPoolAcknowledgements,
+  "supervisor-bundle-provenance": supervisorBundleProvenance,
   "stop-during-topology-never-reopens-ingress":
     stopDuringTopologyNeverReopensIngress,
   "synchronous-connect-pool-error-uses-assigned-start-promise":
@@ -2365,8 +2492,15 @@ const name = process.argv[2];
 if (name !== undefined) {
   assert.equal(typeof scenarios[name], "function", `unknown scenario ${name}`);
   await Promise.all(MIGRATION_URLS.map((url) => readFile(url, "utf8")));
-  await scenarios[name]();
-  process.stdout.write(
-    `${JSON.stringify({ scenario: name, status: "passed" })}\n`,
-  );
+  deploymentSupervisorFixture = await prepareDeploymentSupervisorFixture();
+  try {
+    await scenarios[name]();
+    process.stdout.write(
+      `${JSON.stringify({ scenario: name, status: "passed" })}\n`,
+    );
+  } finally {
+    const { parent } = deploymentSupervisorFixture;
+    deploymentSupervisorFixture = null;
+    await rm(parent, { force: true, recursive: true });
+  }
 }

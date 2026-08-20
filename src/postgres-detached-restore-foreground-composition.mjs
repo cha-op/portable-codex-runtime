@@ -100,6 +100,7 @@ const OPTION_KEYS = objectFreeze([
   "operationGuard",
   "resolveStablePlan",
   "restoreActivationCoordinator",
+  "stateOwnerId",
   "writerDetach",
 ]);
 const PROBE_KEYS = objectFreeze(["assertHeld"]);
@@ -163,6 +164,7 @@ const RESERVATION_IDENTITY_KEYS = objectFreeze([
 ]);
 const MAX_PROTOTYPE_DEPTH = 12;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const regexpExecIntrinsic = RegExp.prototype.exec;
 const StringConstructor = String;
 const MAX_DATA_DEPTH = 32;
@@ -427,6 +429,14 @@ function regexpTest(pattern, value) {
 
 function opaqueId(value, code) {
   ensure(typeof value === "string" && regexpTest(OPAQUE_ID_PATTERN, value), code);
+  return value;
+}
+
+function canonicalStateOwnerId(value, code) {
+  ensure(
+    typeof value === "string" && regexpTest(STATE_OWNER_ID_PATTERN, value),
+    code,
+  );
   return value;
 }
 
@@ -1341,11 +1351,16 @@ function normalizeLaunchReceipt(value, plan, code) {
   });
 }
 
-async function readLaunchOptional(authority, plan, code) {
+async function readLaunchOptional(authority, plan, stateOwnerId, code) {
   const settled = await invokeForRead(
     authority,
     "readWriterLaunchAttempt",
-    [exactFrozenRecord({ operationId: plan.launchAttemptId })],
+    [
+      exactFrozenRecord({
+        operationId: plan.launchAttemptId,
+        stateOwnerId,
+      }),
+    ],
     code,
   );
   if (settled.ok) return normalizeLaunchReceipt(settled.value, plan, code);
@@ -3108,7 +3123,12 @@ async function executeForegroundRestore(
     plan,
     code,
   );
-  const launch = await readLaunchOptional(bindings.authority, plan, code);
+  const launch = await readLaunchOptional(
+    bindings.authority,
+    plan,
+    bindings.stateOwnerId,
+    code,
+  );
   let detachedSession;
   if (activation !== null || launch !== null) {
     ensure(activation !== null, code);
@@ -3142,6 +3162,7 @@ async function executeForegroundRestore(
 }
 
 function createBindings(options, code) {
+  const stateOwnerId = canonicalStateOwnerId(options.stateOwnerId, code);
   ensure(isPostgresRestoreLifecycleGuard(options.lifecycleGuard), code);
   ensure(isPostgresOperationGuard(options.operationGuard), code);
   ensure(
@@ -3197,6 +3218,7 @@ function createBindings(options, code) {
       ACTIVATION_COORDINATOR_METHODS,
       code,
     ),
+    stateOwnerId,
     writerDetach: collaborator(options.writerDetach, WRITER_DETACH_METHODS, code),
   });
 }

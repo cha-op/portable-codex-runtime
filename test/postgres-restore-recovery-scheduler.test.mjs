@@ -29,6 +29,7 @@ const LANE_SPECS = Object.freeze([
   Object.freeze({ field: "activation", lane: "activation" }),
   Object.freeze({ field: "launchAttempt", lane: "launch-attempt" }),
   Object.freeze({ field: "currentLaunch", lane: "current-launch" }),
+  Object.freeze({ field: "supervisorStateGc", lane: "supervisor-state-gc" }),
 ]);
 
 function freezeRecord(value) {
@@ -275,7 +276,7 @@ function generationCandidate() {
 }
 
 function cursor(lane, overrides = {}) {
-  return freezeRecord({
+  const value = {
     recoveryScopeId: RECOVERY_SCOPE_ID,
     lane,
     afterSessionId: null,
@@ -284,8 +285,17 @@ function cursor(lane, overrides = {}) {
     lastTransitionId: null,
     lastRequestSha256: null,
     updatedAt: UPDATED_AT,
-    ...overrides,
-  });
+  };
+  if (lane === "supervisor-state-gc") {
+    value.afterAuthorizedAt = null;
+    value.afterTerminalOperationId = null;
+  }
+  const merged = { ...value, ...overrides };
+  if (lane !== "supervisor-state-gc") {
+    delete merged.afterAuthorizedAt;
+    delete merged.afterTerminalOperationId;
+  }
+  return freezeRecord(merged);
 }
 
 function createCursorStore({ failFirstRead = false } = {}) {
@@ -307,7 +317,10 @@ function createCursorStore({ failFirstRead = false } = {}) {
       calls.push(["advance", input]);
       const before = state.get(input.lane);
       const next = cursor(input.lane, {
+        afterAuthorizedAt: input.nextAfterAuthorizedAt ?? null,
         afterSessionId: input.nextAfterSessionId,
+        afterTerminalOperationId:
+          input.nextAfterTerminalOperationId ?? null,
         cycle:
           input.nextAfterSessionId === null
             ? `${BigInt(before.cycle) + 1n}`
@@ -345,6 +358,18 @@ function createService({ generationPage = null, reconcileGeneration } = {}) {
       calls.push(["list:launchAttempt", input]);
       return { candidates: [], nextAfterSessionId: null };
     },
+    listWriterSupervisorStateGcCandidates(input) {
+      calls.push(["list:supervisorStateGc", input]);
+      return {
+        candidates: [],
+        nextAfterAuthorizedAt: null,
+        nextAfterSessionId: null,
+        nextAfterTerminalOperationId: null,
+      };
+    },
+    collectWriterSupervisorStateGc(candidate) {
+      calls.push(["collect:supervisorStateGc", candidate]);
+    },
     reconcileRestoreAttachmentActivation(candidate) {
       calls.push(["reconcile:activation", candidate]);
     },
@@ -372,6 +397,7 @@ function createRunnerFixture({
       currentLaunch: 1,
       generation: 1,
       launchAttempt: 1,
+      supervisorStateGc: 1,
     },
     recoveryScopeId: RECOVERY_SCOPE_ID,
     recoveryService: serviceFixture.service,
@@ -630,7 +656,7 @@ test("stop joins an explicit step admitted while the loop waits", async () => {
   assert.equal(
     runnerFixture.cursorFixture.calls.filter(([kind]) => kind === "advance")
       .length,
-    5,
+    6,
   );
 });
 

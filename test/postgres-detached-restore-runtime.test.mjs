@@ -14,11 +14,13 @@ import {
   isPostgresDetachedRestoreOperationalLeaseBudget,
 } from "../src/postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
 import {
-  LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+  LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
@@ -58,6 +60,8 @@ const SOURCE_STORAGE_ID = "source-storage-001";
 const DESTINATION_STORAGE_ID = "destination-storage-001";
 const CHECKPOINT_ID = "checkpoint-001";
 const ARTIFACT_ID = "artifact-001";
+const STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"b".repeat(64)}`;
 const RUNTIME_OPTION_ERROR =
   "invalid_postgres_detached_restore_runtime_composition_options";
 const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
@@ -219,6 +223,7 @@ function createTestOperationalLeaseBudget() {
 }
 
 function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
+  const supervisorId = "runtime-physical-supervisor-001";
   const lifecycleBackend = Object.freeze({
     ...rawLifecycle,
     physicalInvocationContractVersion: 1,
@@ -240,12 +245,25 @@ function createTestPhysicalBindings(calls, rawPublication, rawLifecycle) {
       settlementGraceMilliseconds: 1_000,
     }),
     supervisor: Object.freeze({
-      contractVersion: 2,
+      contractVersion:
+        POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
-      supervisorId: "runtime-physical-supervisor-001",
+      stateOwnerId: STATE_OWNER_ID,
+      supervisorId,
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+    supervisorStateCollectionSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisorStateCollector: Object.freeze({
+      collectTerminalState: unexpected,
+      contractVersion:
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId: STATE_OWNER_ID,
+      supervisorId,
+    }),
   });
 }
 
@@ -418,7 +436,7 @@ function createRuntimeFixture() {
   );
   const stoppedWriterCoordinator = new StoppedWriterCapabilityCoordinator();
   const supervisor = Object.freeze({
-    contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+    contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
     async launchWriter() {
       calls.supervisor += 1;
       throw new Error("writer supervisor must not launch");
@@ -427,7 +445,20 @@ function createRuntimeFixture() {
       calls.supervisor += 1;
       throw new Error("writer supervisor must not reconcile");
     },
+    stateOwnerId: STATE_OWNER_ID,
     supervisorId: "runtime-supervisor-001",
+  });
+  const supervisorStateCollector = Object.freeze({
+    collectTerminalState: Object.freeze(
+      async function collectTerminalState() {
+        calls.supervisor += 1;
+        throw new Error("writer supervisor state collector must not run");
+      },
+    ),
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    stateOwnerId: STATE_OWNER_ID,
+    supervisorId: supervisor.supervisorId,
   });
   const options = {
     authority: {
@@ -447,6 +478,7 @@ function createRuntimeFixture() {
       imagePlanBinding,
       stoppedWriterCoordinator,
       supervisor,
+      supervisorStateCollector,
     },
     pools,
     planRegistry: {
@@ -463,6 +495,7 @@ function createRuntimeFixture() {
         currentLaunch: 1,
         generation: 1,
         launchAttempt: 1,
+        supervisorStateGc: 1,
       },
       onStep() {
         calls.onStep += 1;
@@ -495,6 +528,7 @@ function createRuntimeFixture() {
       publication,
       stoppedWriterCoordinator,
       supervisor,
+      supervisorStateCollector,
     },
     options,
     pools,
@@ -1029,6 +1063,67 @@ test("runtime leaves lifecycle and pool shutdown ownership with the caller", asy
 });
 
 test("runtime composition rejects hostile options without leaking hostile behavior", async (t) => {
+  await t.test("supervisor and collector state owners differ", () => {
+    const fixture = createRuntimeFixture();
+    const supervisorStateCollector = Object.freeze({
+      ...fixture.options.launch.supervisorStateCollector,
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    });
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          launch: {
+            ...fixture.options.launch,
+            supervisorStateCollector,
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
+  await t.test("foreground cannot override the configured state owner", () => {
+    const fixture = createRuntimeFixture();
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          foreground: {
+            ...fixture.options.foreground,
+            stateOwnerId: OTHER_STATE_OWNER_ID,
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
+  await t.test("recovery scope cannot substitute for a state owner", () => {
+    const fixture = createRuntimeFixture();
+    const supervisor = Object.freeze({
+      ...fixture.options.launch.supervisor,
+      stateOwnerId: fixture.options.recovery.recoveryScopeId,
+    });
+    const supervisorStateCollector = Object.freeze({
+      ...fixture.options.launch.supervisorStateCollector,
+      stateOwnerId: fixture.options.recovery.recoveryScopeId,
+    });
+    assert.throws(
+      () =>
+        createPostgresDetachedRestoreRuntimeComposition({
+          ...fixture.options,
+          launch: {
+            ...fixture.options.launch,
+            supervisor,
+            supervisorStateCollector,
+          },
+        }),
+      runtimeOptionError,
+    );
+    assertNoActivity(fixture);
+  });
+
   await t.test("forged operational lease budget", () => {
     const fixture = createRuntimeFixture();
     assert.throws(

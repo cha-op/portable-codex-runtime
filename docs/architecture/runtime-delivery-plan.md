@@ -270,7 +270,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      republishes, reserves or consumes an image, invokes a launcher, or
      reconstructs an opaque writer capability.
 8. **Production restore adapter enablement (complete)**
-   - The durable four-lane recovery cursor prerequisite is complete: one
+   - The durable five-lane recovery cursor prerequisite is complete: one
      PostgreSQL row per recovery scope and lane persists keyset position,
      cycle, revision, and exact transition replay evidence. A bounded runner
      processes the lanes in order and commits each settled continuation before
@@ -310,7 +310,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      retired only after the exact predetermined committed result returns.
    - The cross-process restore lifecycle guard and recovery scheduler are
      complete. One database-global versioned advisory-lock identity gives
-     foreground work a shared lease and each bounded four-lane pass an
+     foreground work a shared lease and each bounded five-lane pass an
      exclusive lease. The runner and service revalidate that lease at their
      lane, candidate, and cursor boundaries. Startup runs one immediate pass;
      later fixed-delay ticks do not overlap, and shutdown drains admitted
@@ -350,6 +350,36 @@ Restore and launcher authority are now split into eight serial pull requests:
      scheduler lifecycle action, provider action, or pool close. Its public
      backend remains a low-level uncontrolled capability until claimed by the
      controller.
+   - The assembled runtime now treats local supervisor state as an explicit
+     routed resource. Supervisor and collector exact surfaces carry the same
+     persistent high-entropy `stateOwnerId` from the private state-root marker;
+     matching strings are necessary but not sufficient in production.
+     Deployment requires the exact process-local pair returned by
+     `createPodmanWriterSupervisorBundle()` before constructing the physical
+     adapter. First owner preparation writes and syncs a complete canonical
+     marker in a unique same-parent staging directory, atomically renames that
+     directory to the final root, then revalidates and repeats the file, root,
+     and parent barriers. A pre-rename crash leaves only inert staging debris;
+     a post-rename or lost-ack retry adopts only the complete exact marker.
+     Existing malformed or unmarked final roots remain fail-closed. Owner
+     preparation and state/supervisor bundle construction fail closed before
+     physical dispatch; direct
+     `createPodmanWriterSupervisor()` carries only a caller-asserted owner and
+     cannot satisfy that deployment boundary.
+     Private list wrappers inject that owner into the third launch-attempt and
+     fifth supervisor-state-GC authority queries, so neither external lane can
+     select a foreign root. Runtime derives the actual cursor scope with
+     domain-separated SHA-256 over the caller's base `recoveryScopeId` and the
+     owner marker: equal base labels remain isolated across roots, while a
+     same-root restart is stable. The base label is not reused as owner.
+     The first four lanes retain scalar session cursors. The fifth lane stores
+     the full `(sessionId, authorizedAt, terminalOperationId)` boundary and may
+     process several items from one session in one bounded page. A pending item
+     advances only the current cycle, so later same-session work is not hidden
+     and the item is retried after wrap.
+     Runtime fixes the same owner into its private foreground composition, whose
+     launch-attempt read uses exact `{ operationId, stateOwnerId }`; public
+     restore admission has no owner selector.
    - The PostgreSQL durable stable-plan registry slice is complete. Migration
      7 adds immutable canonical admission and plan storage plus a permanent
      operation-ID claim. Separately gated provisioning performs insert or
@@ -367,7 +397,7 @@ Restore and launcher authority are now split into eight serial pull requests:
      capability for the deployment lifecycle owner.
    - The deployment controller now performs migration before serving, starts
      the scheduler, requires its immediate coalesced pass to prove a complete
-     four-lane sweep, and only then opens the gated checkpoint backend, image-plan-
+     five-lane sweep, and only then opens the gated checkpoint backend, image-plan-
      reservation, stable-plan, and writer-launch facets. Stop closes
      admission, stops the scheduler, and drains all accepted calls without
      closing the four borrowed pools.
@@ -411,11 +441,41 @@ Restore and launcher authority are now split into eight serial pull requests:
      activation request/result version 1 and the schema are unchanged.
    - The complete currently assembled physical graph now has deployment-owned
      method-specific settlement: supervisor launch/reconcile/returned stop,
-     nine storage-lifecycle calls, four publication calls, and restore-
-     destination resolution, in addition to the two image-provider calls.
+     `supervisorStateCollector.collectTerminalState`, nine storage-lifecycle
+     calls, four publication calls, and restore-destination resolution, in
+     addition to the two image-provider calls.
      Transient invocation context never enters durable records. Deployment
-     stops all nineteen boundaries before pool closure, and any failed drain is
+     stops all twenty boundaries before pool closure, and any failed drain is
      a sticky failed deployment rather than proof of physical quiescence.
+     The destructive supervisor-state collector additionally retains its
+     invocation and aggregate stop after a fatal grace breach until the raw
+     native Promise settles. Its fifth recovery lane therefore keeps the
+     database-global exclusive lifecycle lease during normal operation.
+     Connection or database loss may release that advisory lease without
+     proving callback quiescence; a same-authorization cold overlap then relies
+     on exact concurrent idempotent-or-fail-closed collection.
+     The raw Podman/physical supervisor, physical facade, logical supervisor,
+     logical reconcile receipt, collection surface/receipt, and aggregate
+     binding are versions 5, 4, 4, 2, 2, and 4. The raw launch receipt remains
+     version 2, while the raw reconciliation receipt is now version 2.
+     Migration 009 binds each
+     launch attempt immutably to its local owner before dispatch; GC
+     authorization/request/receipt repeat the marker and completion rechecks it.
+     Updates to that owner route are forbidden, and its deferred delete guard
+     permits removal only with same-transaction teardown of the permanent
+     operation-ID claim, preventing delete-and-reinsert ownership transfer.
+     The durable launch request remains version 1. Migration 009 refuses any
+     legacy `starting`/`uncertain` launch and any non-null session current-launch
+     pointer regardless of its shape or referential validity, thereby requiring
+     a committed current launch to be stopped or physically fenced before
+     rollout and its current-launch pointer to be cleared. It then uses a
+     deferred database constraint to keep an already-running old binary from
+     committing an ownerless dispatch. Only unbound prepared work remains
+     owner-neutral for read/cancel cleanup;
+     historical unbound terminal work that is no longer current receives no new
+     GC or adoption authority. The marker is routing
+     identity, not cryptographic host attestation or protection against an
+     administrator cloning the root and marker together.
    - Operational lease admission is now complete. Deployment derives separate
      renewal-to-generation-claim and activation-to-launch-claim bounds from the
      applicable method-specific deadline plus grace periods, an explicit
@@ -423,15 +483,23 @@ Restore and launcher authority are now split into eight serial pull requests:
      two independently minted leases use the maximum window rather than a sum;
      stable-plan provisioning and every resolution enforce the same exact
      configured duration before physical work.
-   - The completed assembled safety-matrix slice classifies the nineteen physical
-     contracts before claiming coverage. Fourteen belong to the private
-     protocol surface: seven grant-bearing mutators and seven repeatable read-only
-     resolver, verifier, inspector, or reconciler observations. The other five
-     generic lifecycle methods remain contract-only in this saga. Its evidence
-     combines seven real-PostgreSQL durable-cut/commit-acknowledgement-loss paths
-     with a same-database/stable-plan retry through fresh physical bindings,
-     image binding, runtime, and controller plus separate stable-plan-registry
-     rehydration. Settlement evidence remains layered: the foundation
+   - The completed version 2 assembled safety-matrix slice classifies the twenty
+     physical contracts before claiming coverage. Fifteen belong to the private
+     protocol surface: nine mutators and six repeatable read-only resolver,
+     verifier, inspector, or observer-only reconciliation leaves. The
+     supervisor-state collector retains cut
+     `supervisor-state-gc`, durable key
+     `authorization.terminalOperationId`, and independent overlay
+     `supervisor-state-mutator`. The complete
+     `supervisor.reconcileWriterLaunch` leaf is conservatively the ninth mutator
+     in `supervisor-mutator`, with cut `writer-launch-retirement` and durable key
+     `attempt.launchAttemptId`; the matrix now has nine durable cuts and six
+     overlays. The other five generic lifecycle methods remain contract-only in
+     this saga. Its evidence combines nine real-PostgreSQL durable-cut/commit-
+     acknowledgement-loss paths with a same-database/stable-plan retry through
+     fresh physical bindings, image binding, runtime, and controller plus
+     separate stable-plan-registry rehydration. Settlement evidence remains
+     layered: the foundation
      proves aggregate stop ownership and representative deadline/grace
      semantics, while deployment fake-PostgreSQL scenarios exercise the image
      boundary, late settlement, abort/drain, fatal grace breach, and zero calls
@@ -442,12 +510,21 @@ Restore and launcher authority are now split into eight serial pull requests:
      whole-saga deployment restart, operating-system `SIGKILL`, or fake-
      PostgreSQL execution of all five collaborator families.
    - The no-second-dispatch property is scoped by authority. One settlement
-     invocation is never automatically retried; a durable mutator is dispatched
-     at most once for its operation grant. Trusted image observations,
-     destination resolution, committed verifiers, and stopped-only
-     reconciliation may repeat in a separate recovery attempt, but cannot mint
-     a grant. A fresh image reservation is therefore permitted for the same
-     fixed prepared plan and is not mutation replay.
+     invocation is never automatically retried, and the seven one-shot mutators
+     remain at-most-once for their operation grants. Exact revision 4 cold
+     retirement may repeat only idempotent removal plus the same name/ID absence
+     proofs while the record remains durable. It returns the terminal record and
+     uses the owner-bound GC finalizer only after both proofs. Ambiguous removal,
+     proof, adaptation, or a pre-commit finalizer failure preserves revision 4
+     and commits no database finalization. A post-COMMIT acknowledgement loss
+     may instead follow an atomic commit of the operation and owner-bound GC
+     authorization; exact authorization readback determines whether that commit
+     exists. Revision 4 remains until the authorized collector removes it in
+     either case. Observer-only reconciliation remains null-record and no-GC.
+     Trusted image observations, destination resolution, and committed
+     verifiers may repeat in a separate recovery attempt but cannot mint a grant.
+     A fresh image reservation is therefore permitted for the same fixed
+     prepared plan and is not mutation replay.
    - The final public restore-capable backend is complete. Runtime assembly
      keeps the capture backend private, constructs a second immutable backend
      after foreground composition, and binds its restore authority without a

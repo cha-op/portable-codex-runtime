@@ -7,11 +7,14 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import {
+  PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-  createPodmanWriterSupervisor,
+  createPodmanWriterSupervisorBundle,
 } from "../src/podman-writer-supervisor.mjs";
 import {
-  createPodmanWriterSupervisorState,
+  assertPodmanWriterSupervisorStateRecord,
+  createPodmanWriterSupervisorStateBundle,
+  preparePodmanWriterSupervisorStateOwner,
 } from "../src/podman-writer-supervisor-state.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -2295,8 +2298,14 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     });
     await mkdir(ROOT, { mode: 0o700 });
     await mkdir(attachmentRoot, { mode: 0o700 });
-    const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
-    supervisorState = state;
+    const stateOwner = await preparePodmanWriterSupervisorStateOwner(exact({
+      expectedStateOwnerId: null,
+      root: stateRoot,
+    }));
+    const stateBundle = createPodmanWriterSupervisorStateBundle(exact({
+      owner: stateOwner,
+    }));
+    supervisorState = stateBundle.state;
     const options = exact({
       commandTimeoutMilliseconds: 30_000,
       configuredAttachmentRoot: ROOT,
@@ -2311,14 +2320,34 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       maxOutputBytes: 1024 * 1024,
       podmanEnvironment,
       podmanExecutable: PODMAN,
-      state,
+      stateBundle,
       stopTimeoutSeconds: 10,
       supervisorId: SUPERVISOR_ID,
       writerCommand: Object.freeze(["/usr/local/bin/writer"]),
       writerEnvironment: exact({ LANG: "C.UTF-8" }),
     });
     const input = launchInput(attachmentRoot);
-    const supervisor = createPodmanWriterSupervisor(options);
+    const { supervisor, supervisorStateCollector } =
+      createPodmanWriterSupervisorBundle(options);
+    assert.deepEqual(Reflect.ownKeys(supervisor), [
+      "contractVersion",
+      "launchWriter",
+      "reconcileWriterLaunch",
+      "stateOwnerId",
+      "supervisorId",
+    ]);
+    assert.deepEqual(Reflect.ownKeys(supervisorStateCollector), [
+      "collectTerminalState",
+      "contractVersion",
+      "stateOwnerId",
+      "supervisorId",
+    ]);
+    assert.equal(supervisor.stateOwnerId, stateOwner.stateOwnerId);
+    assert.equal(
+      supervisorStateCollector.stateOwnerId,
+      supervisor.stateOwnerId,
+    );
+    assert.equal(supervisorStateCollector.supervisorId, supervisor.supervisorId);
     const journalBoundary = await captureConmonJournalBoundary();
     phase = "launch";
     startLaunchWatchdog(journalBoundary);
@@ -2333,14 +2362,69 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     assert.equal(markerStat.gid, process.getgid());
     assert.equal(markerStat.mode & 0o7777, 0o600);
     phase = "stop";
-    assert.deepEqual(await receipt.stopWriter(stopInput(input, receipt)), exact({
-      contractVersion: 2,
-      status: "stopped",
+    const stopRequest = stopInput(input, receipt);
+    const stopped = await receipt.stopWriter(stopRequest);
+    assert.deepEqual(Reflect.ownKeys(stopped), [
+      "contractVersion",
+      "status",
+      "terminalRecord",
+    ]);
+    assert.equal(Object.getPrototypeOf(stopped), null);
+    assert.equal(Object.isFrozen(stopped), true);
+    assert.equal(
+      stopped.contractVersion,
+      PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+    );
+    assert.equal(stopped.status, "stopped");
+    const terminalRecord = assertPodmanWriterSupervisorStateRecord(
+      stopped.terminalRecord,
+    );
+    assert.equal(terminalRecord.status, "stopped");
+    assert.equal(terminalRecord.revision, 4);
+    assert.equal(
+      terminalRecord.launchAttemptId,
+      receipt.evidence.launchAttemptId,
+    );
+    assert.equal(terminalRecord.stopOperationId, stopRequest.stopOperationId);
+    assert.equal(
+      terminalRecord.processIncarnationId,
+      receipt.evidence.processIncarnationId,
+    );
+    assert.equal(
+      terminalRecord.writerIncarnationId,
+      receipt.evidence.writerIncarnationId,
+    );
+    assert.equal(terminalRecord.proofId, receipt.evidence.proofId);
+    const restartedOwner = await preparePodmanWriterSupervisorStateOwner(exact({
+      expectedStateOwnerId: stateOwner.stateOwnerId,
+      root: stateRoot,
     }));
-    const restarted = createPodmanWriterSupervisor(options);
+    const restartedStateBundle = createPodmanWriterSupervisorStateBundle(exact({
+      owner: restartedOwner,
+    }));
+    supervisorState = restartedStateBundle.state;
+    const restartedComposition = createPodmanWriterSupervisorBundle(exact({
+      ...options,
+      stateBundle: restartedStateBundle,
+    }));
+    assert.equal(restartedOwner.stateOwnerId, stateOwner.stateOwnerId);
+    assert.equal(
+      restartedComposition.supervisor.stateOwnerId,
+      supervisor.stateOwnerId,
+    );
+    assert.equal(
+      restartedComposition.supervisorStateCollector.stateOwnerId,
+      restartedComposition.supervisor.stateOwnerId,
+    );
+    const restarted = restartedComposition.supervisor;
     phase = "reconcile";
     const reconciled = await restarted.reconcileWriterLaunch(reconcileInput(input));
     assert.equal(reconciled.evidence.status, "complete-stopped");
+    assert.equal(
+      reconciled.receiptVersion,
+      PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+    );
+    assert.deepEqual(reconciled.terminalRecord, terminalRecord);
     phase = "external-ps";
     const retired = await execFileAsync(
       PODMAN,

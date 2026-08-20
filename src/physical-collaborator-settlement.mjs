@@ -469,7 +469,10 @@ function makeInvocation() {
   return objectFreeze(objectCreate(null));
 }
 
-export function createPhysicalCollaboratorSettlement(...args) {
+function createPhysicalCollaboratorSettlementInternal(
+  args,
+  providerSettlementRequired,
+) {
   const optionCode = "invalid_physical_collaborator_settlement_options";
   const requestCode = "invalid_physical_collaborator_settlement_request";
   ensure(args.length === 1, optionCode);
@@ -690,6 +693,10 @@ export function createPhysicalCollaboratorSettlement(...args) {
   }
 
   function breachRecord(record, code) {
+    if (providerSettlementRequired && record.providerPending) {
+      quiesceRecord(record, code);
+      return;
+    }
     if (record.phase === "done" || record.phase === "breached") return;
     const timersCleared = clearRecordTimers(record);
     if (!timersCleared) void clearRecordTimers(record);
@@ -728,6 +735,50 @@ export function createPhysicalCollaboratorSettlement(...args) {
       makeError(code),
     ]);
     maybeCompleteStop();
+  }
+
+  function quiesceRecord(record, code) {
+    if (
+      record.phase === "done" ||
+      record.phase === "breached" ||
+      record.phase === "quiescing"
+    ) {
+      return;
+    }
+    const timersCleared = clearRecordTimers(record);
+    if (!timersCleared) void clearRecordTimers(record);
+    record.phase = "quiescing";
+    terminalFailure = true;
+    if (lifecycle === "running") lifecycle = "failed";
+    let abortSucceeded = true;
+    if (!record.aborted) {
+      try {
+        callIntrinsic(abortControllerAbortIntrinsic, record.controller, []);
+        record.aborted = true;
+      } catch {
+        abortSucceeded = false;
+      }
+    }
+    const failureCode =
+      timersCleared && abortSucceeded
+        ? code
+        : "physical_collaborator_settlement_outcome_uncertain";
+    record.quiescenceCode = failureCode;
+    if (
+      terminalFailureCode === null ||
+      failureCode === "physical_collaborator_settlement_outcome_uncertain"
+    ) {
+      terminalFailureCode = failureCode;
+    }
+    fatalCallbacksInFlight += 1;
+    const fatalSucceeded = invokeFatal(record);
+    fatalCallbacksInFlight -= 1;
+    if (!fatalSucceeded) {
+      record.quiescenceCode =
+        "physical_collaborator_settlement_outcome_uncertain";
+      terminalFailureCode =
+        "physical_collaborator_settlement_outcome_uncertain";
+    }
   }
 
   function recordNow(record) {
@@ -860,6 +911,15 @@ export function createPhysicalCollaboratorSettlement(...args) {
       if (record.phase === "done" || record.phase === "breached") return;
       enforceElapsedBoundaries(record);
       if (record.phase === "done" || record.phase === "breached") return;
+      record.providerPending = false;
+      if (record.phase === "quiescing") {
+        finishRecord(
+          record,
+          record.quiescenceCode ?? "physical_collaborator_no_settlement",
+          null,
+        );
+        return;
+      }
       if (record.phase === "draining") {
         finishRecord(record, "physical_collaborator_late_settlement", null);
         return;
@@ -876,6 +936,15 @@ export function createPhysicalCollaboratorSettlement(...args) {
       if (record.phase === "done" || record.phase === "breached") return;
       enforceElapsedBoundaries(record);
       if (record.phase === "done" || record.phase === "breached") return;
+      record.providerPending = false;
+      if (record.phase === "quiescing") {
+        finishRecord(
+          record,
+          record.quiescenceCode ?? "physical_collaborator_no_settlement",
+          null,
+        );
+        return;
+      }
       finishRecord(
         record,
         record.phase === "draining"
@@ -922,6 +991,8 @@ export function createPhysicalCollaboratorSettlement(...args) {
     record.invocation = invocation;
     record.phase = "accepting";
     record.promise = deferred.promise;
+    record.providerPending = false;
+    record.quiescenceCode = null;
     record.reject = deferred.reject;
     record.resolve = deferred.resolve;
     record.trigger = "deadline";
@@ -961,6 +1032,7 @@ export function createPhysicalCollaboratorSettlement(...args) {
       rejectContractViolation(record);
       return record.promise;
     }
+    record.providerPending = true;
     observeProvider(record, pending);
     enforceElapsedBoundaries(record);
     return record.promise;
@@ -1010,6 +1082,14 @@ export function createPhysicalCollaboratorSettlement(...args) {
   return settlement;
 }
 
+export function createPhysicalCollaboratorSettlement(...args) {
+  return createPhysicalCollaboratorSettlementInternal(args, false);
+}
+
+export function createQuiescentPhysicalCollaboratorSettlement(...args) {
+  return createPhysicalCollaboratorSettlementInternal(args, true);
+}
+
 export function isPhysicalCollaboratorSettlement(value) {
   try {
     return (
@@ -1027,4 +1107,5 @@ export function isPhysicalCollaboratorSettlement(value) {
 objectFreeze(PhysicalCollaboratorSettlementError.prototype);
 objectFreeze(PhysicalCollaboratorSettlementError);
 objectFreeze(createPhysicalCollaboratorSettlement);
+objectFreeze(createQuiescentPhysicalCollaboratorSettlement);
 objectFreeze(isPhysicalCollaboratorSettlement);

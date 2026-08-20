@@ -8,10 +8,12 @@ import { promisify } from "node:util";
 
 import {
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-  createPodmanWriterSupervisor,
+  createPodmanWriterSupervisorBundle,
 } from "../src/podman-writer-supervisor.mjs";
 import {
-  createPodmanWriterSupervisorState,
+  assertPodmanWriterSupervisorStateRecord,
+  createPodmanWriterSupervisorStateBundle,
+  preparePodmanWriterSupervisorStateOwner,
 } from "../src/podman-writer-supervisor-state.mjs";
 
 const READY_MARKER = "ready\n";
@@ -37,6 +39,7 @@ const objectGetOwnPropertyDescriptorIntrinsic =
   Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectHasOwnIntrinsic = Object.hasOwn;
+const objectIsFrozenIntrinsic = Object.isFrozen;
 const objectPrototypeIntrinsic = Object.prototype;
 
 const ROOTLESS_NAMESPACE_CONFIGURATION_KEYS = Object.freeze([
@@ -405,28 +408,54 @@ export async function runExt4PodmanWriterIntegration({
   assert.match(podmanEnvironment.XDG_RUNTIME_DIR, /^\//u);
   const servicePid = process.pid;
   const serviceUid = process.getuid();
-  const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
-  const supervisor = createPodmanWriterSupervisor(exact({
-    commandTimeoutMilliseconds: 30_000,
-    configuredAttachmentRoot,
-    filesystemAuthority,
-    images: exact({
-      [imageDigest]: exact({
-        architecture: "amd64",
-        codexVersion: "1.0.0",
-        imageReference,
-        os: "linux",
-      }),
-    }),
-    maxOutputBytes: 1024 * 1024,
-    podmanEnvironment,
-    podmanExecutable,
-    state,
-    stopTimeoutSeconds: 10,
-    supervisorId: SUPERVISOR_ID,
-    writerCommand: Object.freeze(["/usr/local/bin/writer"]),
-    writerEnvironment: exact({ LANG: "C.UTF-8" }),
+  const stateOwner = await preparePodmanWriterSupervisorStateOwner(exact({
+    expectedStateOwnerId: null,
+    root: stateRoot,
   }));
+  const stateBundle = createPodmanWriterSupervisorStateBundle(exact({
+    owner: stateOwner,
+  }));
+  const { supervisor, supervisorStateCollector } =
+    createPodmanWriterSupervisorBundle(exact({
+      commandTimeoutMilliseconds: 30_000,
+      configuredAttachmentRoot,
+      filesystemAuthority,
+      images: exact({
+        [imageDigest]: exact({
+          architecture: "amd64",
+          codexVersion: "1.0.0",
+          imageReference,
+          os: "linux",
+        }),
+      }),
+      maxOutputBytes: 1024 * 1024,
+      podmanEnvironment,
+      podmanExecutable,
+      stateBundle,
+      stopTimeoutSeconds: 10,
+      supervisorId: SUPERVISOR_ID,
+      writerCommand: Object.freeze(["/usr/local/bin/writer"]),
+      writerEnvironment: exact({ LANG: "C.UTF-8" }),
+    }));
+  assert.deepEqual(reflectOwnKeysIntrinsic(supervisor), [
+    "contractVersion",
+    "launchWriter",
+    "reconcileWriterLaunch",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.deepEqual(reflectOwnKeysIntrinsic(supervisorStateCollector), [
+    "collectTerminalState",
+    "contractVersion",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.equal(supervisor.stateOwnerId, stateOwner.stateOwnerId);
+  assert.equal(
+    supervisorStateCollector.stateOwnerId,
+    supervisor.stateOwnerId,
+  );
+  assert.equal(supervisorStateCollector.supervisorId, supervisor.supervisorId);
   const input = launchInput(attachment, imageDigest);
   const receipt = await supervisor.launchWriter(input);
   assert.equal(process.pid, servicePid);
@@ -441,10 +470,39 @@ export async function runExt4PodmanWriterIntegration({
     assert.equal(marker.gid, process.getgid());
     assert.equal(marker.mode & 0o7777, 0o600);
   } finally {
-    assert.deepEqual(await receipt.stopWriter(stopInput(input, receipt)), exact({
-      contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-      status: "stopped",
-    }));
+    const stopRequest = stopInput(input, receipt);
+    const stopped = await receipt.stopWriter(stopRequest);
+    assert.deepEqual(reflectOwnKeysIntrinsic(stopped), [
+      "contractVersion",
+      "status",
+      "terminalRecord",
+    ]);
+    assert.equal(objectGetPrototypeOfIntrinsic(stopped), null);
+    assert.equal(objectIsFrozenIntrinsic(stopped), true);
+    assert.equal(
+      stopped.contractVersion,
+      PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+    );
+    assert.equal(stopped.status, "stopped");
+    const terminalRecord = assertPodmanWriterSupervisorStateRecord(
+      stopped.terminalRecord,
+    );
+    assert.equal(terminalRecord.status, "stopped");
+    assert.equal(terminalRecord.revision, 4);
+    assert.equal(
+      terminalRecord.launchAttemptId,
+      receipt.evidence.launchAttemptId,
+    );
+    assert.equal(terminalRecord.stopOperationId, stopRequest.stopOperationId);
+    assert.equal(
+      terminalRecord.processIncarnationId,
+      receipt.evidence.processIncarnationId,
+    );
+    assert.equal(
+      terminalRecord.writerIncarnationId,
+      receipt.evidence.writerIncarnationId,
+    );
+    assert.equal(terminalRecord.proofId, receipt.evidence.proofId);
   }
   assert.equal(process.pid, servicePid);
   assert.equal(process.getuid(), serviceUid);

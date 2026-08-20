@@ -16,6 +16,8 @@ import {
   isPostgresDetachedRestoreOperationalLeaseBudget,
 } from "../src/postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePublicationBinding,
 } from "../src/postgres-detached-restore-physical-bindings.mjs";
@@ -36,7 +38,7 @@ import {
   PostgresDetachedRestoreStablePlanRegistryError,
 } from "../src/postgres-detached-restore-stable-plan-registry.mjs";
 import {
-  LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+  LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
@@ -55,6 +57,8 @@ const SOURCE_STORAGE_ID = "controller-source-storage-001";
 const DESTINATION_STORAGE_ID = "controller-destination-storage-001";
 const NOW = "2026-08-12T00:00:00.000Z";
 const RECOVERY_SCOPE_ID = "controller-recovery-001";
+const STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
+const OTHER_STATE_OWNER_ID = `state-owner:${"b".repeat(64)}`;
 const MIGRATION_URLS = Object.freeze([
   new URL("../migrations/authority/001-session-authority.sql", import.meta.url),
   new URL("../migrations/authority/002-restore-destination-generations.sql", import.meta.url),
@@ -64,12 +68,14 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../migrations/authority/006-writer-stop-capture-handoff.sql", import.meta.url),
   new URL("../migrations/authority/007-detached-restore-stable-plans.sql", import.meta.url),
   new URL("../migrations/authority/008-filesystem-image-provider-heads.sql", import.meta.url),
+  new URL("../migrations/authority/009-writer-supervisor-state-gc.sql", import.meta.url),
 ]);
 const LANES = Object.freeze([
   "generation",
   "activation",
   "launch-attempt",
   "current-launch",
+  "supervisor-state-gc",
 ]);
 const PHYSICAL_PUBLICATION_METHODS = Object.freeze([
   "publishFreshCheckpointArtifact",
@@ -160,7 +166,12 @@ function createTestOperationalLeaseBudget() {
   });
 }
 
-function createTestPhysicalBindings(fixture, rawPublication, rawLifecycle) {
+function createTestPhysicalBindings(
+  fixture,
+  rawPublication,
+  rawLifecycle,
+  stateOwnerId,
+) {
   const unexpected = async function unexpectedPhysicalProvider() {
     fixture.calls.provider += 1;
     throw new Error("physical provider must not run in controller tests");
@@ -181,12 +192,25 @@ function createTestPhysicalBindings(fixture, rawPublication, rawLifecycle) {
       settlementGraceMilliseconds: 1_000,
     }),
     supervisor: Object.freeze({
-      contractVersion: 2,
+      contractVersion:
+        POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
       launchWriter: unexpected,
       reconcileWriterLaunch: unexpected,
-      supervisorId: "controller-physical-supervisor-001",
+      stateOwnerId,
+      supervisorId: "controller-supervisor-001",
     }),
     supervisorSettlement: physicalPolicies(PHYSICAL_SUPERVISOR_METHODS),
+    supervisorStateCollectionSettlement: Object.freeze({
+      deadlineMilliseconds: 30_000,
+      settlementGraceMilliseconds: 1_000,
+    }),
+    supervisorStateCollector: Object.freeze({
+      collectTerminalState: unexpected,
+      contractVersion:
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+      stateOwnerId,
+      supervisorId: "controller-supervisor-001",
+    }),
   });
 }
 
@@ -385,12 +409,14 @@ class ControllerAuthorityClient {
       this.transactionLane = lane;
       if (!this.fixture.cursors.has(lane)) {
         this.fixture.cursors.set(lane, {
+          after_authorized_at: null,
           after_session_id: null,
+          after_terminal_operation_id: null,
           cycle: "0",
           lane,
           last_request_sha256: null,
           last_transition_id: null,
-          recovery_scope_id: RECOVERY_SCOPE_ID,
+          recovery_scope_id: values[0],
           revision: "0",
           updated_at: new Date(NOW),
         });
@@ -405,17 +431,51 @@ class ControllerAuthorityClient {
     if (text.startsWith("UPDATE session_authority.restore_recovery_cursors")) {
       const lane = values[1];
       const row = {
+        after_authorized_at: values[3],
         after_session_id: values[2],
-        cycle: values[3],
+        after_terminal_operation_id: values[4],
+        cycle: values[5],
         lane,
-        last_request_sha256: values[6],
-        last_transition_id: values[5],
+        last_request_sha256: values[8],
+        last_transition_id: values[7],
         recovery_scope_id: values[0],
-        revision: values[4],
-        updated_at: new Date(values[7]),
+        revision: values[6],
+        updated_at: new Date(values[9]),
       };
       this.fixture.cursors.set(lane, row);
       return { command: "UPDATE", rowCount: 1, rows: [{ ...row }] };
+    }
+    if (
+      text.includes(
+        "session_authority.writer_supervisor_state_owners AS owner",
+      ) && text.includes("launch.kind = 'writer-launch-attempt-v1'")
+    ) {
+      const requestedOwner = values[0];
+      this.fixture.recoveryOwnerRequests.launchAttempt.push(requestedOwner);
+      const selectable = this.fixture.foreignRecoveryRows.filter(
+        (row) =>
+          row.lane === "launch-attempt" &&
+          row.stateOwnerId === requestedOwner,
+      );
+      assert.equal(selectable.length, 0);
+      return { command: "SELECT", rows: [] };
+    }
+    if (
+      text.includes("session_authority.writer_supervisor_state_gc") &&
+      text.includes("collected_at IS NULL")
+    ) {
+      const requestedOwner = values[0];
+      this.fixture.recoveryOwnerRequests.supervisorStateGc.push(
+        requestedOwner,
+      );
+      const selectable = this.fixture.foreignRecoveryRows.filter(
+        (row) =>
+          row.lane === "supervisor-state-gc" &&
+          row.stateOwnerId === requestedOwner &&
+          row.completed === false,
+      );
+      assert.equal(selectable.length, 0);
+      return { command: "SELECT", rows: [] };
     }
     for (const lane of LANES) {
       if (
@@ -632,10 +692,12 @@ function createPublication(fixture) {
 }
 
 async function createFixture({
+  foreignRecoveryStateOwnerId = null,
   holdMigration = false,
   onStep = () => undefined,
   operationalLeaseBudget = createTestOperationalLeaseBudget(),
   recoveryLockAcquired = true,
+  stateOwnerId = STATE_OWNER_ID,
 } = {}) {
   const migrationSql = new Set(
     await Promise.all(MIGRATION_URLS.map((url) => readFile(url, "utf8"))),
@@ -653,6 +715,21 @@ async function createFixture({
     blockedGuardRoles: new Set(),
     cursors: new Map(),
     events: [],
+    foreignRecoveryRows:
+      foreignRecoveryStateOwnerId === null
+        ? []
+        : [
+            {
+              completed: false,
+              lane: "launch-attempt",
+              stateOwnerId: foreignRecoveryStateOwnerId,
+            },
+            {
+              completed: false,
+              lane: "supervisor-state-gc",
+              stateOwnerId: foreignRecoveryStateOwnerId,
+            },
+          ],
     guardConnectEntered: new Map([
       ["foreground-lifecycle", deferred()],
       ["operation", deferred()],
@@ -665,6 +742,10 @@ async function createFixture({
     lastUnexpectedQuery: null,
     migrationEntered: deferred(),
     migrationSql,
+    recoveryOwnerRequests: {
+      launchAttempt: [],
+      supervisorStateGc: [],
+    },
     recoveryLockAcquired,
   };
   const pools = {
@@ -702,6 +783,7 @@ async function createFixture({
     fixture,
     rawPublication,
     lifecycleBackend,
+    stateOwnerId,
   );
   assert.equal(
     isPostgresDetachedRestorePublicationBinding(
@@ -727,7 +809,7 @@ async function createFixture({
       imagePlanBinding,
       stoppedWriterCoordinator: new StoppedWriterCapabilityCoordinator(),
       supervisor: Object.freeze({
-        contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+        contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
         async launchWriter() {
           fixture.calls.supervisor += 1;
           throw new Error("supervisor must not launch");
@@ -736,8 +818,10 @@ async function createFixture({
           fixture.calls.supervisor += 1;
           throw new Error("supervisor must not reconcile");
         },
+        stateOwnerId,
         supervisorId: "controller-supervisor-001",
       }),
+      supervisorStateCollector: physicalBindings.supervisorStateCollector,
     },
     planRegistry: {
       operationalLeaseBudget,
@@ -761,6 +845,7 @@ async function createFixture({
         currentLaunch: 1,
         generation: 1,
         launchAttempt: 1,
+        supervisorStateGc: 1,
       },
       onStep,
       recoveryScopeId: RECOVERY_SCOPE_ID,
@@ -984,6 +1069,67 @@ test("distinct authentic runtimes have independent controller lifecycles", async
   assertNoPhysicalEffects(second);
 });
 
+test("effective recovery scopes isolate owners and remain restart-stable", async () => {
+  const [first, restarted, foreign] = await Promise.all([
+    createFixture(),
+    createFixture(),
+    createFixture({ stateOwnerId: OTHER_STATE_OWNER_ID }),
+  ]);
+  await Promise.all([
+    first.controller.start(),
+    restarted.controller.start(),
+    foreign.controller.start(),
+  ]);
+  const scopeFor = (fixture) => {
+    const scopes = new Set(
+      [...fixture.cursors.values()].map((cursor) => cursor.recovery_scope_id),
+    );
+    assert.equal(scopes.size, 1);
+    const [scope] = scopes;
+    assert.match(scope, /^recovery-owner:[0-9a-f]{64}$/u);
+    return scope;
+  };
+  const firstScope = scopeFor(first);
+  assert.equal(scopeFor(restarted), firstScope);
+  assert.notEqual(scopeFor(foreign), firstScope);
+  await Promise.all([
+    first.controller.stop(),
+    restarted.controller.stop(),
+    foreign.controller.stop(),
+  ]);
+  assertNoPhysicalEffects(first);
+  assertNoPhysicalEffects(restarted);
+  assertNoPhysicalEffects(foreign);
+});
+
+test("an empty local owner cannot consume a shared authority's foreign recovery rows", async () => {
+  const fixture = await createFixture({
+    foreignRecoveryStateOwnerId: OTHER_STATE_OWNER_ID,
+  });
+  assert.deepEqual(
+    await fixture.controller.start(),
+    freezeRecord({ status: "ready" }),
+  );
+  assert.deepEqual(fixture.recoveryOwnerRequests, {
+    launchAttempt: [STATE_OWNER_ID],
+    supervisorStateGc: [STATE_OWNER_ID],
+  });
+  assert.deepEqual(fixture.foreignRecoveryRows, [
+    {
+      completed: false,
+      lane: "launch-attempt",
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    },
+    {
+      completed: false,
+      lane: "supervisor-state-gc",
+      stateOwnerId: OTHER_STATE_OWNER_ID,
+    },
+  ]);
+  assertNoPhysicalEffects(fixture);
+  await fixture.controller.stop();
+});
+
 test("start migrates and completes one coalesced initial sweep before opening ingress", async () => {
   const fixture = await createFixture({ holdMigration: true });
   const first = fixture.controller.start();
@@ -1009,7 +1155,7 @@ test("start migrates and completes one coalesced initial sweep before opening in
     );
   });
   assert.deepEqual(await first, freezeRecord({ status: "ready" }));
-  assert.equal(fixture.cursors.size, 4);
+  assert.equal(fixture.cursors.size, 5);
   for (const lane of LANES) {
     assert.equal(fixture.cursors.get(lane).cycle, "1");
     assert.equal(fixture.cursors.get(lane).revision, "1");

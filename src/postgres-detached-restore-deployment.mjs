@@ -17,11 +17,17 @@ import {
   createPostgresDetachedRestoreOperationalLeaseBudget,
 } from "./postgres-detached-restore-operational-lease-budget.mjs";
 import {
+  POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION,
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   createPostgresDetachedRestorePhysicalBindings,
 } from "./postgres-detached-restore-physical-bindings.mjs";
 import {
   createPostgresDetachedRestoreRuntimeController,
 } from "./postgres-detached-restore-runtime-controller.mjs";
+import {
+  isPodmanWriterSupervisorBundlePair,
+} from "./podman-writer-supervisor.mjs";
 import {
   createCheckpointBackendFacade,
 } from "./session-storage-contracts.mjs";
@@ -93,6 +99,8 @@ const createPhysicalBindingsIntrinsic =
   createPostgresDetachedRestorePhysicalBindings;
 const createRuntimeControllerIntrinsic =
   createPostgresDetachedRestoreRuntimeController;
+const isPodmanWriterSupervisorBundlePairIntrinsic =
+  isPodmanWriterSupervisorBundlePair;
 const createCheckpointBackendFacadeIntrinsic = createCheckpointBackendFacade;
 const createPhysicalSettlementIntrinsic =
   createPhysicalCollaboratorSettlement;
@@ -173,6 +181,8 @@ const LAUNCH_OPTION_KEYS = objectFreeze([
   "stoppedWriterCoordinator",
   "supervisor",
   "supervisorSettlement",
+  "supervisorStateCollectionSettlement",
+  "supervisorStateCollector",
 ]);
 const IMAGE_PLAN_PROVIDER_KEYS = objectFreeze([
   "contractVersion",
@@ -188,12 +198,19 @@ const SUPERVISOR_KEYS = objectFreeze([
   "contractVersion",
   "launchWriter",
   "reconcileWriterLaunch",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const SUPERVISOR_SETTLEMENT_KEYS = objectFreeze([
   "launchWriter",
   "reconcileWriterLaunch",
   "stopWriter",
+]);
+const SUPERVISOR_STATE_COLLECTOR_KEYS = objectFreeze([
+  "collectTerminalState",
+  "contractVersion",
+  "stateOwnerId",
+  "supervisorId",
 ]);
 const PHYSICAL_SETTLEMENT_POLICY_KEYS = objectFreeze([
   "deadlineMilliseconds",
@@ -284,6 +301,7 @@ const PHYSICAL_BINDINGS_KEYS = objectFreeze([
   "resolveRestoreDestination",
   "stop",
   "supervisor",
+  "supervisorStateCollector",
 ]);
 const STATUS_KEYS = objectFreeze(["status"]);
 const TOPOLOGY_ROW_KEYS = objectFreeze([
@@ -317,6 +335,7 @@ const MAX_APPLICATION_NAME_BYTES = 63;
 const MAX_CREDENTIAL_BYTES = 16 * 1024;
 const MAX_TLS_MATERIAL_BYTES = 4 * 1024 * 1024;
 const APPLICATION_PREFIX_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const HOST_PATTERN =
   /^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(?:\.(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?))*$/u;
 const SERVER_VERSION_PATTERN = /^[0-9]{1,10}$/u;
@@ -1154,7 +1173,18 @@ function normalizeRuntimeOptions(value) {
     launch.imagePlanProviderSettlement,
     IMAGE_PLAN_PROVIDER_SETTLEMENT_KEYS,
   );
+  ensure(
+    callIntrinsic(isPodmanWriterSupervisorBundlePairIntrinsic, undefined, [
+      launch.supervisor,
+      launch.supervisorStateCollector,
+    ]),
+    OPTION_ERROR_CODE,
+  );
   const supervisor = exactDataObject(launch.supervisor, SUPERVISOR_KEYS);
+  const supervisorStateCollector = exactDataObject(
+    launch.supervisorStateCollector,
+    SUPERVISOR_STATE_COLLECTOR_KEYS,
+  );
   const supervisorSettlement = normalizePhysicalSettlementPolicies(
     launch.supervisorSettlement,
     SUPERVISOR_SETTLEMENT_KEYS,
@@ -1184,9 +1214,23 @@ function normalizeRuntimeOptions(value) {
   trustedFunction(foreground.fleetCapabilityGate);
   trustedFunction(imagePlanProvider.inspectCodex);
   trustedFunction(imagePlanProvider.resolveImagePlan);
-  ensure(supervisor.contractVersion === 2, OPTION_ERROR_CODE);
+  ensure(
+    supervisor.contractVersion ===
+      POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+    OPTION_ERROR_CODE,
+  );
+  ensure(
+    supervisorStateCollector.contractVersion ===
+        POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION &&
+      supervisorStateCollector.supervisorId === supervisor.supervisorId &&
+      typeof supervisor.stateOwnerId === "string" &&
+      regexpTest(STATE_OWNER_ID_PATTERN, supervisor.stateOwnerId) &&
+      supervisorStateCollector.stateOwnerId === supervisor.stateOwnerId,
+    OPTION_ERROR_CODE,
+  );
   trustedFunction(supervisor.launchWriter);
   trustedFunction(supervisor.reconcileWriterLaunch);
+  trustedFunction(supervisorStateCollector.collectTerminalState);
   ensure(
     ownDataValue(
       storage.lifecycleBackend,
@@ -1221,6 +1265,11 @@ function normalizeRuntimeOptions(value) {
       stoppedWriterCoordinator: launch.stoppedWriterCoordinator,
       supervisor,
       supervisorSettlement,
+      supervisorStateCollectionSettlement:
+        normalizePhysicalSettlementPolicy(
+          launch.supervisorStateCollectionSettlement,
+        ),
+      supervisorStateCollector,
     }),
     operationalLease: exactFrozenRecord({
       databaseRequestMilliseconds: normalizeInteger(
@@ -2020,6 +2069,10 @@ export function createPostgresDetachedRestoreDeployment(...args) {
             runtimeOptions.storage.resolveRestoreDestinationSettlement,
           supervisor: runtimeOptions.launch.supervisor,
           supervisorSettlement: runtimeOptions.launch.supervisorSettlement,
+          supervisorStateCollectionSettlement:
+            runtimeOptions.launch.supervisorStateCollectionSettlement,
+          supervisorStateCollector:
+            runtimeOptions.launch.supervisorStateCollector,
         }),
       ],
     );
@@ -2034,7 +2087,8 @@ export function createPostgresDetachedRestoreDeployment(...args) {
       OPTION_ERROR_CODE,
     );
     ensure(
-      normalizedPhysicalBindings.contractVersion === 1,
+      normalizedPhysicalBindings.contractVersion ===
+        POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION,
       OPTION_ERROR_CODE,
     );
     physicalBindings = normalizedPhysicalBindings;
@@ -2096,6 +2150,8 @@ export function createPostgresDetachedRestoreDeployment(...args) {
           stoppedWriterCoordinator:
             runtimeOptions.launch.stoppedWriterCoordinator,
           supervisor: physicalBindings.supervisor,
+          supervisorStateCollector:
+            physicalBindings.supervisorStateCollector,
         }),
         planRegistry: exactFrozenRecord({
           operationalLeaseBudget,

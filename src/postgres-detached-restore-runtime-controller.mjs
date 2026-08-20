@@ -101,6 +101,7 @@ const RECOVERY_RESULT_KEYS = objectFreeze([
   "launchAttempt",
   "recoveryScopeId",
   "status",
+  "supervisorStateGc",
 ]);
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 

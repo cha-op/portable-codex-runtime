@@ -67,16 +67,21 @@ The physical implementation remains split into small authorities:
   restore-destination publication, and source-free committed verification.
   The ext4 inspector supplies its atomic filesystem/object observation, while
   provider state supplies the expected destination control identity.
-- `PodmanWriterSupervisor` implements the raw version 2 writer-supervisor
+- `PodmanWriterSupervisor` implements the raw version 5 writer-supervisor
   surface with a digest-pinned image reference, rootless execution, a private
-  bind, immutable revision publication, stop/join, and stopped-only read-only
-  launch reconciliation. Every Podman child invocation is explicitly local
+  bind, immutable revision publication, stop/join, observer-only launch
+  reconciliation, and exact stopped-revision retirement. Every Podman child
+  invocation is explicitly local
   through `--remote=false`, and a new launch proves the local rootless ABI with
   the exact `unshare /usr/bin/true` command before it publishes a claim. The
   supervisor also requires matching non-root real and effective user IDs. Its
   Podman child environment adds the fixed `/usr/bin:/bin` search path required
   by reviewed rootless helpers; it never inherits or accepts an ambient
   caller-controlled `PATH`.
+- The matching contract version 2 terminal-state collector removes only one
+  exact stopped revision 4 chain through the separately settled
+  `supervisorStateCollector.collectTerminalState` leaf. It does not share the
+  reconciler surface or infer mutation authority from local state.
 
 No one component is a grant authority. PostgreSQL continues to decide whether
 one physical mutator may run; these components only validate and execute the
@@ -579,29 +584,142 @@ namespace holder is coupled to the built-in command runner; a deployment that
 injects a different runner must also inject its matching trusted filesystem
 authority instead of mixing execution domains.
 
-`reconcileWriterLaunch()` is a repeatable stopped-only observation. It may
-enumerate and inspect the exact container and prove the live bind identity, but
-it cannot adopt a new started writer, stop or remove a container, or mutate the
-private supervisor journal. A live or configured ambiguous attempt therefore
-remains uncertain and blocks successor authority until an explicit owner stop
-or physical fence resolves it. Container retirement occurs only after the
-grant-bearing returned stop callback has durably reached its private stopped
-record.
+`reconcileWriterLaunch()` has one effectful cold-retirement branch and otherwise
+remains a stopped-only observation. Only an exact durable stopped revision 4
+record authorizes idempotent `podman rm --ignore` by its bound container ID,
+followed by two independent empty `podman ps -a --no-trunc` results filtered by
+the exact anchored container name and exact container ID. Only then does its raw
+reconciliation receipt, now version 2, carry the revision 4 `terminalRecord`;
+the raw launch receipt remains version 2. Ambiguity in `rm`, either absence
+proof, physical adaptation, or a pre-commit PostgreSQL finalizer failure
+preserves revision 4 and commits no database finalization. A post-COMMIT
+acknowledgement loss may instead follow an atomic commit of the operation and
+owner-bound GC authorization; exact authorization readback determines whether
+that commit exists. Revision 4 remains until the authorized collector removes
+it in either case. Observer-only `complete-stopped` and `not-started` receipts
+carry a null terminal record and retain the legacy no-GC finalizer. A live or
+otherwise ambiguous attempt remains uncertain and blocks successor authority
+until an explicit owner stop or physical fence resolves it.
 
-The supervisor state currently retains immutable per-attempt revisions for
-exact acknowledgement-loss replay and has no authority-owned compactor. A
-production host must place that owner-private root on monitored dedicated
-storage. The configured root is a canonical, lossless UTF-8 native pathname of
-at most 4,015 bytes, reserving the remaining 80 bytes of Linux's 4,095-byte
-domain for `/<64-hex>.<revision>.json.pending`. Record-key hashing and all path
+## Terminal Supervisor-State Collection
+
+The owner-private state root still publishes immutable per-attempt revisions
+for exact acknowledgement-loss replay, but terminal stopped state now has a
+separate bounded collector. `createPodmanWriterSupervisorStateBundle()` keeps
+the original state ABI separate from its terminal collector and exposes the
+root's persistent high-entropy `stateOwnerId`, whose exact syntax is
+`state-owner:<64 lowercase hex>`. First owner preparation creates a unique
+sibling staging directory under the held private parent, writes the final-name
+canonical marker there, and proves marker identity, exact bytes, `0600` mode,
+and single-link policy plus the candidate root's identity, exact namespace,
+and `0700` mode. It syncs marker, candidate root, and parent before a same-parent
+rename, then revalidates the published root and marker and repeats marker,
+final-root, and parent barriers. A pre-rename crash leaves only inert staging
+debris, while a retry after rename or acknowledgement loss adopts only the
+complete exact marker. Existing malformed or unmarked final roots fail closed
+without in-place repair. Node exposes ordinary POSIX `rename()`, not
+`renameat2(RENAME_NOREPLACE)`, so an active non-cooperative same-UID process can
+still insert an empty final root in the last absence-check window; the protocol
+does not claim that stronger property. Exact cleanup of a proven concurrent
+loser similarly uses held marker/root descriptors and `nlink == 0` as
+post-operation proof because Node exposes no inode-conditioned
+`unlink`/`rmdir`. An active same-UID replacement can therefore make cleanup
+remove a bait object before the held-object proof fails closed; it cannot make
+that failed cleanup authoritative. Later owner preparation reads and
+durably validates the published marker; the branded state bundle then supplies
+`createPodmanWriterSupervisorBundle()`, which returns the raw supervisor and
+collector as one exact process-local branded pair. Production deployment
+checks that pair before constructing the physical adapter. Equal
+`supervisorId` and `stateOwnerId` strings are necessary but not sufficient, and
+direct `createPodmanWriterSupervisor()` validates only a caller-asserted owner
+so it cannot satisfy the production deployment boundary. Production does not
+derive the owner from the root pathname, `supervisorId`, or `recoveryScopeId`;
+missing, malformed, or mismatched markers fail owner preparation or bundle
+construction before physical dispatch. This marker is persistent routing
+identity, not cryptographic host attestation. An administrator who clones both
+the private root and its marker is outside the property it proves. The raw
+`supervisorStateCollector.collectTerminalState` physical leaf accepts the exact
+immutable stopped revision 4 `terminalRecord` data; a path or attempt ID is not
+sufficient input. Its exact version-2 request also carries the bundle's
+`stateOwnerId`, and its exact version-2 receipt repeats that owner beside the
+attempt ID, status, and terminal-record collection digest. The raw collector
+validates the canonical record but cannot
+attest its provenance. Production authorization obtains it from the owner
+launch, returned stop receipt, or the exact durable revision 4 retirement
+receipt. Observer-only reconciliation remains null-record and receives no
+collection authority.
+
+An intact first collection validates the complete revision 0 through 4 chain,
+every present publication sidecar, the exact terminal record, and the absence of
+revisions 5 through 9 before the first unlink. A retry admits only the
+oldest-first missing lower prefix produced by phase 1 while revision 4 remains
+the exact terminal anchor. Collection then performs two durable phases:
+
+1. Remove revisions 0 through 3 and their sidecars, remove the revision 4
+   sidecars while retaining the revision 4 data file as the terminal anchor,
+   prove the lower prefix absent, and `fsync` the held state directory.
+2. Compare the named revision 4 object and bytes with its already held file
+   descriptor, unlink it, then positionally reread its exact canonical bytes
+   through that descriptor while revalidating identity and access policy.
+   Prove all revision and sidecar names absent and `fsync` the held directory
+   again.
+
+On Linux, every artifact lookup, unlink, and final absence proof resolves its
+basename through a revalidated clone of the held state-root FD at
+`/proc/self/fd/<fd>`. A same-UID replacement of the named root therefore cannot
+redirect deletion into a bait directory. Non-Linux builds keep held/named root
+identity and access-policy brackets; because Node has no portable
+`openat`/`unlinkat`, that fallback does not claim protection from an active
+same-UID ABA swap.
+
+A retry may begin from that durable phase-1 prefix. If collection completed but
+its acknowledgement was lost, the next exact attempt returns `absent`; the
+outer PostgreSQL completion ledger can therefore accept a `collected` to
+`absent` replay without restoring deleted local files.
+
+The collector separates three protected properties. Object identity uses
+`dev`/`ino` together with the held directory and file descriptors. Content
+stability includes the post-unlink held-file positional reread of the exact
+canonical bytes. Access policy separately checks same-UID regular/non-symlink
+record and sidecar files at exact mode `0600` with required `nlink`, the same-
+UID state root and immediate parent at exact mode `0700`, and remaining named
+traversal ancestors owned by root/current UID with group/other write permitted
+only when sticky. Directory child-entry churn or another generic `stat` delta
+is not mutation evidence; it triggers the relevant identity, content, and
+policy revalidation. During same-authorization cold overlap, only removal of a
+prevalidated record/pending sibling alias is benign: held-FD `nlink` may fall
+monotonically within its prior bound, never rise, and every held artifact must
+finish at zero links. A pre-mutation I/O or unreadable-state failure, including
+a failed pre-mutation object/content/policy revalidation, is
+`podman_writer_state_io_failed`; a conflicting canonical chain, supplied
+terminal record, sidecar, or future revision is
+`podman_writer_state_conflict`; and a failure after any unlink may have begun
+becomes `podman_writer_state_collection_outcome_uncertain`, including failure
+of the post-unlink held-FD proof. These classes remain distinct from a proved
+already-absent result.
+
+The raw collector does not prove that PostgreSQL committed the terminal attempt
+or that other callbacks are quiescent. In production, migration 009's owner-
+finalizer authorization, the assembled runner's database-global exclusive
+restore lifecycle guard, and the collector's independent physical settlement
+provide those outer properties.
+For this destructive leaf, deadline-plus-grace expiry requests abort and fatal
+deployment shutdown but deliberately keeps the invocation and aggregate stop
+pending until the raw native Promise settles. The fifth lane therefore keeps
+the exclusive lifecycle lease during normal operation while the original
+callback can still unlink, and normal pool closure cannot release it early.
+PostgreSQL session, connection, or database loss can release the advisory lease
+before that callback settles. A later process may then overlap only on the same
+immutable authorization; the cold collectors' exact concurrent
+idempotent-or-fail-closed protocol preserves state safety without claiming that
+the older callback quiesced.
+The configured root remains a canonical, lossless UTF-8 native pathname of at
+most 4,015 bytes, reserving the remaining 80 bytes of Linux's 4,095-byte domain
+for `/<64-hex>.<revision>.json.pending`. Record-key hashing and all path
 operations use module-load-captured `node:crypto` and `node:path` intrinsics, so
 post-import builtin synchronization cannot redirect or rename durable state.
 This is a lexical nameability and persistent-derivation property, independent
-of the held-directory object-identity and access-policy proofs. Bounded
-retention or garbage collection requires a separate callback after PostgreSQL
-has permanently committed the exact terminal attempt and all callbacks for
-that attempt are quiescent; the read-only reconciler cannot be used as that
-authority.
+of the held-directory identity, content-stability, and access-policy proofs.
 
 ## Production Injection
 
@@ -609,11 +727,19 @@ The generic deployment already exposes the required injection points. A host
 constructs the inspector, driver, paths, and externally anchored provider
 state, then passes them through `createExt4PodmanAttachmentBinding()` so the
 initialized backend and Podman filesystem authority cannot diverge. It
-constructs publication and the supervisor before creating the deployment. It
-maps them as follows:
+constructs publication, prepares the supervisor-state owner, constructs its
+branded state bundle, and passes that bundle through
+`createPodmanWriterSupervisorBundle()` before creating the deployment. The
+deployment rejects independently assembled lookalikes before its physical
+adapter is constructed. It maps the accepted pair as follows:
 
-- `runtime.launch.supervisor` receives the Podman v2 surface constructed with
-  the binding's `filesystemAuthority`;
+- the physical binding consumes the Podman raw-v5 surface and raw version-2
+  reconciliation receipt constructed with the binding's `filesystemAuthority`,
+  then exposes the version-4 facade and logical supervisor plus version-2
+  logical reconciliation receipt to `runtime.launch.supervisor`;
+- `runtime.launch.supervisorStateCollector` receives the matching contract
+  version 2 collector with the identical `stateOwnerId`, and deployment gives
+  `collectTerminalState()` its own deadline/grace settlement policy;
 - `runtime.storage.lifecycleBackend` receives
   `binding.backend.lifecycleBackend`;
 - `runtime.storage.publication` receives the stopped-directory publication;

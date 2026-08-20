@@ -40,7 +40,9 @@ const LANES = objectFreeze([
   "activation",
   "launch-attempt",
   "current-launch",
+  "supervisor-state-gc",
 ]);
+const SUPERVISOR_STATE_GC_LANE = "supervisor-state-gc";
 const READ_KEYS = objectFreeze(["lane", "recoveryScopeId"]);
 const ADVANCE_KEYS = objectFreeze([
   "expectedAfterSessionId",
@@ -52,8 +54,24 @@ const ADVANCE_KEYS = objectFreeze([
   "requestSha256",
   "transitionId",
 ]);
+const GC_ADVANCE_KEYS = objectFreeze([
+  "expectedAfterAuthorizedAt",
+  "expectedAfterSessionId",
+  "expectedAfterTerminalOperationId",
+  "expectedCycle",
+  "expectedRevision",
+  "lane",
+  "nextAfterAuthorizedAt",
+  "nextAfterSessionId",
+  "nextAfterTerminalOperationId",
+  "recoveryScopeId",
+  "requestSha256",
+  "transitionId",
+]);
 const CURSOR_ROW_KEYS = objectFreeze([
+  "after_authorized_at",
   "after_session_id",
+  "after_terminal_operation_id",
   "cycle",
   "lane",
   "last_request_sha256",
@@ -73,6 +91,8 @@ const CURSOR_COLUMNS = [
   "recovery_scope_id",
   "lane",
   "after_session_id::pg_catalog.text AS after_session_id",
+  "after_authorized_at",
+  "after_terminal_operation_id",
   "cycle::pg_catalog.text AS cycle",
   "revision::pg_catalog.text AS revision",
   "last_transition_id::pg_catalog.text AS last_transition_id",
@@ -94,11 +114,14 @@ const READ_QUERY = [
 ].join(" ");
 const UPDATE_QUERY = [
   "UPDATE session_authority.restore_recovery_cursors",
-  "SET after_session_id = $3, cycle = $4, revision = $5,",
-  "last_transition_id = $6, last_request_sha256 = $7, updated_at = $8",
+  "SET after_session_id = $3, after_authorized_at = $4,",
+  "after_terminal_operation_id = $5, cycle = $6, revision = $7,",
+  "last_transition_id = $8, last_request_sha256 = $9, updated_at = $10",
   "WHERE recovery_scope_id = $1 AND lane = $2",
-  "AND revision = $9 AND cycle = $10",
-  "AND after_session_id IS NOT DISTINCT FROM $11",
+  "AND revision = $11 AND cycle = $12",
+  "AND after_session_id IS NOT DISTINCT FROM $13",
+  "AND after_authorized_at IS NOT DISTINCT FROM $14",
+  "AND after_terminal_operation_id IS NOT DISTINCT FROM $15",
   `RETURNING ${CURSOR_COLUMNS}`,
 ].join(" ");
 
@@ -236,6 +259,10 @@ function canonicalNullableSessionId(value, code) {
   return value === null ? null : canonicalUuid(value, code);
 }
 
+function canonicalNullableOpaqueId(value, code) {
+  return value === null ? null : canonicalOpaqueId(value, code);
+}
+
 function canonicalSha256(value, code) {
   ensure(
     typeof value === "string" && regexpTest(SHA256_PATTERN, value),
@@ -315,6 +342,25 @@ function normalizeCursorRow(value, expected, code) {
     row.after_session_id,
     code,
   );
+  const afterAuthorizedAt =
+    row.after_authorized_at === null
+      ? null
+      : canonicalTimestamp(row.after_authorized_at, code);
+  const afterTerminalOperationId = canonicalNullableOpaqueId(
+    row.after_terminal_operation_id,
+    code,
+  );
+  ensure(
+    lane === SUPERVISOR_STATE_GC_LANE
+      ? (afterSessionId === null &&
+          afterAuthorizedAt === null &&
+          afterTerminalOperationId === null) ||
+          (afterSessionId !== null &&
+            afterAuthorizedAt !== null &&
+            afterTerminalOperationId !== null)
+      : afterAuthorizedAt === null && afterTerminalOperationId === null,
+    code,
+  );
   const cycle = canonicalBigint(row.cycle, code);
   const revision = canonicalBigint(row.revision, code);
   ensure(cycle.parsed <= revision.parsed, code);
@@ -340,16 +386,31 @@ function normalizeCursorRow(value, expected, code) {
   } else {
     ensure(lastTransitionId !== null, code);
   }
-  return objectFreeze({
-    recoveryScopeId,
-    lane,
-    afterSessionId,
-    cycle: cycle.value,
-    revision: revision.value,
-    lastTransitionId,
-    lastRequestSha256,
-    updatedAt: canonicalTimestamp(row.updated_at, code),
-  });
+  return objectFreeze(
+    lane === SUPERVISOR_STATE_GC_LANE
+      ? {
+          recoveryScopeId,
+          lane,
+          afterAuthorizedAt,
+          afterSessionId,
+          afterTerminalOperationId,
+          cycle: cycle.value,
+          revision: revision.value,
+          lastTransitionId,
+          lastRequestSha256,
+          updatedAt: canonicalTimestamp(row.updated_at, code),
+        }
+      : {
+          recoveryScopeId,
+          lane,
+          afterSessionId,
+          cycle: cycle.value,
+          revision: revision.value,
+          lastTransitionId,
+          lastRequestSha256,
+          updatedAt: canonicalTimestamp(row.updated_at, code),
+        },
+  );
 }
 
 function normalizeReadRequest(value, code) {
@@ -360,8 +421,37 @@ function normalizeReadRequest(value, code) {
   });
 }
 
+function positionIsCompleteOrNull(sessionId, authorizedAt, operationId) {
+  return (
+    (sessionId === null && authorizedAt === null && operationId === null) ||
+    (sessionId !== null && authorizedAt !== null && operationId !== null)
+  );
+}
+
+function positionAfter(
+  sessionId,
+  authorizedAt,
+  operationId,
+  previousSessionId,
+  previousAuthorizedAt,
+  previousOperationId,
+) {
+  return (
+    sessionId > previousSessionId ||
+    (sessionId === previousSessionId &&
+      (authorizedAt > previousAuthorizedAt ||
+        (authorizedAt === previousAuthorizedAt &&
+          operationId > previousOperationId)))
+  );
+}
+
 function normalizeAdvanceRequest(value, code) {
-  const normalized = exactDataObject(value, ADVANCE_KEYS, code);
+  const lane = canonicalLane(ownDataValue(value, "lane", code), code);
+  const normalized = exactDataObject(
+    value,
+    lane === SUPERVISOR_STATE_GC_LANE ? GC_ADVANCE_KEYS : ADVANCE_KEYS,
+    code,
+  );
   const expectedAfterSessionId = canonicalNullableSessionId(
     normalized.expectedAfterSessionId,
     code,
@@ -370,10 +460,59 @@ function normalizeAdvanceRequest(value, code) {
     normalized.nextAfterSessionId,
     code,
   );
+  const expectedAfterAuthorizedAt =
+    lane === SUPERVISOR_STATE_GC_LANE &&
+    normalized.expectedAfterAuthorizedAt !== null
+      ? canonicalTimestamp(normalized.expectedAfterAuthorizedAt, code)
+      : null;
+  const expectedAfterTerminalOperationId =
+    lane === SUPERVISOR_STATE_GC_LANE
+      ? canonicalNullableOpaqueId(
+          normalized.expectedAfterTerminalOperationId,
+          code,
+        )
+      : null;
+  const nextAfterAuthorizedAt =
+    lane === SUPERVISOR_STATE_GC_LANE &&
+    normalized.nextAfterAuthorizedAt !== null
+      ? canonicalTimestamp(normalized.nextAfterAuthorizedAt, code)
+      : null;
+  const nextAfterTerminalOperationId =
+    lane === SUPERVISOR_STATE_GC_LANE
+      ? canonicalNullableOpaqueId(
+          normalized.nextAfterTerminalOperationId,
+          code,
+        )
+      : null;
+  ensure(
+    lane === SUPERVISOR_STATE_GC_LANE
+      ? positionIsCompleteOrNull(
+          expectedAfterSessionId,
+          expectedAfterAuthorizedAt,
+          expectedAfterTerminalOperationId,
+        ) &&
+          positionIsCompleteOrNull(
+            nextAfterSessionId,
+            nextAfterAuthorizedAt,
+            nextAfterTerminalOperationId,
+          )
+      : expectedAfterAuthorizedAt === null &&
+          expectedAfterTerminalOperationId === null &&
+          nextAfterAuthorizedAt === null &&
+          nextAfterTerminalOperationId === null,
+    code,
+  );
   if (nextAfterSessionId !== null) {
     ensure(
       expectedAfterSessionId === null ||
-        nextAfterSessionId > expectedAfterSessionId,
+        positionAfter(
+          nextAfterSessionId,
+          nextAfterAuthorizedAt,
+          nextAfterTerminalOperationId,
+          expectedAfterSessionId,
+          expectedAfterAuthorizedAt,
+          expectedAfterTerminalOperationId,
+        ),
       code,
     );
   }
@@ -393,13 +532,17 @@ function normalizeAdvanceRequest(value, code) {
   const nextRevision = incrementBigint(expectedRevision, code);
   return objectFreeze({
     recoveryScopeId: canonicalOpaqueId(normalized.recoveryScopeId, code),
-    lane: canonicalLane(normalized.lane, code),
+    lane,
     transitionId: canonicalUuid(normalized.transitionId, code),
     requestSha256: canonicalSha256(normalized.requestSha256, code),
     expectedAfterSessionId,
+    expectedAfterAuthorizedAt,
+    expectedAfterTerminalOperationId,
     expectedCycle: expectedCycle.value,
     expectedRevision: expectedRevision.value,
     nextAfterSessionId,
+    nextAfterAuthorizedAt,
+    nextAfterTerminalOperationId,
     nextCycle,
     nextRevision,
   });
@@ -461,7 +604,11 @@ function cursorMatchesExpected(cursor, input) {
   return (
     cursor.revision === input.expectedRevision &&
     cursor.cycle === input.expectedCycle &&
-    cursor.afterSessionId === input.expectedAfterSessionId
+    cursor.afterSessionId === input.expectedAfterSessionId &&
+    (input.lane !== SUPERVISOR_STATE_GC_LANE ||
+      (cursor.afterAuthorizedAt === input.expectedAfterAuthorizedAt &&
+        cursor.afterTerminalOperationId ===
+          input.expectedAfterTerminalOperationId))
   );
 }
 
@@ -469,7 +616,9 @@ function inputExpectsInitialCursor(input) {
   return (
     input.expectedRevision === "0" &&
     input.expectedCycle === "0" &&
-    input.expectedAfterSessionId === null
+    input.expectedAfterSessionId === null &&
+    input.expectedAfterAuthorizedAt === null &&
+    input.expectedAfterTerminalOperationId === null
   );
 }
 
@@ -478,6 +627,10 @@ function cursorMatchesTarget(cursor, input) {
     cursor.revision === input.nextRevision &&
     cursor.cycle === input.nextCycle &&
     cursor.afterSessionId === input.nextAfterSessionId &&
+    (input.lane !== SUPERVISOR_STATE_GC_LANE ||
+      (cursor.afterAuthorizedAt === input.nextAfterAuthorizedAt &&
+        cursor.afterTerminalOperationId ===
+          input.nextAfterTerminalOperationId)) &&
     cursor.lastTransitionId === input.transitionId &&
     cursor.lastRequestSha256 === input.requestSha256
   );
@@ -510,6 +663,8 @@ async function advanceTransaction(store, input) {
           input.recoveryScopeId,
           input.lane,
           input.nextAfterSessionId,
+          input.nextAfterAuthorizedAt,
+          input.nextAfterTerminalOperationId,
           input.nextCycle,
           input.nextRevision,
           input.transitionId,
@@ -518,6 +673,8 @@ async function advanceTransaction(store, input) {
           input.expectedRevision,
           input.expectedCycle,
           input.expectedAfterSessionId,
+          input.expectedAfterAuthorizedAt,
+          input.expectedAfterTerminalOperationId,
         ],
         code,
       ),

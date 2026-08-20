@@ -30,6 +30,7 @@ const EXPECTED_LEAF_KEYS = Object.freeze([
   "supervisor.launchWriter",
   "supervisor.reconcileWriterLaunch",
   "supervisor.stopWriter",
+  "supervisorStateCollector.collectTerminalState",
 ]);
 const EXPECTED_CUTS = Object.freeze({
   "checkpoint-capture": Object.freeze([
@@ -44,6 +45,10 @@ const EXPECTED_CUTS = Object.freeze({
     "publication.publishRestoreDestination",
     "plan.request.operationId",
   ]),
+  "supervisor-state-gc": Object.freeze([
+    "supervisorStateCollector.collectTerminalState",
+    "authorization.terminalOperationId",
+  ]),
   "writer-force-fence": Object.freeze([
     "lifecycle.forceFence",
     "plan.detachOperationId",
@@ -51,6 +56,10 @@ const EXPECTED_CUTS = Object.freeze({
   "writer-launch": Object.freeze([
     "supervisor.launchWriter",
     "plan.launchAttemptId",
+  ]),
+  "writer-launch-retirement": Object.freeze([
+    "supervisor.reconcileWriterLaunch",
+    "attempt.launchAttemptId",
   ]),
   "writer-release": Object.freeze([
     "lifecycle.detachAttachment",
@@ -75,7 +84,6 @@ const EXPECTED_OVERLAYS = Object.freeze({
     "publication.verifyCommittedCheckpointArtifact",
     "publication.verifyCommittedRestoreDestination",
     "resolver.resolveRestoreDestination",
-    "supervisor.reconcileWriterLaunch",
   ]),
   "storage-mutator": Object.freeze([
     "lifecycle.detachAttachment",
@@ -84,7 +92,11 @@ const EXPECTED_OVERLAYS = Object.freeze({
   ]),
   "supervisor-mutator": Object.freeze([
     "supervisor.launchWriter",
+    "supervisor.reconcileWriterLaunch",
     "supervisor.stopWriter",
+  ]),
+  "supervisor-state-mutator": Object.freeze([
+    "supervisorStateCollector.collectTerminalState",
   ]),
 });
 const POLICY = Object.freeze({
@@ -166,7 +178,7 @@ function publicationContext(publicationMode) {
   });
 }
 
-test("assembled restore safety matrix fixes nineteen exact settlement leaves", () => {
+test("assembled restore safety matrix fixes twenty exact settlement leaves", () => {
   const contract = POSTGRES_ASSEMBLED_RESTORE_SAFETY_MATRIX;
   assertExactFrozenRecord(contract, [
     "contractVersion",
@@ -174,9 +186,9 @@ test("assembled restore safety matrix fixes nineteen exact settlement leaves", (
     "leaves",
     "overlayFamilies",
   ]);
-  assert.equal(contract.contractVersion, 1);
+  assert.equal(contract.contractVersion, 2);
   assert.equal(Object.isFrozen(contract.leaves), true);
-  assert.equal(contract.leaves.length, 19);
+  assert.equal(contract.leaves.length, 20);
 
   const counts = { "contract-only": 0, mutator: 0, observation: 0 };
   const leafKeys = new Set();
@@ -201,17 +213,17 @@ test("assembled restore safety matrix fixes nineteen exact settlement leaves", (
 
   assert.deepEqual(counts, {
     "contract-only": 5,
-    mutator: 7,
-    observation: 7,
+    mutator: 9,
+    observation: 6,
   });
   assert.deepEqual(sorted(leafKeys), EXPECTED_LEAF_KEYS);
 });
 
-test("seven durable cut keys map one-to-one to effectful mutators", () => {
+test("nine durable cut keys map one-to-one to effectful mutators", () => {
   const { cutKeys } = POSTGRES_ASSEMBLED_RESTORE_SAFETY_MATRIX;
   const mutators = leavesByClassification("mutator");
   assert.equal(Object.isFrozen(cutKeys), true);
-  assert.equal(cutKeys.length, 7);
+  assert.equal(cutKeys.length, 9);
 
   const observedCutKeys = new Set();
   const observedLeafKeys = new Set();
@@ -237,7 +249,7 @@ test("seven durable cut keys map one-to-one to effectful mutators", () => {
   );
 });
 
-test("five settlement overlays partition the declared protocol surface exactly once", () => {
+test("six settlement overlays partition the declared protocol surface exactly once", () => {
   const { overlayFamilies } = POSTGRES_ASSEMBLED_RESTORE_SAFETY_MATRIX;
   const reachable = [
     ...leavesByClassification("mutator"),
@@ -247,7 +259,7 @@ test("five settlement overlays partition the declared protocol surface exactly o
     leavesByClassification("contract-only").map((leaf) => leaf.key),
   );
   assert.equal(Object.isFrozen(overlayFamilies), true);
-  assert.equal(overlayFamilies.length, 5);
+  assert.equal(overlayFamilies.length, 6);
 
   const overlayKeys = new Set();
   const coveredLeaves = new Set();
@@ -341,7 +353,7 @@ test("the explicit publication seam routes fresh mutation and committed observat
   assert.equal(calls.length, 2);
 });
 
-test("declared leaves match the production operational-lease policy surface", () => {
+test("declared leaves match the production policy surfaces", () => {
   const budget = createPostgresDetachedRestoreOperationalLeaseBudget(
     budgetOptions(),
   );
@@ -353,6 +365,9 @@ test("declared leaves match the production operational-lease policy surface", ()
       publication: sorted(policyMethods("publicationSettlement")),
       resolver: sorted(policyMethods("resolveRestoreDestinationSettlement")),
       supervisor: sorted(policyMethods("supervisorSettlement")),
+      supervisorStateCollector: sorted(
+        policyMethods("supervisorStateCollectionSettlement"),
+      ),
     },
     {
       image: ["inspectCodex", "resolveImagePlan"],
@@ -379,6 +394,7 @@ test("declared leaves match the production operational-lease policy surface", ()
         "reconcileWriterLaunch",
         "stopWriter",
       ],
+      supervisorStateCollector: ["collectTerminalState"],
     },
   );
 });

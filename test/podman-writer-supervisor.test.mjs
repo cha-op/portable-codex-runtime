@@ -28,13 +28,19 @@ import test from "node:test";
 import { setTimeout as delay } from "node:timers/promises";
 
 import {
+  PODMAN_WRITER_LAUNCH_RECEIPT_VERSION,
+  PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PodmanWriterSupervisorError,
   createPodmanWriterFilesystemAuthorityComposition,
   createPodmanWriterSupervisor,
+  createPodmanWriterSupervisorBundle,
+  isPodmanWriterSupervisorBundlePair,
 } from "../src/podman-writer-supervisor.mjs";
 import {
-  createPodmanWriterSupervisorState,
+  PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+  createPodmanWriterSupervisorStateBundle,
+  preparePodmanWriterSupervisorStateOwner,
 } from "../src/podman-writer-supervisor-state.mjs";
 
 const DIGEST = `sha256:${"a".repeat(64)}`;
@@ -74,6 +80,7 @@ function closedStdioDescendantPodmanScript({
   descendantExitPath,
   descendantPidPath,
   descendantReadyPath,
+  descendantStartedPath,
   failureMode,
   sourceAttemptedPath,
   sourceMissingPath,
@@ -141,7 +148,7 @@ case "$1" in
     test -d "$source_path"
     direct_pid=$$
     (
-      : > ${shellQuote(descendantReadyPath)}
+      : > ${shellQuote(descendantStartedPath)}
       while kill -0 "$direct_pid" 2>/dev/null; do
         /bin/sleep 0.01
       done
@@ -149,9 +156,12 @@ case "$1" in
     ) </dev/null >/dev/null 2>/dev/null &
     descendant_pid=$!
     printf '%s\\n' "$descendant_pid" > ${shellQuote(descendantPidPath)}
-    while ! test -f ${shellQuote(descendantReadyPath)}; do
+    while ! test -f ${shellQuote(descendantStartedPath)}; do
       /bin/sleep 0.01
     done
+    # Publish readiness only after the PID receipt is complete and the
+    # descendant has executed behind its closed-stdio redirections.
+    : > ${shellQuote(descendantReadyPath)}
     ${failureBody}
     ;;
   *)
@@ -759,6 +769,7 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
   let running = false;
   let name = null;
   let mountSource = settings.inspectionSource ?? attachmentRoot;
+  let psCalls = 0;
   return async function commandRunner(executable, arguments_, options) {
     assert.equal(Object.isFrozen(arguments_), true);
     assert.equal(arguments_[0], "--remote=false");
@@ -834,12 +845,24 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
         settings.rmRejectAfterRemove = false;
         throw new Error("simulated ambiguous rm");
       }
+      const rmOutputOnce = settings.rmOutputOnce;
+      const stdout = rmOutputOnce ??
+        settings.rmOutput ??
+        `${CONTAINER_ID}\n`;
+      if (rmOutputOnce !== undefined) settings.rmOutputOnce = undefined;
       return {
         stderr: "",
-        stdout: settings.rmOutput ?? `${CONTAINER_ID}\n`,
+        stdout,
       };
     }
     if (arguments_[0] === "ps") {
+      psCalls += 1;
+      if (settings.psRejectAt === psCalls) {
+        throw new Error("simulated ps failure");
+      }
+      if (settings.psStderrAt === psCalls) {
+        return { stderr: "simulated ps diagnostic\n", stdout: "[]\n" };
+      }
       const filter = arguments_[arguments_.indexOf("--filter") + 1];
       const filteredName = filter.startsWith("name=^")
         ? filter.slice("name=^".length, -1)
@@ -1005,7 +1028,15 @@ async function fixture(t, settings = {}) {
   t.after(() => rm(parent, { force: true, recursive: true }));
   const events = [];
   const filesystemEvents = [];
-  const state = createPodmanWriterSupervisorState(exact({ root: stateRoot }));
+  const stateOwner = await preparePodmanWriterSupervisorStateOwner(
+    exact({ expectedStateOwnerId: null, root: stateRoot }),
+  );
+  const stateOptions = { owner: stateOwner };
+  if (settings.stateFaultHooks !== undefined) stateOptions.faultHooks = settings.stateFaultHooks;
+  const stateBundle = createPodmanWriterSupervisorStateBundle(
+    exact(stateOptions),
+  );
+  const state = stateBundle.state;
   let podmanExecutable = settings.podmanExecutable ?? "/usr/bin/podman";
   if (settings.defaultCommandRunnerScript !== undefined) {
     podmanExecutable = join(parent, "podman-fixture");
@@ -1034,6 +1065,7 @@ async function fixture(t, settings = {}) {
     }),
     podmanExecutable,
     state,
+    stateOwnerId: stateBundle.stateOwnerId,
     stopTimeoutSeconds: settings.stopTimeoutSeconds ?? 7,
     supervisorId: SUPERVISOR_ID,
     writerCommand: settings.writerCommand ??
@@ -1065,9 +1097,17 @@ async function fixture(t, settings = {}) {
     options,
     parent,
     state,
+    stateBundle,
     stateRoot,
     supervisor: createPodmanWriterSupervisor(options),
   };
+}
+
+function bundleOptions(options, stateBundle) {
+  const value = { ...options, stateBundle };
+  delete value.state;
+  delete value.stateOwnerId;
+  return exact(value);
 }
 
 function assertSupervisorError(code) {
@@ -1208,25 +1248,47 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
   assert.equal(Object.isFrozen(supervisor), true);
   assert.deepEqual(Reflect.ownKeys(supervisor), [
     "contractVersion",
-    "supervisorId",
     "launchWriter",
     "reconcileWriterLaunch",
+    "stateOwnerId",
+    "supervisorId",
   ]);
-  assert.equal(supervisor.contractVersion, 2);
+  assert.equal(supervisor.contractVersion, 5);
+  assert.equal(supervisor.stateOwnerId, base.stateBundle.stateOwnerId);
   assert.equal(supervisor.launchWriter.length, 1);
   assert.equal(supervisor.reconcileWriterLaunch.length, 1);
 
   const pending = supervisor.launchWriter(base.input);
   assert.equal(Object.getPrototypeOf(pending), Promise.prototype);
   const receipt = await pending;
+  assert.deepEqual(Reflect.ownKeys(receipt), [
+    "evidence",
+    "receiptVersion",
+    "stopWriter",
+    "terminalRecord",
+  ]);
   assert.equal(receipt.evidence.status, "started");
+  assert.equal(receipt.receiptVersion, PODMAN_WRITER_LAUNCH_RECEIPT_VERSION);
+  assert.equal(receipt.terminalRecord, null);
   assert.equal(receipt.stopWriter.length, 1);
   assert.equal(Object.isFrozen(receipt.stopWriter), true);
   const stopRequest = stopInput(base.input, receipt);
   const stopPending = receipt.stopWriter(stopRequest);
   assert.equal(Object.getPrototypeOf(stopPending), Promise.prototype);
   const stopped = await stopPending;
-  assert.deepEqual(stopped, exact({ contractVersion: 2, status: "stopped" }));
+  assert.deepEqual(Reflect.ownKeys(stopped), [
+    "contractVersion",
+    "status",
+    "terminalRecord",
+  ]);
+  const terminalRecord = await base.state.read(
+    exact({ launchAttemptId: "launch-attempt-001" }),
+  );
+  assert.deepEqual(stopped, exact({
+    contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+    status: "stopped",
+    terminalRecord,
+  }));
 
   assert.deepEqual(base.events[0].arguments_, ["unshare", "/usr/bin/true"]);
   assert.equal(
@@ -1312,6 +1374,308 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
   }
 });
 
+test("direct supervisor owner IDs are caller-asserted while bundle owners are branded-derived", async (t) => {
+  const base = await fixture(t);
+  const assertedStateOwnerId = `state-owner:${"9".repeat(64)}`;
+  const direct = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    stateOwnerId: assertedStateOwnerId,
+  }));
+  assert.equal(direct.stateOwnerId, assertedStateOwnerId);
+  assert.notEqual(direct.stateOwnerId, base.stateBundle.stateOwnerId);
+
+  for (const stateOwnerId of [
+    undefined,
+    null,
+    "state-owner:short",
+    `state-owner:${"A".repeat(64)}`,
+    "owner:" + "a".repeat(64),
+  ]) {
+    assert.throws(
+      () => createPodmanWriterSupervisor(exact({
+        ...base.options,
+        stateOwnerId,
+      })),
+      assertSupervisorError("invalid_podman_writer_supervisor_options"),
+    );
+  }
+
+  const bundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  assert.equal(bundle.supervisor.stateOwnerId, base.stateBundle.stateOwnerId);
+  assert.equal(
+    bundle.supervisorStateCollector.stateOwnerId,
+    base.stateBundle.stateOwnerId,
+  );
+});
+
+test("bundle pair provenance is exact, unforgeable, and re-established from the durable marker", async (t) => {
+  const base = await fixture(t);
+  const first = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      first.supervisor,
+      first.supervisorStateCollector,
+    ),
+    true,
+  );
+
+  const direct = createPodmanWriterSupervisor(base.options);
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      direct,
+      first.supervisorStateCollector,
+    ),
+    false,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      Object.freeze({ ...first.supervisor }),
+      Object.freeze({ ...first.supervisorStateCollector }),
+    ),
+    false,
+  );
+  assert.equal(isPodmanWriterSupervisorBundlePair(first), false);
+  assert.equal(isPodmanWriterSupervisorBundlePair(null, null), false);
+
+  const restartedOwner = await preparePodmanWriterSupervisorStateOwner(exact({
+    expectedStateOwnerId: base.stateBundle.stateOwnerId,
+    root: base.stateRoot,
+  }));
+  const restartedStateBundle = createPodmanWriterSupervisorStateBundle(exact({
+    owner: restartedOwner,
+  }));
+  const restarted = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, restartedStateBundle),
+  );
+  assert.equal(
+    restarted.supervisor.stateOwnerId,
+    first.supervisor.stateOwnerId,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      restarted.supervisor,
+      restarted.supervisorStateCollector,
+    ),
+    true,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      first.supervisor,
+      restarted.supervisorStateCollector,
+    ),
+    false,
+  );
+  assert.equal(
+    isPodmanWriterSupervisorBundlePair(
+      restarted.supervisor,
+      first.supervisorStateCollector,
+    ),
+    false,
+  );
+});
+
+test("constructs an atomic supervisor/state-collector bundle and collects only its owner receipt", async (t) => {
+  const base = await fixture(t);
+  const bundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  assert.equal(Object.getPrototypeOf(bundle), null);
+  assert.equal(Object.isFrozen(bundle), true);
+  assert.deepEqual(Reflect.ownKeys(bundle), [
+    "supervisor",
+    "supervisorStateCollector",
+  ]);
+  assert.deepEqual(Reflect.ownKeys(bundle.supervisor), [
+    "contractVersion",
+    "launchWriter",
+    "reconcileWriterLaunch",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.deepEqual(Reflect.ownKeys(bundle.supervisorStateCollector), [
+    "collectTerminalState",
+    "contractVersion",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.equal(bundle.supervisor.contractVersion, 5);
+  assert.equal(bundle.supervisorStateCollector.contractVersion, 2);
+  assert.equal(
+    bundle.supervisorStateCollector.stateOwnerId,
+    bundle.supervisor.stateOwnerId,
+  );
+  assert.equal(
+    bundle.supervisorStateCollector.supervisorId,
+    bundle.supervisor.supervisorId,
+  );
+
+  const launch = await bundle.supervisor.launchWriter(base.input);
+  assert.equal(launch.receiptVersion, PODMAN_WRITER_LAUNCH_RECEIPT_VERSION);
+  assert.equal(launch.terminalRecord, null);
+  const stopped = await launch.stopWriter(stopInput(base.input, launch));
+  assert.equal(stopped.terminalRecord.status, "stopped");
+  assert.equal(stopped.terminalRecord.revision, 4);
+  const wrongStateOwnerId = bundle.supervisor.stateOwnerId ===
+      `state-owner:${"8".repeat(64)}`
+    ? `state-owner:${"7".repeat(64)}`
+    : `state-owner:${"8".repeat(64)}`;
+  await assert.rejects(
+    bundle.supervisorStateCollector.collectTerminalState(exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      invocation: exact({}),
+      signal: new AbortController().signal,
+      stateOwnerId: wrongStateOwnerId,
+      terminalRecord: stopped.terminalRecord,
+    })),
+    assertSupervisorError("invalid_podman_writer_supervisor_request"),
+  );
+  assert.deepEqual(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    stopped.terminalRecord,
+  );
+  const collection = await bundle.supervisorStateCollector.collectTerminalState(
+    exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      invocation: exact({}),
+      signal: new AbortController().signal,
+      stateOwnerId: bundle.supervisor.stateOwnerId,
+      terminalRecord: stopped.terminalRecord,
+    }),
+  );
+  assert.deepEqual(Reflect.ownKeys(collection), [
+    "contractVersion",
+    "launchAttemptId",
+    "stateOwnerId",
+    "status",
+    "terminalRecordSha256",
+  ]);
+  assert.equal(collection.contractVersion, 2);
+  assert.equal(collection.launchAttemptId, "launch-attempt-001");
+  assert.equal(collection.status, "collected");
+  assert.match(collection.terminalRecordSha256, /^[0-9a-f]{64}$/u);
+  assert.equal(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    null,
+  );
+  const replay = await bundle.supervisorStateCollector.collectTerminalState(
+    exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      invocation: exact({}),
+      signal: new AbortController().signal,
+      stateOwnerId: bundle.supervisor.stateOwnerId,
+      terminalRecord: stopped.terminalRecord,
+    }),
+  );
+  assert.equal(replay.status, "absent");
+  assert.equal(replay.terminalRecordSha256, collection.terminalRecordSha256);
+});
+
+test("rejects unbranded or mixed state collector wiring before construction", async (t) => {
+  const left = await fixture(t);
+  const right = await fixture(t);
+  const forgedStateBundle = exact({
+    state: left.stateBundle.state,
+    terminalCollector: right.stateBundle.terminalCollector,
+  });
+  assert.throws(
+    () => createPodmanWriterSupervisorBundle(
+      bundleOptions(left.options, forgedStateBundle),
+    ),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
+  assert.throws(
+    () => createPodmanWriterSupervisorBundle(exact({
+      ...bundleOptions(left.options, left.stateBundle),
+      state: left.state,
+    })),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
+});
+
+test("rejects a wrongly derived terminal record without deleting durable state", async (t) => {
+  const base = await fixture(t);
+  const bundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  const launch = await bundle.supervisor.launchWriter(base.input);
+  const stopped = await launch.stopWriter(stopInput(base.input, launch));
+  const wrong = exact({
+    ...stopped.terminalRecord,
+    writerIncarnationId: "podman-writer:wrong-derived-owner",
+  });
+  await assert.rejects(
+    bundle.supervisorStateCollector.collectTerminalState(exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      invocation: exact({}),
+      signal: new AbortController().signal,
+      stateOwnerId: bundle.supervisor.stateOwnerId,
+      terminalRecord: wrong,
+    })),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+  );
+  assert.deepEqual(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    stopped.terminalRecord,
+  );
+});
+
+test("distinguishes pre-call abort from post-call collection uncertainty", async (t) => {
+  const pre = await fixture(t);
+  const preBundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(pre.options, pre.stateBundle),
+  );
+  const preLaunch = await preBundle.supervisor.launchWriter(pre.input);
+  const preStopped = await preLaunch.stopWriter(stopInput(pre.input, preLaunch));
+  const preController = new AbortController();
+  preController.abort();
+  await assert.rejects(
+    preBundle.supervisorStateCollector.collectTerminalState(exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      invocation: exact({}),
+      signal: preController.signal,
+      stateOwnerId: preBundle.supervisor.stateOwnerId,
+      terminalRecord: preStopped.terminalRecord,
+    })),
+    assertSupervisorError("podman_writer_supervisor_aborted"),
+  );
+  assert.deepEqual(
+    await pre.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    preStopped.terminalRecord,
+  );
+
+  const postController = new AbortController();
+  const post = await fixture(t, {
+    stateFaultHooks: exact({
+      afterCollectionTerminalRevalidation() {
+        postController.abort();
+      },
+    }),
+  });
+  const postBundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(post.options, post.stateBundle),
+  );
+  const postLaunch = await postBundle.supervisor.launchWriter(post.input);
+  const postStopped = await postLaunch.stopWriter(stopInput(post.input, postLaunch));
+  await assert.rejects(
+    postBundle.supervisorStateCollector.collectTerminalState(exact({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
+      invocation: exact({}),
+      signal: postController.signal,
+      stateOwnerId: postBundle.supervisor.stateOwnerId,
+      terminalRecord: postStopped.terminalRecord,
+    })),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+  );
+  assert.equal(
+    await post.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    null,
+  );
+});
+
 test("a single writer executable fully overrides the image command", async (t) => {
   const writerCommand = Object.freeze(["/usr/local/bin/writer"]);
   const base = await fixture(t, { writerCommand });
@@ -1392,7 +1756,8 @@ test("environment values preserve lossless UTF-8 at the code-unit boundary", asy
   }
   assert.equal(base.events.length, 0);
   assert.equal(base.filesystemEvents.length, 0);
-  assert.equal(existsSync(base.stateRoot), false);
+  assert.equal(existsSync(base.stateRoot), true);
+  assert.deepEqual(await readdir(base.stateRoot), [".state-owner-v1.json"]);
 
   const supervisor = createPodmanWriterSupervisor(exact({
     ...base.options,
@@ -1441,9 +1806,9 @@ test("stop is exact-owner idempotent and persists complete-stopped reconciliatio
   const base = await fixture(t);
   const launch = await base.supervisor.launchWriter(base.input);
   const request = stopInput(base.input, launch);
-  await launch.stopWriter(request);
+  const firstStop = await launch.stopWriter(request);
   const count = base.events.length;
-  assert.deepEqual(await launch.stopWriter(request), exact({ contractVersion: 2, status: "stopped" }));
+  assert.deepEqual(await launch.stopWriter(request), firstStop);
   assert.deepEqual(
     base.events.slice(count).map((event) => event.arguments_[0]),
     ["rm", "ps", "ps"],
@@ -1457,9 +1822,14 @@ test("stop is exact-owner idempotent and persists complete-stopped reconciliatio
     reconcileInput(base.input),
   );
   assert.equal(reconciled.evidence.status, "complete-stopped");
+  assert.equal(
+    reconciled.receiptVersion,
+    PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+  );
+  assert.deepEqual(reconciled.terminalRecord, firstStop.terminalRecord);
   assert.deepEqual(
     base.events.slice(afterReplay).map((event) => event.arguments_[0]),
-    [],
+    ["rm", "ps", "ps"],
   );
 });
 
@@ -1487,11 +1857,134 @@ test("durable stopped cleanup retries after rm acknowledgement loss on cold repl
   const replayStart = base.events.length;
   const restarted = createPodmanWriterSupervisor(base.options);
   const replay = await restarted.launchWriter(base.input);
+  assert.deepEqual(Reflect.ownKeys(replay), [
+    "evidence",
+    "receiptVersion",
+    "stopWriter",
+    "terminalRecord",
+  ]);
   assert.equal(replay.evidence.status, "complete-stopped");
   assert.equal(replay.stopWriter, null);
+  assert.deepEqual(replay.terminalRecord, durable);
   assert.deepEqual(
     base.events.slice(replayStart).map((event) => event.arguments_[0]),
     ["rm", "ps", "ps"],
+  );
+});
+
+for (const [name, runnerSettings, expectedFailedEvents] of [
+  ["rm acknowledgement loss", { rmRejectAfterRemove: true }, ["rm"]],
+  [
+    "malformed rm acknowledgement",
+    { rmOutputOnce: "unexpected\n" },
+    ["rm"],
+  ],
+  ["first absence proof failure", { psRejectAt: 1 }, ["rm", "ps"]],
+  ["first absence proof diagnostic", { psStderrAt: 1 }, ["rm", "ps"]],
+  ["second absence proof failure", { psRejectAt: 2 }, ["rm", "ps", "ps"]],
+]) {
+  test(`rev4 reconciliation retries after ${name}`, async (t) => {
+    const base = await fixture(t);
+    const launch = await base.supervisor.launchWriter(base.input);
+    const stopped = await launch.stopWriter(stopInput(base.input, launch));
+    const events = [];
+    const restarted = createPodmanWriterSupervisor(exact({
+      ...base.options,
+      commandRunner: successfulRunner(
+        base.attachmentRoot,
+        events,
+        runnerSettings,
+      ),
+    }));
+
+    await assert.rejects(
+      restarted.reconcileWriterLaunch(reconcileInput(base.input)),
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+    );
+    assert.deepEqual(
+      events.map((event) => event.arguments_[0]),
+      expectedFailedEvents,
+    );
+    assert.deepEqual(
+      await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+      stopped.terminalRecord,
+    );
+
+    const retryStart = events.length;
+    const reconciled = await restarted.reconcileWriterLaunch(
+      reconcileInput(base.input),
+    );
+    assert.deepEqual(reconciled.terminalRecord, stopped.terminalRecord);
+    assert.deepEqual(
+      events.slice(retryStart).map((event) => event.arguments_[0]),
+      ["rm", "ps", "ps"],
+    );
+  });
+}
+
+test("rev4 reconciliation treats abort after rm dispatch as uncertain", async (t) => {
+  const base = await fixture(t);
+  const launch = await base.supervisor.launchWriter(base.input);
+  const stopped = await launch.stopWriter(stopInput(base.input, launch));
+  const controller = new AbortController();
+  const events = [];
+  const restarted = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    commandRunner: successfulRunner(base.attachmentRoot, events, {
+      async onRm() {
+        controller.abort();
+      },
+    }),
+  }));
+
+  await assert.rejects(
+    restarted.reconcileWriterLaunch(
+      reconcileInput(base.input, controller.signal),
+    ),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+  );
+  assert.deepEqual(
+    events.map((event) => event.arguments_[0]),
+    ["rm"],
+  );
+  assert.deepEqual(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    stopped.terminalRecord,
+  );
+
+  const retryStart = events.length;
+  const reconciled = await restarted.reconcileWriterLaunch(
+    reconcileInput(base.input),
+  );
+  assert.deepEqual(reconciled.terminalRecord, stopped.terminalRecord);
+  assert.deepEqual(
+    events.slice(retryStart).map((event) => event.arguments_[0]),
+    ["rm", "ps", "ps"],
+  );
+});
+
+test("rev4 reconciliation preserves pre-dispatch abort classification", async (t) => {
+  const base = await fixture(t);
+  const launch = await base.supervisor.launchWriter(base.input);
+  const stopped = await launch.stopWriter(stopInput(base.input, launch));
+  const controller = new AbortController();
+  controller.abort();
+  const events = [];
+  const restarted = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    commandRunner: successfulRunner(base.attachmentRoot, events),
+  }));
+
+  await assert.rejects(
+    restarted.reconcileWriterLaunch(
+      reconcileInput(base.input, controller.signal),
+    ),
+    assertSupervisorError("podman_writer_supervisor_aborted"),
+  );
+  assert.deepEqual(events, []);
+  assert.deepEqual(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    stopped.terminalRecord,
   );
 });
 
@@ -1520,10 +2013,16 @@ test("successive launch attempts retire every durable stopped container", async 
   const reconciled = await base.supervisor.reconcileWriterLaunch(
     reconcileInput(absent),
   );
+  assert.deepEqual(Reflect.ownKeys(reconciled), [
+    "evidence",
+    "receiptVersion",
+    "terminalRecord",
+  ]);
   assert.equal(reconciled.evidence.status, "not-started");
+  assert.equal(reconciled.terminalRecord, null);
 });
 
-test("reconcile is a repeatable stopped-only observation", async (t) => {
+test("reconcile observes non-rev4 stopped states without mutation", async (t) => {
   const missing = await fixture(t);
   const other = launchInput(missing.attachmentRoot, {
     launchAttemptId: "launch-attempt-missing",
@@ -1531,6 +2030,7 @@ test("reconcile is a repeatable stopped-only observation", async (t) => {
   const observed = await missing.supervisor.reconcileWriterLaunch(reconcileInput(other));
   assert.equal(observed.evidence.status, "not-started");
   assert.equal(observed.evidence.processIncarnationId, null);
+  assert.equal(observed.terminalRecord, null);
   assert.deepEqual(missing.events.map((event) => event.arguments_[0]), ["ps"]);
 
   const running = await fixture(t);
@@ -1554,6 +2054,7 @@ test("reconcile is a repeatable stopped-only observation", async (t) => {
     reconcileInput(running.input),
   );
   assert.equal(observedStopped.evidence.status, "complete-stopped");
+  assert.equal(observedStopped.terminalRecord, null);
   assert.equal(
     (await running.state.read(exact({ launchAttemptId: "launch-attempt-001" })))
       .status,
@@ -1581,6 +2082,7 @@ test("reconcile is a repeatable stopped-only observation", async (t) => {
   const recovery = createPodmanWriterSupervisor(recoveryOptions);
   const recovered = await recovery.reconcileWriterLaunch(reconcileInput(crashed.input));
   assert.equal(recovered.evidence.status, "complete-stopped");
+  assert.equal(recovered.terminalRecord, null);
   const durable = await crashed.state.read(exact({ launchAttemptId: "launch-attempt-001" }));
   assert.equal(durable.status, "created");
   assert.deepEqual(
@@ -1663,6 +2165,8 @@ test("missing-state stopped evidence replays identically without premature retir
     reconcileInput(stopped.input),
   );
   assert.equal(first.evidence.status, "complete-stopped");
+  assert.equal(first.terminalRecord, null);
+  assert.equal(replay.terminalRecord, null);
   assert.deepEqual(replay.evidence, first.evidence);
   assert.deepEqual(
     stopped.events.map((event) => event.arguments_[0]),
@@ -1691,6 +2195,7 @@ test("preparing reconciliation proves absence by exact read-only enumeration", a
     reconcileInput(base.input),
   );
   assert.equal(receipt.evidence.status, "not-started");
+  assert.equal(receipt.terminalRecord, null);
   assert.deepEqual(events.map((event) => event.arguments_[0]), ["ps"]);
   assert.deepEqual(events[0].arguments_, [
     "ps",
@@ -1721,6 +2226,8 @@ test("preparing reconciliation observes stopped state without mutation", async (
   const first = await supervisor.reconcileWriterLaunch(reconcileInput(base.input));
   const replay = await supervisor.reconcileWriterLaunch(reconcileInput(base.input));
   assert.equal(first.evidence.status, "complete-stopped");
+  assert.equal(first.terminalRecord, null);
+  assert.equal(replay.terminalRecord, null);
   assert.deepEqual(replay.evidence, first.evidence);
   assert.deepEqual(
     events.map((event) => event.arguments_[0]),
@@ -1994,7 +2501,8 @@ test("native pathname ingress accepts 4095 UTF-8 bytes and rejects 4096", async 
   }
   assert.equal(base.events.length, 0);
   assert.equal(base.filesystemEvents.length, 0);
-  assert.equal(existsSync(base.stateRoot), false);
+  assert.equal(existsSync(base.stateRoot), true);
+  assert.deepEqual(await readdir(base.stateRoot), [".state-owner-v1.json"]);
 
   const prefix = `${base.parent}/`;
   const maximumRequestedRoot =
@@ -3350,6 +3858,7 @@ test("Linux default runner kills closed-stdio descendants before releasing autho
       let descendantExitPath;
       let descendantPidPath;
       let descendantReadyPath;
+      let descendantStartedPath;
       let heldFd = null;
       let settlementCount = 0;
       let sourceAttemptedPath;
@@ -3362,6 +3871,7 @@ test("Linux default runner kills closed-stdio descendants before releasing autho
           descendantExitPath = join(parent, "podman-descendant-exit");
           descendantPidPath = join(parent, "podman-descendant-pid");
           descendantReadyPath = join(parent, "podman-descendant-ready");
+          descendantStartedPath = join(parent, "podman-descendant-started");
           sourceAttemptedPath = join(parent, "podman-descendant-source-attempted");
           sourceMissingPath = join(parent, "podman-descendant-source-missing");
           sourceVisiblePath = join(parent, "podman-descendant-source-visible");
@@ -3369,6 +3879,7 @@ test("Linux default runner kills closed-stdio descendants before releasing autho
             descendantExitPath,
             descendantPidPath,
             descendantReadyPath,
+            descendantStartedPath,
             failureMode,
             sourceAttemptedPath,
             sourceMissingPath,

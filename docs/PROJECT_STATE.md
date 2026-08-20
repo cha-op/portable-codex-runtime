@@ -267,18 +267,91 @@
   available after that gate closes.
 - A bounded restore recovery coordinator and service now cover retained
   destination generations, attachment activations, prepared or active launch
-  attempts, and current-launch inventory through four independent keyset
-  cursors. Recovery is source-free and no-relaunch: it never republishes,
-  reserves or consumes an image, invokes a launcher, or reconstructs an opaque
-  writer capability. Current-launch handling is inventory only.
-- PostgreSQL now persists those four cursors independently for each configured
-  recovery scope. A bounded single-flight runner advances each settled lane by
+  attempts, current-launch inventory, and authorized terminal supervisor-state
+  collection through five independent keyset cursors. Recovery is source-free
+  and no-relaunch: it never republishes, reserves or consumes an image, invokes
+  a launcher, or reconstructs an opaque writer capability. Current-launch
+  handling is inventory only.
+- PostgreSQL now persists those five cursors independently for each effective
+  recovery scope. The first four lanes retain a scalar session cursor. The
+  fifth lane persists the complete
+  `(sessionId, authorizedAt, terminalOperationId)` ordering key, so one
+  permanently pending authorization cannot hide later work from the same
+  session; wrap retries it in a later cycle. Runtime derives that opaque scope
+  with domain-separated
+  SHA-256 from the caller's base `recoveryScopeId` and the local persistent
+  `stateOwnerId`; the base remains a fairness/replay label and is never treated
+  as root identity. This prevents two roots reusing one base label from
+  advancing each other's third/fifth-lane cursors while keeping same-root
+  restart stable. A bounded single-flight runner advances each settled lane by
   revision/cycle compare-and-swap, survives restart and commit-acknowledgement
   loss, and preserves earlier lane progress when a later lane fails.
+- Migration 009 permanently records terminal local supervisor-state GC
+  authorization and completion against both the terminal operation and launch
+  attempt, plus one immutable pre-dispatch owner binding in
+  `writer_supervisor_state_owners`. Each private state root supplies a
+  persistent high-entropy marker matching `state-owner:<64 lowercase hex>`.
+  First preparation creates the complete canonical marker in a unique sibling
+  staging directory, syncs marker, candidate root, and parent, then renames the
+  complete directory to the final root and repeats those durability barriers.
+  Pre-rename crashes leave only inert staging debris; post-rename or lost-ack
+  retries adopt only a complete exact marker. Existing malformed or unmarked
+  final roots remain fail-closed and are not repaired in place. Because Node
+  exposes plain POSIX `rename()` rather than `RENAME_NOREPLACE`, this does not
+  exclude an active same-UID process inserting an empty final root in the last
+  absence-check window. Node also has no inode-conditioned `unlink`/`rmdir`;
+  Linux loser cleanup uses held-FD `nlink == 0` as a post-operation proof,
+  while non-Linux hosts retain held/name brackets and durable name absence
+  without claiming active same-UID ABA resistance.
+  Owner updates are rejected immediately. Owner deletion is accepted only
+  with same-transaction teardown of the permanent operation-ID claim, so
+  delete-and-reinsert cannot transfer recovery authority to another root.
+  Only an owner-bound finalizer that commits exact `complete-stopped` evidence
+  with its stopped revision 4 `terminalRecord` may create that authorization.
+  Immediate launch/stop and exact revision 4 cold retirement use that path;
+  observer-only reconciliation returns a null terminal record and remains
+  no-GC. In the assembled production runner, the
+  fifth lane pages pending rows last while that runner holds the database-global
+  exclusive lifecycle lease, invokes the separately settled physical collector
+  with exact `{ stateOwnerId, terminalRecord }`, verifies the version-2 receipt
+  carries the same owner before completion, and then records `collected` or
+  `absent`. The third and fifth authority lists are owner-filtered by
+  runtime-private wrappers, so callers cannot select a foreign root. An
+  acknowledgement-loss retry may observe `collected` followed by `absent`
+  without losing the durable completion. The destructive collector's grace
+  expiry aborts and reports fatal failure but does not release its invocation,
+  aggregate physical shutdown, or the normally held lifecycle lease until the
+  raw native Promise settles. Connection or database loss may release that
+  advisory lease earlier; a same-authorization cold retry is then safe only
+  through the exact concurrent idempotent-or-fail-closed collector protocol and
+  does not prove the older callback quiesced.
+  On Linux, destructive collection resolves every artifact through a
+  revalidated clone of the held state-root FD, including terminal lookup and
+  final absence proof. Non-Linux collection retains pathname identity/policy
+  brackets and does not claim resistance to an active same-UID ABA swap.
+  Production deployment accepts only the exact process-local supervisor and
+  collector pair returned by `createPodmanWriterSupervisorBundle()` before it
+  constructs the physical adapter; matching IDs and owner strings alone are
+  insufficient. Owner preparation and state/supervisor bundle construction
+  fail closed before physical dispatch. Direct
+  `createPodmanWriterSupervisor()` carries only a caller-asserted owner and is
+  not a production deployment input. Migration 009 refuses to install while
+  any legacy writer launch is `starting` or `uncertain`, or while any session
+  retains a non-null current-launch pointer regardless of its shape or
+  referential validity. The latter gate requires a committed current launch to
+  be stopped or physically fenced and its current-launch pointer cleared before
+  rollout. After installation, a deferred database constraint prevents an old
+  binary from committing an ownerless dispatch. Only unbound `prepared` work remains
+  owner-neutral for read/cancel cleanup. Historical unbound committed work that
+  is no longer current receives no GC or adoption authority; its remaining
+  terminal artifacts require explicit legacy cleanup.
+  The marker prevents accidental routing but is neither cryptographic host
+  attestation nor protection against an administrator cloning the root and
+  marker together.
 - One database-global versioned restore lifecycle lock now gives foreground
   composition a shared lease and the recovery runner an exclusive lease. The
-  runner and service revalidate the lease around lane, candidate, and cursor
-  boundaries. A fixed-delay scheduler starts with one immediate bounded
+  runner and guarded service calls revalidate the lease around lane, candidate,
+  and cursor boundaries. A fixed-delay scheduler starts with one immediate bounded
   pass, prevents overlapping passes, coalesces concurrent kicks, reports busy
   or uncertain ticks through a synchronous observer, and drains admitted work
   during shutdown. The observer must return `undefined`; Promise and thenable
@@ -304,6 +377,10 @@
   an autonomous cross-stage saga. The plan's source checkpoint artefact path
   is distinct from the fresh safety-capture path selected by the capture
   backend from derived IDs.
+  The assembled runtime fixes the configured state owner into this private
+  foreground composition. Its launch-attempt read uses exact
+  `{ operationId, stateOwnerId }`; public restore admission cannot choose or
+  override that owner.
 - The facade requires its nested per-operation guard pool to be distinct from
   both lifecycle pools before any connection is acquired. This prevents a
   max-one foreground lifecycle pool from self-deadlocking while its shared
@@ -373,21 +450,35 @@
   hook. Neither abort nor that hook proves physical quiescence, makes attempted
   dependency cleanup a clean stopped result, or authorizes another dispatch.
 - A deployment-private physical-binding graph now extends the same contract to
-  three supervisor methods, nine storage-lifecycle methods, four publication
-  methods, and restore-destination resolution. Together with image resolution
-  and inspection, deployment owns nineteen method-specific settlement stops.
+  three supervisor methods, a separate supervisor-state collector, nine
+  storage-lifecycle methods, four publication methods, and restore-destination
+  resolution. Together with image resolution and inspection, deployment owns
+  twenty method-specific settlement stops.
+  The raw Podman/physical supervisor, physical adapter facade, logical
+  supervisor, logical reconcile receipt, collection surface/receipt, and
+  aggregate binding are now versions 5, 4, 4, 2, 2, and 4 respectively. The raw
+  launch receipt remains version 2, while the raw reconciliation receipt is now
+  version 2; the durable launch request remains version 1 and owner-free.
+  Supervisor and collector exact surfaces expose the same `stateOwnerId`.
+  Production additionally
+  requires their marker-backed process-local pair provenance; structural
+  equality alone does not establish it.
   Transient invocation identities and abort signals remain outside durable
   requests/results; all existing grants, readbacks, stopped-only reconciliation,
   committed-only verification, and no-second-dispatch rules remain authoritative.
   Stop requests every settlement drain before awaiting them and closes pools
   only after controller and settlement drain; any failure is sticky.
-- The completed assembled-restore safety matrix fixes the distinction
-  between all nineteen settlement contracts and the fourteen leaves on the
-  private restore protocol surface. Seven grant-bearing mutators remain at-most-
-  once per durable operation; seven resolver, verifier, inspector, or
-  reconciler observations may repeat across independent recovery attempts but
-  cannot manufacture a grant. The five remaining generic lifecycle contracts
-  stay outside the current saga. The evidence shape combines seven existing
+- The completed assembled-restore safety matrix is version 2 and fixes the
+  distinction between all twenty settlement contracts and the fifteen leaves
+  on the private restore protocol surface: nine mutators, six observations,
+  and five contract-only leaves. Seven one-shot dispatch mutators remain
+  at-most-once per durable operation; terminal-state GC authorizes one exact
+  chain whose
+  acknowledgement-loss retry may prove it absent but cannot perform a second
+  deletion. Six resolver, verifier, inspector, or observer-only reconciliation
+  leaves may repeat across independent recovery attempts but cannot manufacture
+  a grant. The five remaining generic lifecycle contracts
+  stay outside the current saga. The evidence shape combines nine
   real-PostgreSQL durable-cut and commit-acknowledgement-loss paths, separate
   same-database/stable-plan retry through fresh physical bindings, image
   binding, runtime, and controller, stable-plan-registry rehydration, and
@@ -396,6 +487,14 @@
   callback seam. The immutable public backend now owns that routing in
   production without accepting a caller callback. The matrix does not claim
   one whole-saga deployment restart or operating-system crash coverage.
+  The collector mutator remains
+  `supervisorStateCollector.collectTerminalState`; its cut is
+  `supervisor-state-gc`, durable key is
+  `authorization.terminalOperationId`, and independent overlay is
+  `supervisor-state-mutator`. The ninth mutator is the complete
+  `supervisor.reconcileWriterLaunch` leaf, conservatively assigned to
+  `supervisor-mutator`; its cut is `writer-launch-retirement` and its durable
+  key is `attempt.launchAttemptId`.
 - Restore activation now obtains and consumes its PostgreSQL one-shot dispatch
   grant entirely inside one coordinator-owned per-operation guard. The storage
   backend exposes a separate version 1 read-only reconciliation contract keyed
@@ -460,6 +559,37 @@
   wrapper close plus group absence; a dispatched exact start only advances on
   a zero exit and otherwise remains pending because conmon may leave the CLI
   group.
+- Terminal local Podman supervisor state now has a bounded two-phase collector.
+  It validates the exact stopped revision 4 terminal record and revisions 0
+  through 3 or their admitted oldest-first missing retry prefix, removes the
+  lower revisions plus publication sidecars and syncs
+  the held directory, then compares revision 4's named object and bytes with
+  its held FD before unlink. After unlink it positionally rereads exact bytes
+  through that FD, revalidates identity and access policy, proves absence, and
+  syncs the directory again. Object identity (`dev`/`ino` plus held FDs),
+  content stability, and access policy remain separate protected properties.
+  That policy checks same-UID regular files at `0600` with required `nlink`,
+  the same-UID state root and immediate parent at `0700`, and safe traversal-
+  ancestor ownership/write/sticky constraints; child-entry and generic `stat`
+  churn are not change evidence.
+  I/O or unreadable state, canonical conflict, and post-mutation outcome
+  uncertainty remain distinct. PostgreSQL finalization and outer lifecycle/
+  settlement provide authority and normal-path quiescence while the owning
+  session remains live; same-authorization monotonic collection handles the
+  explicitly non-quiescent session-loss overlap. The collector does not mint
+  either outer property.
+- Cold reconciliation physically retires a container only from an exact durable
+  stopped revision 4 record. It completes idempotent `podman rm --ignore`, then
+  proves exact anchored-name and exact-ID absence with two independent
+  `podman ps -a --no-trunc` queries before returning that record to the
+  owner-bound GC finalizer. Ambiguous removal, either absence query, physical
+  adaptation, or a pre-commit finalizer failure preserves revision 4 and
+  commits no database finalization. A post-COMMIT acknowledgement loss may
+  instead follow an atomic commit of the operation and owner-bound GC
+  authorization; exact authorization readback determines whether that commit
+  exists. Revision 4 remains until the authorized collector removes it in
+  either case. Observer-only `complete-stopped` and `not-started` return a null
+  terminal record and retain the legacy no-GC path.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers
@@ -470,6 +600,8 @@
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - ext4-to-Podman attachment composition:
   `docs/project_journal/2026/08/2026-08-19-ext4-podman-composition-a4c821.md`
+- Terminal writer-supervisor state GC:
+  `docs/project_journal/2026/08/2026-08-19-writer-supervisor-state-gc-b7d4e2.md`
 - Final public restore backend:
   `docs/project_journal/2026/08/2026-08-13-final-public-restore-backend-4b7c2e.md`
 - Assembled restore safety matrix:
@@ -579,8 +711,9 @@
   to injected runtime collaborators. Its image-plan binding owns exact OCI
   bytes, trusted inspection, opaque reservation identity, and separate bounded
   settlement policy for provider resolution and inspection. The same owner now
-  binds every assembled supervisor, storage-lifecycle, publication, and
-  restore-destination resolver Promise into the common settlement lifecycle.
+  binds every assembled supervisor, terminal-state collector,
+  storage-lifecycle, publication, and restore-destination resolver Promise
+  into the common settlement lifecycle.
   The deployment now also derives and admits one exact operational lease
   policy across the two database-clock windows, including physical deadline/
   grace bounds, an aggregate database allowance, and a safety margin.
@@ -600,8 +733,10 @@
   receipt—not container stop alone—for physical quiescence. This release step
   is forbidden on a shared UID or Podman engine. The independent Podman job
   remains as narrower supervisor coverage. These jobs do not make crash-prefix
-  state durable, revoke a stale remote writer automatically, or supply differential/
-  compressed export, encryption, retention, or registry trust. The next slice
-  is terminal supervisor-state GC after PostgreSQL terminal commit and callback
-  quiescence. Provider history retention remains separate and must preserve
-  every current attachment's origin operation.
+  state durable, revoke a stale remote writer automatically, or supply
+  differential/compressed export, encryption, provider-state retention, or
+  registry trust. Terminal supervisor-state GC safety after PostgreSQL terminal
+  commit is complete for both healthy-session callback quiescence and exact
+  same-authorization session-loss overlap. Provider history retention is the
+  next independent slice and must preserve every current attachment's origin
+  operation.

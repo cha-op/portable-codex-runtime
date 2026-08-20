@@ -26,6 +26,9 @@ import {
   createWriterLaunchStopOperationRequest,
 } from "./postgres-session-authority.mjs";
 import {
+  assertPodmanWriterSupervisorStateRecord,
+} from "./podman-writer-supervisor-state.mjs";
+import {
   assertCheckpointDescriptor,
   assertLeaseGrant,
   assertSessionAttachment,
@@ -108,8 +111,9 @@ const {
 } = utilTypes;
 
 export const LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION = 1;
-
-const CALLBACK_RECEIPT_VERSION = 1;
+export const LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION = 4;
+export const LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION = 2;
+export const LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION = 2;
 const MAX_DATA_TREE_DEPTH = 24;
 const MAX_DATA_TREE_NODES = 16_384;
 const NATIVE_FUNCTION_SOURCE_PATTERN =
@@ -117,6 +121,7 @@ const NATIVE_FUNCTION_SOURCE_PATTERN =
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const REVISION_PATTERN = /^(?:0|[1-9][0-9]{0,18})$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
+const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const UUID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u;
 
@@ -136,6 +141,7 @@ const SUPERVISOR_KEYS = objectFreeze([
   "contractVersion",
   "launchWriter",
   "reconcileWriterLaunch",
+  "stateOwnerId",
   "supervisorId",
 ]);
 const AUTHORITY_METHODS = objectFreeze([
@@ -144,10 +150,14 @@ const AUTHORITY_METHODS = objectFreeze([
   "claimWriterLaunchStopDispatch",
   "finalizeWriterLaunchAttemptStarted",
   "finalizeWriterLaunchAttemptStopped",
+  "finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc",
   "finalizeWriterLaunchStopped",
+  "finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc",
   "finalizeWriterLaunchStoppedAndReserveCheckpointCapture",
+  "finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc",
   "markOperationUncertain",
   "readSession",
+  "readWriterSupervisorStateGcAuthorization",
   "readWriterLaunchAttempt",
   "reconcileWriterLaunchStopOperation",
   "reserveOperation",
@@ -431,11 +441,19 @@ const STOP_FINALIZE_RECEIPT_KEYS = objectFreeze([
   "status",
   "stop",
 ]);
+const STOP_FINALIZE_GC_RECEIPT_KEYS = objectFreeze([
+  ...STOP_FINALIZE_RECEIPT_KEYS,
+  "supervisorStateGcAuthorization",
+]);
 const STOP_CAPTURE_HANDOFF_RECEIPT_KEYS = objectFreeze([
   "capture",
   "session",
   "status",
   "stop",
+]);
+const STOP_CAPTURE_HANDOFF_GC_RECEIPT_KEYS = objectFreeze([
+  ...STOP_CAPTURE_HANDOFF_RECEIPT_KEYS,
+  "supervisorStateGcAuthorization",
 ]);
 const STOP_CAPTURE_HANDOFF_RECONCILE_RECEIPT_KEYS = objectFreeze([
   "capture",
@@ -490,6 +508,10 @@ const FINALIZE_RECEIPT_KEYS = objectFreeze([
   "session",
   "status",
 ]);
+const FINALIZE_GC_RECEIPT_KEYS = objectFreeze([
+  ...FINALIZE_RECEIPT_KEYS,
+  "supervisorStateGcAuthorization",
+]);
 const CANCEL_RECEIPT_KEYS = objectFreeze([
   "cancelled",
   "operation",
@@ -501,10 +523,12 @@ const LAUNCH_CALLBACK_RECEIPT_KEYS = objectFreeze([
   "evidence",
   "receiptVersion",
   "stopWriter",
+  "terminalRecord",
 ]);
 const RECONCILE_CALLBACK_RECEIPT_KEYS = objectFreeze([
   "evidence",
   "receiptVersion",
+  "terminalRecord",
 ]);
 const ATTACHMENT_KEYS = objectFreeze([
   "attachmentId",
@@ -535,6 +559,23 @@ const STOP_BINDING_KEYS = objectFreeze([
   "stopOperationId",
   "writerFence",
   "writerIncarnationId",
+]);
+const PHYSICAL_STOP_RESULT_KEYS = objectFreeze([
+  "confirmation",
+  "contractVersion",
+  "terminalRecord",
+]);
+const SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS = objectFreeze([
+  "authorizationSha256",
+  "authorizedAt",
+  "contractVersion",
+  "launchAttemptId",
+  "sessionId",
+  "stateOwnerId",
+  "terminalKind",
+  "terminalOperationId",
+  "terminalRecord",
+  "terminalRecordSha256",
 ]);
 const WRITER_FENCE_KEYS = objectFreeze([
   "contractVersion",
@@ -1077,6 +1118,14 @@ function sameContent(left, right, code) {
 
 function assertOpaqueId(value, code) {
   ensure(typeof value === "string" && regexpTest(OPAQUE_ID_PATTERN, value), code);
+  return value;
+}
+
+function assertStateOwnerId(value, code) {
+  ensure(
+    typeof value === "string" && regexpTest(STATE_OWNER_ID_PATTERN, value),
+    code,
+  );
   return value;
 }
 
@@ -2282,6 +2331,46 @@ function normalizeFinalizeReceipt(
   });
 }
 
+function normalizeFinalizeGcReceipt(
+  value,
+  launchAttemptId,
+  expectedRequest,
+  expectedEvidence,
+  terminalRecord,
+  stateOwnerId,
+  code,
+) {
+  const receipt = exactDataObject(value, FINALIZE_GC_RECEIPT_KEYS, code);
+  const normalized = normalizeFinalizeReceipt(
+    exactFrozenRecord({
+      attempt: receipt.attempt,
+      finalized: receipt.finalized,
+      launch: receipt.launch,
+      operation: receipt.operation,
+      reservation: receipt.reservation,
+      session: receipt.session,
+      status: receipt.status,
+    }),
+    launchAttemptId,
+    expectedRequest,
+    expectedEvidence,
+    code,
+  );
+  normalizeSupervisorStateGcAuthorization(
+    receipt.supervisorStateGcAuthorization,
+    {
+      launchAttemptId,
+      sessionId: normalized.operation.sessionId,
+      stateOwnerId,
+      terminalKind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+      terminalOperationId: normalized.operation.operationId,
+      terminalRecord,
+    },
+    code,
+  );
+  return normalized;
+}
+
 function normalizeCancelReceipt(value, launchAttemptId, expectedRequest, code) {
   const common = normalizeReceiptCommon(
     value,
@@ -2570,6 +2659,48 @@ function normalizeStopFinalizationReceipt(
     status: "committed",
     stop,
   });
+}
+
+function normalizeStopFinalizationGcReceipt(
+  value,
+  baseInput,
+  expectedEvidence,
+  terminalRecord,
+  stateOwnerId,
+  code,
+) {
+  const receipt = exactDataObject(
+    value,
+    STOP_FINALIZE_GC_RECEIPT_KEYS,
+    code,
+  );
+  const normalized = normalizeStopFinalizationReceipt(
+    exactFrozenRecord({
+      finalized: receipt.finalized,
+      launch: receipt.launch,
+      operation: receipt.operation,
+      reservation: receipt.reservation,
+      session: receipt.session,
+      status: receipt.status,
+      stop: receipt.stop,
+    }),
+    baseInput,
+    expectedEvidence,
+    code,
+  );
+  normalizeSupervisorStateGcAuthorization(
+    receipt.supervisorStateGcAuthorization,
+    {
+      launchAttemptId: baseInput.request.launch.launchAttemptId,
+      sessionId: normalized.operation.sessionId,
+      stateOwnerId,
+      terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+      terminalOperationId: normalized.operation.operationId,
+      terminalRecord,
+    },
+    code,
+  );
+  return normalized;
 }
 
 function normalizeCommittedStopReadbackReceipt(
@@ -2908,7 +3039,10 @@ function normalizeReconcileInput(value, code) {
 
 function normalizeLaunchCallbackReceipt(value, attempt, code) {
   const receipt = exactDataObject(value, LAUNCH_CALLBACK_RECEIPT_KEYS, code);
-  ensure(receipt.receiptVersion === CALLBACK_RECEIPT_VERSION, code);
+  ensure(
+    receipt.receiptVersion === LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION,
+    code,
+  );
   const evidence = normalizeTerminalEvidence(
     receipt.evidence,
     attempt,
@@ -2916,15 +3050,91 @@ function normalizeLaunchCallbackReceipt(value, attempt, code) {
     code,
   );
   let stopWriter = null;
+  let terminalRecord = null;
   if (evidence.status === "started") {
     stopWriter = assertSourceBackedFunction(receipt.stopWriter, {
       asynchronous: true,
       code,
     });
-  } else {
+    ensure(receipt.terminalRecord === null, code);
+  } else if (evidence.status === "complete-stopped") {
+    try {
+      terminalRecord = assertPodmanWriterSupervisorStateRecord(
+        receipt.terminalRecord,
+      );
+    } catch {
+      fail(code);
+    }
+    ensure(
+      terminalRecord.status === "stopped" &&
+        terminalRecord.revision === 4 &&
+        terminalRecord.launchAttemptId === attempt.launchAttemptId &&
+        terminalRecord.processIncarnationId ===
+          evidence.processIncarnationId &&
+        terminalRecord.stopProofId === evidence.proofId &&
+        terminalRecord.writerIncarnationId ===
+          evidence.writerIncarnationId,
+      code,
+    );
     ensure(receipt.stopWriter === null, code);
+  } else {
+    ensure(receipt.stopWriter === null && receipt.terminalRecord === null, code);
   }
-  return exactFrozenRecord({ evidence, stopWriter });
+  return exactFrozenRecord({ evidence, stopWriter, terminalRecord });
+}
+
+function normalizeSupervisorStateGcAuthorization(
+  value,
+  {
+    launchAttemptId,
+    sessionId,
+    stateOwnerId,
+    terminalKind,
+    terminalOperationId,
+    terminalRecord,
+  },
+  code,
+) {
+  const authorization = exactDataObject(
+    value,
+    SUPERVISOR_STATE_GC_AUTHORIZATION_KEYS,
+    code,
+  );
+  ensure(
+    authorization.contractVersion === 2 &&
+      authorization.launchAttemptId === launchAttemptId &&
+      authorization.sessionId === sessionId &&
+      authorization.stateOwnerId === stateOwnerId &&
+      authorization.terminalKind === terminalKind &&
+      authorization.terminalOperationId === terminalOperationId &&
+      assertSha256(authorization.authorizationSha256, code) ===
+        authorization.authorizationSha256 &&
+      assertSha256(authorization.terminalRecordSha256, code) ===
+        authorization.terminalRecordSha256 &&
+      sameContent(authorization.terminalRecord, terminalRecord, code),
+    code,
+  );
+  canonicalTimestampMilliseconds(authorization.authorizedAt, code);
+  return snapshotData(value, code);
+}
+
+async function readSupervisorStateGcAuthorization(
+  authority,
+  expected,
+  code,
+) {
+  const value = await invokeAsync(
+    authority,
+    "readWriterSupervisorStateGcAuthorization",
+    [
+      exactFrozenRecord({
+        stateOwnerId: expected.stateOwnerId,
+        terminalOperationId: expected.terminalOperationId,
+      }),
+    ],
+    code,
+  );
+  return normalizeSupervisorStateGcAuthorization(value, expected, code);
 }
 
 function normalizeReconcileCallbackReceipt(value, attempt, code) {
@@ -2933,15 +3143,39 @@ function normalizeReconcileCallbackReceipt(value, attempt, code) {
     RECONCILE_CALLBACK_RECEIPT_KEYS,
     code,
   );
-  ensure(receipt.receiptVersion === CALLBACK_RECEIPT_VERSION, code);
-  return exactFrozenRecord({
-    evidence: normalizeTerminalEvidence(
-      receipt.evidence,
-      attempt,
-      ["complete-stopped", "not-started"],
+  ensure(
+    receipt.receiptVersion === LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION,
+    code,
+  );
+  const evidence = normalizeTerminalEvidence(
+    receipt.evidence,
+    attempt,
+    ["complete-stopped", "not-started"],
+    code,
+  );
+  let terminalRecord = null;
+  if (receipt.terminalRecord !== null) {
+    ensure(evidence.status === "complete-stopped", code);
+    try {
+      terminalRecord = assertPodmanWriterSupervisorStateRecord(
+        receipt.terminalRecord,
+      );
+    } catch {
+      fail(code);
+    }
+    ensure(
+      terminalRecord.status === "stopped" &&
+        terminalRecord.revision === 4 &&
+        terminalRecord.launchAttemptId === attempt.launchAttemptId &&
+        terminalRecord.processIncarnationId ===
+          evidence.processIncarnationId &&
+        terminalRecord.stopProofId === evidence.proofId &&
+        terminalRecord.writerIncarnationId ===
+          evidence.writerIncarnationId,
       code,
-    ),
-  });
+    );
+  }
+  return exactFrozenRecord({ evidence, terminalRecord });
 }
 
 function assertOpaqueWriterHandle(value, code) {
@@ -3039,11 +3273,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
   );
   ensure(
     supervisorOptions.contractVersion ===
-      LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+      LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
     optionCode,
   );
   const supervisor = exactFrozenRecord({
-    contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
+    contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
     launchWriter: assertSourceBackedFunction(supervisorOptions.launchWriter, {
       asynchronous: true,
       code: optionCode,
@@ -3051,6 +3285,10 @@ export function createPostgresLogicalWriterLauncher(...args) {
     reconcileWriterLaunch: assertSourceBackedFunction(
       supervisorOptions.reconcileWriterLaunch,
       { asynchronous: true, code: optionCode },
+    ),
+    stateOwnerId: assertStateOwnerId(
+      supervisorOptions.stateOwnerId,
+      optionCode,
     ),
     supervisorId: assertOpaqueId(supervisorOptions.supervisorId, optionCode),
   });
@@ -3109,7 +3347,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
       await invokeAsync(
         authority,
         "readWriterLaunchAttempt",
-        [exactFrozenRecord({ operationId: launchAttemptId })],
+        [
+          exactFrozenRecord({
+            operationId: launchAttemptId,
+            stateOwnerId: supervisor.stateOwnerId,
+          }),
+        ],
         outcomeCode,
       ),
       launchAttemptId,
@@ -3134,7 +3377,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       sameContent(
         request.supervisor,
         exactFrozenRecord({
-          contractVersion: supervisor.contractVersion,
+          contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
           supervisorId: supervisor.supervisorId,
         }),
         code,
@@ -3302,11 +3545,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
     evidence,
     methodName,
     uncertaintyState,
+    terminalRecord = null,
   ) {
     let finalReceipt;
     try {
-      finalReceipt = normalizeFinalizeReceipt(
-        await invokeAsync(
+      const rawReceipt = await invokeAsync(
           authority,
           methodName,
           [
@@ -3317,15 +3560,29 @@ export function createPostgresLogicalWriterLauncher(...args) {
               kind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
               operationId: readLike.operation.operationId,
               request: readLike.operation.request,
+              ...(terminalRecord === null ? {} : { terminalRecord }),
             }),
           ],
           outcomeCode,
-        ),
-        readLike.operation.operationId,
-        readLike.operation.request,
-        evidence,
-        outcomeCode,
-      );
+        );
+      finalReceipt =
+        terminalRecord === null
+          ? normalizeFinalizeReceipt(
+              rawReceipt,
+              readLike.operation.operationId,
+              readLike.operation.request,
+              evidence,
+              outcomeCode,
+            )
+          : normalizeFinalizeGcReceipt(
+              rawReceipt,
+              readLike.operation.operationId,
+              readLike.operation.request,
+              evidence,
+              terminalRecord,
+              supervisor.stateOwnerId,
+              outcomeCode,
+            );
       const writer =
         evidence.status === "started"
           ? adoptCommittedStarted(finalReceipt)
@@ -3345,6 +3602,20 @@ export function createPostgresLogicalWriterLauncher(...args) {
         readback.operation.state === "committed" &&
         sameContent(readback.evidence, evidence, outcomeCode)
       ) {
+        if (terminalRecord !== null) {
+          await readSupervisorStateGcAuthorization(
+            authority,
+            {
+              launchAttemptId: readback.attempt.launchAttemptId,
+              sessionId: readback.operation.sessionId,
+              stateOwnerId: supervisor.stateOwnerId,
+              terminalKind: WRITER_LAUNCH_ATTEMPT_OPERATION_KIND,
+              terminalOperationId: readback.operation.operationId,
+              terminalRecord,
+            },
+            outcomeCode,
+          );
+        }
         return terminalResultFromRead(readback);
       }
     } catch (error) {
@@ -3428,12 +3699,40 @@ export function createPostgresLogicalWriterLauncher(...args) {
       record.state = "stopping";
       try {
         await assertGuardHeld(record.pendingStop.probe, outcomeCode);
-        const stopped = await invokeSupervisor(
-          record.stopWriter,
-          snapshotData(bindingValue, outcomeCode),
+        const stopped = exactDataObject(
+          await invokeSupervisor(
+            record.stopWriter,
+            snapshotData(bindingValue, outcomeCode),
+            outcomeCode,
+          ),
+          PHYSICAL_STOP_RESULT_KEYS,
           outcomeCode,
         );
-        ensure(stopped === STOPPED_WRITER_STOP_CONFIRMED, outcomeCode);
+        ensure(
+          stopped.confirmation === STOPPED_WRITER_STOP_CONFIRMED &&
+            stopped.contractVersion ===
+              LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+          outcomeCode,
+        );
+        let terminalRecord;
+        try {
+          terminalRecord = assertPodmanWriterSupervisorStateRecord(
+            stopped.terminalRecord,
+          );
+        } catch {
+          fail(outcomeCode);
+        }
+        ensure(
+          terminalRecord.status === "stopped" &&
+            terminalRecord.revision === 4 &&
+            terminalRecord.launchAttemptId === record.launchAttemptId &&
+            terminalRecord.processIncarnationId ===
+              record.processIncarnationId &&
+            terminalRecord.stopOperationId === binding.stopOperationId &&
+            terminalRecord.writerIncarnationId ===
+              record.writerIncarnationId,
+          outcomeCode,
+        );
         await assertGuardHeld(record.pendingStop.probe, outcomeCode);
         const stopEvidence = exactFrozenRecord({
           contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
@@ -3451,11 +3750,13 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 record.pendingStop.baseInput,
                 record.stopClaimToken,
                 stopEvidence,
+                terminalRecord,
               )
             : await finalizeStopWithReadback(
                 record.pendingStop.baseInput,
                 record.stopClaimToken,
                 stopEvidence,
+                terminalRecord,
               );
         await assertGuardHeld(record.pendingStop.probe, outcomeCode);
         record.stopEvidence = stopEvidence;
@@ -3558,11 +3859,16 @@ export function createPostgresLogicalWriterLauncher(...args) {
     await assertGuardHeld(probe, outcomeCode);
 
     if (callbackReceipt.evidence.status !== "started") {
+      const authorizeSupervisorStateGc =
+        callbackReceipt.evidence.status === "complete-stopped";
       return finalizeWithReadback(
         claim,
         callbackReceipt.evidence,
-        "finalizeWriterLaunchAttemptStopped",
+        authorizeSupervisorStateGc
+          ? "finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc"
+          : "finalizeWriterLaunchAttemptStopped",
         uncertaintyState,
+        authorizeSupervisorStateGc ? callbackReceipt.terminalRecord : null,
       );
     }
     registerStartedWriter(claim, callbackReceipt);
@@ -3661,11 +3967,16 @@ export function createPostgresLogicalWriterLauncher(...args) {
     if (local !== undefined && local.state === "provisional") {
       local.state = "lost";
     }
+    const authorizeSupervisorStateGc =
+      callbackReceipt.terminalRecord !== null;
     return finalizeWithReadback(
       read,
       callbackReceipt.evidence,
-      "finalizeWriterLaunchAttemptStopped",
+      authorizeSupervisorStateGc
+        ? "finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc"
+        : "finalizeWriterLaunchAttemptStopped",
       uncertaintyState,
+      callbackReceipt.terminalRecord,
     );
   }
 
@@ -3720,7 +4031,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
               launchAttemptId: input.launchAttemptId,
               measuredImage,
               supervisor: exactFrozenRecord({
-                contractVersion: supervisor.contractVersion,
+                contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
                 supervisorId: supervisor.supervisorId,
               }),
             });
@@ -3777,7 +4088,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 generation: input.generation,
                 measuredImage,
                 supervisor: exactFrozenRecord({
-                  contractVersion: supervisor.contractVersion,
+                  contractVersion: LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
                   supervisorId: supervisor.supervisorId,
                 }),
               });
@@ -3849,6 +4160,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
                     exactFrozenRecord({
                       ...baseInput,
                       expectedOperationRevision: "0",
+                      stateOwnerId: supervisor.stateOwnerId,
                     }),
                   ],
                   outcomeCode,
@@ -3979,7 +4291,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
                 await invokeAsync(
                   authority,
                   "claimWriterLaunchAttemptDispatch",
-                  [transitionInput(read.operation)],
+                  [
+                    exactFrozenRecord({
+                      ...transitionInput(read.operation),
+                      stateOwnerId: supervisor.stateOwnerId,
+                    }),
+                  ],
                   outcomeCode,
                 ),
                 input.launchAttemptId,
@@ -4285,12 +4602,15 @@ export function createPostgresLogicalWriterLauncher(...args) {
     claimToken,
     expectedEvidence,
     reconcile,
+    terminalRecord = null,
   ) {
     const receipt = exactDataObject(
       value,
       reconcile
         ? STOP_CAPTURE_HANDOFF_RECONCILE_RECEIPT_KEYS
-        : STOP_CAPTURE_HANDOFF_RECEIPT_KEYS,
+        : terminalRecord === null
+          ? STOP_CAPTURE_HANDOFF_RECEIPT_KEYS
+          : STOP_CAPTURE_HANDOFF_GC_RECEIPT_KEYS,
       outcomeCode,
     );
     if (reconcile) {
@@ -4363,7 +4683,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       baseInput,
       outcomeCode,
     );
-    return exactFrozenRecord({
+    const normalized = exactFrozenRecord({
       capture: proof.capture,
       session: proof.session,
       status: proof.capture.operation.state,
@@ -4374,12 +4694,28 @@ export function createPostgresLogicalWriterLauncher(...args) {
         reservation: proof.stop.reservation,
       }),
     });
+    if (terminalRecord !== null) {
+      normalizeSupervisorStateGcAuthorization(
+        receipt.supervisorStateGcAuthorization,
+        {
+          launchAttemptId: baseInput.request.launch.launchAttemptId,
+          sessionId: proof.stop.operation.sessionId,
+          stateOwnerId: supervisor.stateOwnerId,
+          terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+          terminalOperationId: proof.stop.operation.operationId,
+          terminalRecord,
+        },
+        outcomeCode,
+      );
+    }
+    return normalized;
   }
 
   async function finalizeStopCaptureWithReadback(
     baseInput,
     claimToken,
     evidence,
+    terminalRecord,
   ) {
     let expectedOperationRevision = "1";
     for (
@@ -4391,12 +4727,13 @@ export function createPostgresLogicalWriterLauncher(...args) {
         ...baseInput,
         evidence,
         expectedOperationRevision,
+        terminalRecord,
       });
       try {
         return normalizeStopCaptureHandoffReceipt(
           await invokeAsync(
             authority,
-            "finalizeWriterLaunchStoppedAndReserveCheckpointCapture",
+            "finalizeWriterLaunchStoppedAndReserveCheckpointCaptureAndAuthorizeSupervisorStateGc",
             [finalizationInput],
             outcomeCode,
           ),
@@ -4404,6 +4741,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
           claimToken,
           evidence,
           false,
+          terminalRecord,
         );
       } catch {
         let readback;
@@ -4413,13 +4751,27 @@ export function createPostgresLogicalWriterLauncher(...args) {
             outcomeCode,
           );
           try {
-            return normalizeStopCaptureHandoffReceipt(
+            const committed = normalizeStopCaptureHandoffReceipt(
               readback,
               baseInput,
               claimToken,
               evidence,
               true,
             );
+            await readSupervisorStateGcAuthorization(
+              authority,
+              {
+                launchAttemptId:
+                  baseInput.request.launch.launchAttemptId,
+                sessionId: committed.stop.operation.sessionId,
+                stateOwnerId: supervisor.stateOwnerId,
+                terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+                terminalOperationId: committed.stop.operation.operationId,
+                terminalRecord,
+              },
+              outcomeCode,
+            );
+            return committed;
           } catch {
             const phase = normalizeStopReconcileReceipt(
               readback,
@@ -4449,19 +4801,33 @@ export function createPostgresLogicalWriterLauncher(...args) {
     } catch {
       fail(outcomeCode);
     }
-    return normalizeStopCaptureHandoffReceipt(
+    const committed = normalizeStopCaptureHandoffReceipt(
       terminalReadback,
       baseInput,
       claimToken,
       evidence,
       true,
     );
+    await readSupervisorStateGcAuthorization(
+      authority,
+      {
+        launchAttemptId: baseInput.request.launch.launchAttemptId,
+        sessionId: committed.stop.operation.sessionId,
+        stateOwnerId: supervisor.stateOwnerId,
+        terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+        terminalOperationId: committed.stop.operation.operationId,
+        terminalRecord,
+      },
+      outcomeCode,
+    );
+    return committed;
   }
 
   async function finalizeStopWithReadback(
     baseInput,
     claimToken,
     evidence,
+    terminalRecord,
   ) {
     let expectedOperationRevision = "1";
     for (
@@ -4473,17 +4839,20 @@ export function createPostgresLogicalWriterLauncher(...args) {
         ...baseInput,
         evidence,
         expectedOperationRevision,
+        terminalRecord,
       });
       try {
-        return normalizeStopFinalizationReceipt(
+        return normalizeStopFinalizationGcReceipt(
           await invokeAsync(
             authority,
-            "finalizeWriterLaunchStopped",
+            "finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc",
             [finalizationInput],
             outcomeCode,
           ),
           baseInput,
           evidence,
+          terminalRecord,
+          supervisor.stateOwnerId,
           outcomeCode,
         );
       } catch {
@@ -4520,13 +4889,26 @@ export function createPostgresLogicalWriterLauncher(...args) {
     } catch {
       fail(outcomeCode);
     }
-    return normalizeCommittedStopReadbackReceipt(
+    const committed = normalizeCommittedStopReadbackReceipt(
       terminalReadback,
       baseInput,
       claimToken,
       evidence,
       outcomeCode,
     );
+    await readSupervisorStateGcAuthorization(
+      authority,
+      {
+        launchAttemptId: baseInput.request.launch.launchAttemptId,
+        sessionId: committed.operation.sessionId,
+        stateOwnerId: supervisor.stateOwnerId,
+        terminalKind: WRITER_LAUNCH_STOP_OPERATION_KIND,
+        terminalOperationId: committed.operation.operationId,
+        terminalRecord,
+      },
+      outcomeCode,
+    );
+    return committed;
   }
 
   function stopBaseInputForSession(

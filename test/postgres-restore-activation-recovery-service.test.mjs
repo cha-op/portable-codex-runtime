@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { syncBuiltinESMExports } from "node:module";
 import path from "node:path";
 import test from "node:test";
@@ -20,6 +21,26 @@ const OTHER_SESSION_ID = "019f2100-0000-7000-8000-000000000003";
 const THIRD_SESSION_ID = "019f2100-0000-7000-8000-000000000004";
 const CODEX_ID = "019f2100-0000-7000-8000-000000000002";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const STATE_OWNER_ID = `state-owner:${"a".repeat(64)}`;
+
+function canonicalJson(value) {
+  if (Array.isArray(value)) return value.map(canonicalJson);
+  if (value !== null && typeof value === "object") {
+    const result = Object.create(null);
+    for (const key of Object.keys(value).sort()) {
+      result[key] = canonicalJson(value[key]);
+    }
+    return result;
+  }
+  return value;
+}
+
+function podmanWriterRequestSha256(request) {
+  return createHash("sha256")
+    .update("portable-codex-runtime:podman-writer-request:v1\0", "utf8")
+    .update(JSON.stringify(canonicalJson(request)), "utf8")
+    .digest("hex");
+}
 
 class ServiceRecoveryLockManager {
   constructor() {
@@ -353,8 +374,106 @@ function currentLaunchCandidate(sessionId = SESSION_ID) {
   };
 }
 
+function supervisorStateGcSession(sessionId = SESSION_ID) {
+  return {
+    createdAt: "2026-08-05T00:00:00.000Z",
+    document: { documentVersion: 3 },
+    revision: "4",
+    sessionId,
+    updatedAt: "2026-08-05T00:05:00.000Z",
+  };
+}
+
+function supervisorStateGcOperation({
+  kind,
+  operationId,
+  request = { contractVersion: 1 },
+  sessionId = SESSION_ID,
+}) {
+  return {
+    conflictClass: "session-mutation",
+    createdAt: "2026-08-05T00:00:00.000Z",
+    expectedSession: supervisorStateGcSession(sessionId),
+    kind,
+    operationId,
+    request,
+    requestSha256: "e".repeat(64),
+    result: { resultVersion: 1 },
+    retiredAt: "2026-08-05T00:05:00.000Z",
+    revision: "2",
+    sessionId,
+    state: "committed",
+    updatedAt: "2026-08-05T00:05:00.000Z",
+  };
+}
+
+function supervisorStateGcCandidate(
+  sessionId = SESSION_ID,
+  {
+    authorizedAt = "2026-08-05T00:06:00.000Z",
+    terminalOperationId = `stop-${sessionId}`,
+  } = {},
+) {
+  const launchAttemptId = `launch-${sessionId}`;
+  const request = launchRequest(sessionId);
+  const terminalRecord = {
+    containerId: "abcdef012345",
+    containerName: "portable-codex-writer",
+    contractVersion: 1,
+    launchAttemptId,
+    processIncarnationId: `process-${sessionId}`,
+    proofId: `proof-${sessionId}`,
+    requestSha256: podmanWriterRequestSha256(request),
+    revision: 4,
+    status: "stopped",
+    stopOperationId: terminalOperationId,
+    stopProofId: `stop-proof-${sessionId}`,
+    writerIncarnationId: `writer-${sessionId}`,
+  };
+  return {
+    authorization: {
+      authorizationSha256: "a".repeat(64),
+      authorizedAt,
+      contractVersion: 2,
+      launchAttemptId,
+      sessionId,
+      stateOwnerId: STATE_OWNER_ID,
+      terminalKind: "writer-launch-stop-v1",
+      terminalOperationId,
+      terminalRecord,
+      terminalRecordSha256: "b".repeat(64),
+    },
+    launchOperation: supervisorStateGcOperation({
+      kind: "writer-launch-attempt-v1",
+      operationId: launchAttemptId,
+      request,
+      sessionId,
+    }),
+    session: supervisorStateGcSession(sessionId),
+    terminalOperation: supervisorStateGcOperation({
+      kind: "writer-launch-stop-v1",
+      operationId: terminalOperationId,
+      sessionId,
+    }),
+  };
+}
+
 function page(candidates, nextAfterSessionId = null) {
   return { candidates, nextAfterSessionId };
+}
+
+function gcPage(candidates, nextCandidate = null) {
+  return {
+    candidates,
+    nextAfterAuthorizedAt:
+      nextCandidate === null ? null : nextCandidate.authorization.authorizedAt,
+    nextAfterSessionId:
+      nextCandidate === null ? null : nextCandidate.authorization.sessionId,
+    nextAfterTerminalOperationId:
+      nextCandidate === null
+        ? null
+        : nextCandidate.authorization.terminalOperationId,
+  };
 }
 
 function callbacks(overrides = {}) {
@@ -377,6 +496,13 @@ function callbacks(overrides = {}) {
       async listWriterLaunchAttemptCandidates(request) {
         calls.push(["list-launch", request]);
         return page([launchCandidate()]);
+      },
+      async listWriterSupervisorStateGcCandidates(request) {
+        calls.push(["list-supervisor-state-gc", request]);
+        return gcPage([supervisorStateGcCandidate()]);
+      },
+      async collectWriterSupervisorStateGc(candidate) {
+        calls.push(["collect-supervisor-state-gc", candidate]);
       },
       async reconcileRestoreAttachmentActivation(candidate) {
         calls.push(["reconcile-activation", candidate]);
@@ -401,8 +527,60 @@ function request(overrides = {}) {
   };
 }
 
+function gcRequest(overrides = {}) {
+  return {
+    afterAuthorizedAt: null,
+    afterSessionId: null,
+    afterTerminalOperationId: null,
+    limit: 10,
+    signal: null,
+    ...overrides,
+  };
+}
+
 function lane(afterSessionId = null, limit = 10) {
   return { afterSessionId, limit };
+}
+
+function gcLane(afterSessionId = null, limit = 10) {
+  return {
+    afterAuthorizedAt:
+      afterSessionId === null ? null : "2026-08-05T00:06:00.000Z",
+    afterSessionId,
+    afterTerminalOperationId:
+      afterSessionId === null ? null : `stop-${afterSessionId}`,
+    limit,
+  };
+}
+
+function consumeGcReceipt(
+  service,
+  afterSessionId,
+  limit,
+  lifecycleLeaseOrReceipt,
+  guardedReceipt,
+) {
+  const cursor = gcLane(afterSessionId, limit);
+  return arguments.length === 5
+    ? consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "supervisorStateGc",
+        cursor.afterSessionId,
+        cursor.afterAuthorizedAt,
+        cursor.afterTerminalOperationId,
+        cursor.limit,
+        lifecycleLeaseOrReceipt,
+        guardedReceipt,
+      )
+    : consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "supervisorStateGc",
+        cursor.afterSessionId,
+        cursor.afterAuthorizedAt,
+        cursor.afterTerminalOperationId,
+        cursor.limit,
+        lifecycleLeaseOrReceipt,
+      );
 }
 
 function assertDeepFrozen(value, seen = new Set()) {
@@ -512,7 +690,7 @@ function createNumericPrototypeTrap(shouldTrap, injectedValues) {
   };
 }
 
-test("runs four bounded recovery lanes without treating current launches as adoptable", async () => {
+test("runs five bounded recovery lanes without treating current launches as adoptable", async () => {
   const fixture = callbacks({
     async reconcileRestoreAttachmentActivation(candidate) {
       fixture.calls.push(["reconcile-activation", candidate]);
@@ -527,6 +705,9 @@ test("runs four bounded recovery lanes without treating current launches as adop
   const activation = await service.runActivationBatch(request());
   const launch = await service.runLaunchAttemptBatch(request());
   const current = await service.scanCurrentLaunchBatch(request());
+  const supervisorStateGc = await service.runSupervisorStateGcBatch(
+    gcRequest(),
+  );
 
   assert.deepEqual(plainBatch(generation), {
     afterSessionId: null,
@@ -534,6 +715,23 @@ test("runs four bounded recovery lanes without treating current launches as adop
     results: [
       {
         operationId: `restore-${SESSION_ID}`,
+        sessionId: SESSION_ID,
+        status: "reconciled",
+      },
+    ],
+    status: "sweep-complete",
+  });
+  assert.deepEqual(plainBatch(supervisorStateGc), {
+    afterAuthorizedAt: null,
+    afterSessionId: null,
+    afterTerminalOperationId: null,
+    nextAfterAuthorizedAt: null,
+    nextAfterSessionId: null,
+    nextAfterTerminalOperationId: null,
+    results: [
+      {
+        authorizedAt: "2026-08-05T00:06:00.000Z",
+        operationId: `stop-${SESSION_ID}`,
         sessionId: SESSION_ID,
         status: "reconciled",
       },
@@ -557,14 +755,128 @@ test("runs four bounded recovery lanes without treating current launches as adop
   assertDeepFrozen(activation);
   assertDeepFrozen(launch);
   assertDeepFrozen(current);
+  assertDeepFrozen(supervisorStateGc);
   assert.deepEqual(Reflect.ownKeys(service), [
     "runActivationBatch",
     "runGenerationBatch",
     "runLaunchAttemptBatch",
+    "runSupervisorStateGcBatch",
     "runSweep",
     "scanCurrentLaunchBatch",
   ]);
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt.length,
+    6,
+  );
   assertDeepFrozen(service);
+});
+
+test("supervisor-state GC candidates require an exact persistent state owner", async () => {
+  for (const mutate of [
+    (candidate) => {
+      delete candidate.authorization.stateOwnerId;
+    },
+    (candidate) => {
+      candidate.authorization.stateOwnerId = "runtime-recovery-001";
+    },
+    (candidate) => {
+      candidate.authorization.contractVersion = 1;
+    },
+  ]) {
+    const candidate = supervisorStateGcCandidate();
+    mutate(candidate);
+    let collections = 0;
+    const fixture = callbacks({
+      async listWriterSupervisorStateGcCandidates() {
+        return gcPage([candidate]);
+      },
+      async collectWriterSupervisorStateGc() {
+        collections += 1;
+      },
+    });
+    const service = createPostgresRestoreActivationRecoveryService(
+      fixture.options,
+    );
+    await assert.rejects(
+      service.runSupervisorStateGcBatch(gcRequest()),
+      assertCode(
+        "postgres_restore_activation_recovery_service_outcome_uncertain",
+      ),
+    );
+    assert.equal(collections, 0);
+  }
+});
+
+test("supervisor-state GC advances past pending and retries after wrap", async () => {
+  const first = supervisorStateGcCandidate(SESSION_ID, {
+    terminalOperationId: "stop-same-session-001",
+  });
+  const second = supervisorStateGcCandidate(SESSION_ID, {
+    terminalOperationId: "stop-same-session-002",
+  });
+  const attempts = [];
+  const fixture = callbacks({
+    async listWriterSupervisorStateGcCandidates(input) {
+      if (input.afterSessionId === null) {
+        return gcPage([first], first);
+      }
+      assert.deepEqual({ ...input }, {
+        afterAuthorizedAt: first.authorization.authorizedAt,
+        afterSessionId: SESSION_ID,
+        afterTerminalOperationId:
+          first.authorization.terminalOperationId,
+        limit: 1,
+      });
+      return gcPage([second]);
+    },
+    async collectWriterSupervisorStateGc(candidate) {
+      attempts.push(candidate.authorization.terminalOperationId);
+      if (
+        candidate.authorization.terminalOperationId ===
+        first.authorization.terminalOperationId
+      ) {
+        throw new Error("permanent collection conflict");
+      }
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+
+  const firstBatch = await service.runSupervisorStateGcBatch(
+    gcRequest({ limit: 1 }),
+  );
+  const secondBatch = await service.runSupervisorStateGcBatch(
+    gcRequest({
+      afterAuthorizedAt: firstBatch.nextAfterAuthorizedAt,
+      afterSessionId: firstBatch.nextAfterSessionId,
+      afterTerminalOperationId: firstBatch.nextAfterTerminalOperationId,
+      limit: 1,
+    }),
+  );
+  const wrappedBatch = await service.runSupervisorStateGcBatch(
+    gcRequest({ limit: 1 }),
+  );
+
+  assert.deepEqual(
+    firstBatch.results.map(({ operationId, status }) => ({
+      operationId,
+      status,
+    })),
+    [{ operationId: "stop-same-session-001", status: "pending" }],
+  );
+  assert.equal(firstBatch.status, "limit-reached");
+  assert.equal(firstBatch.nextAfterSessionId, SESSION_ID);
+  assert.equal(secondBatch.results[0].operationId, "stop-same-session-002");
+  assert.equal(secondBatch.results[0].status, "reconciled");
+  assert.equal(secondBatch.status, "sweep-complete");
+  assert.equal(secondBatch.nextAfterSessionId, null);
+  assert.equal(wrappedBatch.results[0].status, "pending");
+  assert.deepEqual(attempts, [
+    "stop-same-session-001",
+    "stop-same-session-002",
+    "stop-same-session-001",
+  ]);
 });
 
 test(
@@ -751,6 +1063,13 @@ test("guarded sweep probes around every list and candidate action", async () => 
       events.push("list:launchAttempt");
       return page([launchCandidate()]);
     },
+    async listWriterSupervisorStateGcCandidates() {
+      events.push("list:supervisorStateGc");
+      return gcPage([supervisorStateGcCandidate()]);
+    },
+    async collectWriterSupervisorStateGc() {
+      events.push("collect:supervisorStateGc");
+    },
     async reconcileRestoreAttachmentActivation() {
       events.push("reconcile:activation");
     },
@@ -776,22 +1095,32 @@ test("guarded sweep probes around every list and candidate action", async () => 
       launchAttempt: lane(),
       lifecycleLease,
       signal: null,
+      supervisorStateGc: gcLane(),
     });
     for (const laneReceipt of [
       ["generation", result.generation],
       ["activation", result.activation],
       ["launchAttempt", result.launchAttempt],
       ["currentLaunch", result.currentLaunch],
+      ["supervisorStateGc", result.supervisorStateGc],
     ]) {
       assert.equal(
-        consumePostgresRestoreActivationRecoveryBatchReceipt(
-          service,
-          laneReceipt[0],
-          null,
-          10,
-          lifecycleLease,
-          laneReceipt[1],
-        ),
+        laneReceipt[0] === "supervisorStateGc"
+          ? consumeGcReceipt(
+              service,
+              null,
+              10,
+              lifecycleLease,
+              laneReceipt[1],
+            )
+          : consumePostgresRestoreActivationRecoveryBatchReceipt(
+              service,
+              laneReceipt[0],
+              null,
+              10,
+              lifecycleLease,
+              laneReceipt[1],
+            ),
         true,
       );
     }
@@ -822,6 +1151,12 @@ test("guarded sweep probes around every list and candidate action", async () => 
     "list:currentLaunch",
     "probe",
     "probe",
+    "probe",
+    "probe",
+    "list:supervisorStateGc",
+    "probe",
+    "probe",
+    "collect:supervisorStateGc",
     "probe",
     "probe",
   ]);
@@ -1422,6 +1757,7 @@ test("guarded requests reject fake leases without reading their properties", asy
       launchAttempt: lane(),
       lifecycleLease: fakeLease,
       signal: null,
+      supervisorStateGc: gcLane(),
     }),
     assertCode(
       "invalid_postgres_restore_activation_recovery_service_request",
@@ -1552,6 +1888,54 @@ test("authentic sweep-complete receipts bind issuer, lane, input, and identity o
       10,
       receipt,
     ),
+    false,
+  );
+});
+
+test("supervisor-state GC receipts bind the complete input position", async () => {
+  const fixture = callbacks({
+    async listWriterSupervisorStateGcCandidates() {
+      return gcPage([]);
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+  const position = gcLane(SESSION_ID, 10);
+  const receipt = await service.runSupervisorStateGcBatch(
+    gcRequest(position),
+  );
+
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "supervisorStateGc",
+      position.afterSessionId,
+      "2026-08-05T00:06:01.000Z",
+      position.afterTerminalOperationId,
+      position.limit,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "supervisorStateGc",
+      position.afterSessionId,
+      position.afterAuthorizedAt,
+      "stop-crossed",
+      position.limit,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumeGcReceipt(service, SESSION_ID, 10, receipt),
+    true,
+  );
+  assert.equal(
+    consumeGcReceipt(service, SESSION_ID, 10, receipt),
     false,
   );
 });
@@ -1817,6 +2201,11 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
       assert.equal(input.afterSessionId, OTHER_SESSION_ID);
       return page([launchCandidate(THIRD_SESSION_ID)], THIRD_SESSION_ID);
     },
+    async listWriterSupervisorStateGcCandidates(input) {
+      order.push("supervisor-state-gc");
+      assert.equal(input.afterSessionId, THIRD_SESSION_ID);
+      return gcPage([]);
+    },
   });
   const service = createPostgresRestoreActivationRecoveryService(
     fixture.options,
@@ -1828,13 +2217,21 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
     generation: lane(null, 1),
     launchAttempt: lane(OTHER_SESSION_ID, 1),
     signal: null,
+    supervisorStateGc: gcLane(THIRD_SESSION_ID, 5),
   });
 
-  assert.deepEqual(order, ["generation", "activation", "launch", "current"]);
+  assert.deepEqual(order, [
+    "generation",
+    "activation",
+    "launch",
+    "current",
+    "supervisor-state-gc",
+  ]);
   assert.equal(result.generation.nextAfterSessionId, SESSION_ID);
   assert.equal(result.activation.nextAfterSessionId, OTHER_SESSION_ID);
   assert.equal(result.launchAttempt.nextAfterSessionId, THIRD_SESSION_ID);
   assert.equal(result.currentLaunch.nextAfterSessionId, null);
+  assert.equal(result.supervisorStateGc.nextAfterSessionId, null);
   assert.equal(result.status, "limit-reached");
   assert.equal(
     consumePostgresRestoreActivationRecoveryBatchReceipt(
@@ -1876,6 +2273,15 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
     ),
     true,
   );
+  assert.equal(
+    consumeGcReceipt(
+      service,
+      THIRD_SESSION_ID,
+      5,
+      result.supervisorStateGc,
+    ),
+    true,
+  );
   assertDeepFrozen(result);
 });
 
@@ -1903,7 +2309,8 @@ test(
         (field === "generation" ||
           field === "activation" ||
           field === "launchAttempt" ||
-          field === "currentLaunch");
+          field === "currentLaunch" ||
+          field === "supervisorStateGc");
       if (!isLaneEntry) {
         return Reflect.apply(originalIterator, this, []);
       }
@@ -1947,6 +2354,10 @@ test(
         recordOrder("launch");
         return page([]);
       },
+      listWriterSupervisorStateGcCandidates() {
+        recordOrder("supervisor-state-gc");
+        return gcPage([]);
+      },
     });
     const service = createPostgresRestoreActivationRecoveryService(
       fixture.options,
@@ -1957,6 +2368,7 @@ test(
       generation: lane(null, 1),
       launchAttempt: lane(OTHER_SESSION_ID, 3),
       signal: null,
+      supervisorStateGc: gcLane(THIRD_SESSION_ID, 5),
     };
     let result;
     let runError;
@@ -1975,7 +2387,10 @@ test(
 
     assert.ifError(runError);
     assert.equal(iteratorCalls, 0);
-    assert.equal(order, "generation,activation,launch,current");
+    assert.equal(
+      order,
+      "generation,activation,launch,current,supervisor-state-gc",
+    );
     assert.equal(result.status, "sweep-complete");
     assert.equal(
       consumePostgresRestoreActivationRecoveryBatchReceipt(
@@ -1984,6 +2399,15 @@ test(
         null,
         1,
         result.generation,
+      ),
+      true,
+    );
+    assert.equal(
+      consumeGcReceipt(
+        service,
+        THIRD_SESSION_ID,
+        5,
+        result.supervisorStateGc,
       ),
       true,
     );

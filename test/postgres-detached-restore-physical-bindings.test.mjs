@@ -8,9 +8,13 @@ import { FilesystemOperationJournal } from "../src/filesystem-operation-journal.
 import { createPhysicalCollaboratorSettlement } from "../src/physical-collaborator-settlement.mjs";
 import {
   POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION,
+  POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+  POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+  POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION,
   POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
   POSTGRES_RESTORE_DESTINATION_RESOLVER_PHYSICAL_CONTRACT_VERSION,
   POSTGRES_SESSION_STORAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION,
+  POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
   PostgresDetachedRestorePhysicalBindingsError,
   createPostgresDetachedRestorePhysicalBindings,
   isPostgresDetachedRestorePhysicalBindings,
@@ -45,9 +49,41 @@ const POLICY = Object.freeze({
   deadlineMilliseconds: 1_000,
   settlementGraceMilliseconds: 1_000,
 });
+const STATE_OWNER_ID = `state-owner:${"d".repeat(64)}`;
+
+function terminalRecord({
+  launchAttemptId = "attempt-001",
+  processIncarnationId = "process-001",
+  proofId = "proof-001",
+  stopOperationId = "stop-001",
+  writerIncarnationId = "writer-001",
+} = {}) {
+  return exact({
+    containerId: "a".repeat(64),
+    containerName: "codex-writer-fixture",
+    contractVersion: 1,
+    launchAttemptId,
+    processIncarnationId,
+    proofId,
+    requestSha256: "b".repeat(64),
+    revision: 4,
+    status: "stopped",
+    stopOperationId,
+    stopProofId: "stop-proof-001",
+    writerIncarnationId,
+  });
+}
 
 function exact(value) {
   return Object.freeze(Object.assign(Object.create(null), value));
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function policyRegistry(methods, override = {}) {
@@ -116,12 +152,14 @@ async function fixture(overrides = {}) {
   });
   const supervisor = {
     contractVersion: POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+    stateOwnerId: STATE_OWNER_ID,
     supervisorId: "supervisor-001",
     async launchWriter(input) {
       events.push({ argumentsLength: arguments.length, input, method: "launchWriter" });
       return exact({
         evidence: exact({
-          contractVersion: 2,
+          contractVersion:
+            POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
           launchAttemptId: input.attempt.launchAttemptId,
           processIncarnationId: "process-001",
           proofId: "proof-001",
@@ -129,18 +167,31 @@ async function fixture(overrides = {}) {
           supervisorId: "supervisor-001",
           writerIncarnationId: "writer-001",
         }),
-        receiptVersion: 1,
+        receiptVersion:
+          POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
         stopWriter: async function stopWriter(stopInput) {
           events.push({ argumentsLength: arguments.length, input: stopInput, method: "stopWriter" });
-          return exact({ contractVersion: 2, status: "stopped" });
+          return exact({
+            contractVersion:
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+            status: "stopped",
+            terminalRecord: terminalRecord({
+              launchAttemptId: input.attempt.launchAttemptId,
+              processIncarnationId: stopInput.processIncarnationId,
+              stopOperationId: stopInput.stopOperationId,
+              writerIncarnationId: stopInput.writerIncarnationId,
+            }),
+          });
         },
+        terminalRecord: null,
       });
     },
     async reconcileWriterLaunch(input) {
       events.push({ argumentsLength: arguments.length, input, method: "reconcileWriterLaunch" });
       return exact({
         evidence: exact({
-          contractVersion: 2,
+          contractVersion:
+            POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
           launchAttemptId: input.attempt.launchAttemptId,
           processIncarnationId: null,
           proofId: "proof-002",
@@ -148,10 +199,33 @@ async function fixture(overrides = {}) {
           supervisorId: "supervisor-001",
           writerIncarnationId: null,
         }),
-        receiptVersion: 1,
+        receiptVersion:
+          POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+        terminalRecord: null,
       });
     },
   };
+  const supervisorStateCollector = Object.freeze({
+    async collectTerminalState(input) {
+      events.push({
+        argumentsLength: arguments.length,
+        input,
+        method: "collectTerminalState",
+      });
+      return exact({
+        contractVersion:
+          POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+        launchAttemptId: input.terminalRecord.launchAttemptId,
+        stateOwnerId: STATE_OWNER_ID,
+        status: "collected",
+        terminalRecordSha256: "c".repeat(64),
+      });
+    },
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    stateOwnerId: STATE_OWNER_ID,
+    supervisorId: "supervisor-001",
+  });
   const options = {
     lifecycleBackend: new PrototypeLifecycleBackend(events),
     lifecycleSettlement: policyRegistry(LIFECYCLE_METHODS),
@@ -172,6 +246,8 @@ async function fixture(overrides = {}) {
     resolveRestoreDestinationSettlement: POLICY,
     supervisor: Object.freeze(supervisor),
     supervisorSettlement: policyRegistry(SUPERVISOR_METHODS),
+    supervisorStateCollectionSettlement: POLICY,
+    supervisorStateCollector,
     ...overrides,
   };
   return {
@@ -198,7 +274,10 @@ function physicalInput(base) {
     "invocation",
     "signal",
   ]);
-  assert.equal(base.contractVersion, 2);
+  assert.equal(
+    base.contractVersion,
+    POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+  );
   assertFrozenNullRecord(base.invocation, []);
   assert.equal(base.signal instanceof AbortSignal, true);
   assert.equal(base.signal.aborted, false);
@@ -339,10 +418,17 @@ async function physicalPublicationFixture(t) {
   };
 }
 
-test("constructs exact branded facades and maps physical supervisor v2 to launcher v1", async () => {
+test("constructs exact branded facades and maps physical supervisor v5 to launcher v4", async () => {
   const { binding, events } = await fixture();
-  assert.equal(POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION, 1);
-  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION, 2);
+  assert.equal(POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION, 4);
+  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION, 5);
+  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION, 4);
+  assert.equal(POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION, 2);
+  assert.equal(POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION, 2);
+  assert.equal(
+    POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    2,
+  );
   assert.equal(POSTGRES_SESSION_STORAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION, 1);
   assert.equal(POSTGRES_RESTORE_DESTINATION_RESOLVER_PHYSICAL_CONTRACT_VERSION, 1);
   assertFrozenNullRecord(binding, [
@@ -352,6 +438,7 @@ test("constructs exact branded facades and maps physical supervisor v2 to launch
     "resolveRestoreDestination",
     "stop",
     "supervisor",
+    "supervisorStateCollector",
   ]);
   assert.equal(isPostgresDetachedRestorePhysicalBindings(binding), true);
   assert.equal(isPostgresDetachedRestorePublicationBinding(binding.publication), true);
@@ -359,9 +446,26 @@ test("constructs exact branded facades and maps physical supervisor v2 to launch
     "contractVersion",
     "launchWriter",
     "reconcileWriterLaunch",
+    "stateOwnerId",
     "supervisorId",
   ]);
-  assert.equal(binding.supervisor.contractVersion, 1);
+  assert.equal(binding.supervisor.contractVersion, 4);
+  assert.equal(binding.supervisor.stateOwnerId, STATE_OWNER_ID);
+  assertFrozenNullRecord(binding.supervisorStateCollector, [
+    "collectTerminalState",
+    "contractVersion",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.equal(binding.supervisorStateCollector.contractVersion, 2);
+  assert.equal(
+    binding.supervisorStateCollector.stateOwnerId,
+    binding.supervisor.stateOwnerId,
+  );
+  assert.equal(
+    binding.supervisorStateCollector.supervisorId,
+    binding.supervisor.supervisorId,
+  );
   assertFrozenNullRecord(binding.lifecycleBackend, [
     "backendId",
     "capabilities",
@@ -383,9 +487,16 @@ test("constructs exact branded facades and maps physical supervisor v2 to launch
   const launch = await binding.supervisor.launchWriter(
     exact({ attempt: exact({ launchAttemptId: "attempt-001" }), contractVersion: 1 }),
   );
-  assert.equal(launch.receiptVersion, 1);
+  assertFrozenNullRecord(launch, [
+    "evidence",
+    "receiptVersion",
+    "stopWriter",
+    "terminalRecord",
+  ]);
+  assert.equal(launch.receiptVersion, 2);
   assert.equal(launch.evidence.contractVersion, 1);
   assert.equal(launch.evidence.status, "started");
+  assert.equal(launch.terminalRecord, null);
   const launchEvent = events.find((event) => event.method === "launchWriter");
   assert.equal(launchEvent.argumentsLength, 1);
   physicalInput(launchEvent.input);
@@ -397,10 +508,18 @@ test("constructs exact branded facades and maps physical supervisor v2 to launch
     writerFence: exact({ fencingEpoch: "1" }),
     writerIncarnationId: "writer-001",
   }));
-  assert.equal(stopped, STOPPED_WRITER_STOP_CONFIRMED);
+  assertFrozenNullRecord(stopped, [
+    "confirmation",
+    "contractVersion",
+    "terminalRecord",
+  ]);
+  assert.equal(stopped.confirmation, STOPPED_WRITER_STOP_CONFIRMED);
+  assert.equal(stopped.contractVersion, 4);
+  assert.equal(stopped.terminalRecord.status, "stopped");
+  assert.equal(stopped.terminalRecord.revision, 4);
   const stopEvent = events.find((event) => event.method === "stopWriter");
   assert.equal(stopEvent.argumentsLength, 1);
-  assert.equal(stopEvent.input.contractVersion, 2);
+  assert.equal(stopEvent.input.contractVersion, 5);
   assertFrozenNullRecord(stopEvent.input, [
     "attachment",
     "contractVersion",
@@ -413,11 +532,46 @@ test("constructs exact branded facades and maps physical supervisor v2 to launch
   ]);
   assertFrozenNullRecord(stopEvent.input.invocation, []);
 
+  const collected = await binding.supervisorStateCollector.collectTerminalState(
+    exact({
+      stateOwnerId: binding.supervisor.stateOwnerId,
+      terminalRecord: stopped.terminalRecord,
+    }),
+  );
+  assertFrozenNullRecord(collected, [
+    "contractVersion",
+    "launchAttemptId",
+    "stateOwnerId",
+    "status",
+    "terminalRecordSha256",
+  ]);
+  assert.equal(collected.status, "collected");
+  const collectionEvent = events.find(
+    (event) => event.method === "collectTerminalState",
+  );
+  assert.equal(collectionEvent.argumentsLength, 1);
+  assertFrozenNullRecord(collectionEvent.input, [
+    "contractVersion",
+    "invocation",
+    "signal",
+    "stateOwnerId",
+    "terminalRecord",
+  ]);
+  assert.equal(collectionEvent.input.contractVersion, 2);
+  assert.equal(collectionEvent.input.stateOwnerId, STATE_OWNER_ID);
+  assertFrozenNullRecord(collectionEvent.input.invocation, []);
+  assert.equal(collectionEvent.input.signal instanceof AbortSignal, true);
+
   const reconcile = await binding.supervisor.reconcileWriterLaunch(
     exact({ attempt: exact({ launchAttemptId: "attempt-002" }), contractVersion: 1 }),
   );
   assert.equal(reconcile.evidence.contractVersion, 1);
   assert.equal(reconcile.evidence.status, "not-started");
+  assert.equal(
+    reconcile.receiptVersion,
+    POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+  );
+  assert.equal(reconcile.terminalRecord, null);
   assert.equal(events.find((event) => event.method === "reconcileWriterLaunch").argumentsLength, 1);
 
   const lifecycle = await binding.lifecycleBackend.provisionSession(exact({ operationId: "op-001" }));
@@ -434,6 +588,212 @@ test("constructs exact branded facades and maps physical supervisor v2 to launch
   assert.equal(resolverEvent.argumentsLength, 1);
   assert.equal(resolverEvent.input.contractVersion, 1);
   assertFrozenNullRecord(resolverEvent.input.invocation, []);
+});
+
+test("classifies launch terminal records only for owner complete-stopped receipts", async () => {
+  const base = await fixture();
+  const completeRecord = terminalRecord({ launchAttemptId: "attempt-complete" });
+  const complete = await fixture({
+    supervisor: Object.freeze({
+      ...base.options.supervisor,
+      async launchWriter(input) {
+        return exact({
+          evidence: exact({
+            contractVersion:
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+            launchAttemptId: input.attempt.launchAttemptId,
+            processIncarnationId: completeRecord.processIncarnationId,
+            proofId: completeRecord.stopProofId,
+            status: "complete-stopped",
+            supervisorId: "supervisor-001",
+            writerIncarnationId: completeRecord.writerIncarnationId,
+          }),
+          receiptVersion:
+            POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+          stopWriter: null,
+          terminalRecord: completeRecord,
+        });
+      },
+    }),
+  });
+  const completed = await complete.binding.supervisor.launchWriter(
+    exact({
+      attempt: exact({ launchAttemptId: "attempt-complete" }),
+      contractVersion: 1,
+    }),
+  );
+  assert.equal(completed.evidence.status, "complete-stopped");
+  assert.deepEqual(completed.terminalRecord, completeRecord);
+  assert.equal(completed.stopWriter, null);
+
+  const notStarted = await fixture({
+    supervisor: Object.freeze({
+      ...base.options.supervisor,
+      async launchWriter(input) {
+        return exact({
+          evidence: exact({
+            contractVersion:
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+            launchAttemptId: input.attempt.launchAttemptId,
+            processIncarnationId: null,
+            proofId: "not-started-proof",
+            status: "not-started",
+            supervisorId: "supervisor-001",
+            writerIncarnationId: null,
+          }),
+          receiptVersion:
+            POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+          stopWriter: null,
+          terminalRecord: null,
+        });
+      },
+    }),
+  });
+  const absent = await notStarted.binding.supervisor.launchWriter(
+    exact({
+      attempt: exact({ launchAttemptId: "attempt-absent" }),
+      contractVersion: 1,
+    }),
+  );
+  assert.equal(absent.evidence.status, "not-started");
+  assert.equal(absent.terminalRecord, null);
+
+  for (const invalidReceipt of [
+    exact({
+      evidence: exact({
+        contractVersion:
+          POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+        launchAttemptId: "attempt-invalid",
+        processIncarnationId: completeRecord.processIncarnationId,
+        proofId: completeRecord.stopProofId,
+        status: "complete-stopped",
+        supervisorId: "supervisor-001",
+        writerIncarnationId: completeRecord.writerIncarnationId,
+      }),
+      receiptVersion:
+        POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+      stopWriter: null,
+      terminalRecord: null,
+    }),
+    exact({
+      evidence: exact({
+        contractVersion:
+          POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+        launchAttemptId: "attempt-invalid",
+        processIncarnationId: null,
+        proofId: "not-started-proof",
+        status: "not-started",
+        supervisorId: "supervisor-001",
+        writerIncarnationId: null,
+      }),
+      receiptVersion:
+        POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+      stopWriter: null,
+      terminalRecord: completeRecord,
+    }),
+  ]) {
+    const invalid = await fixture({
+      supervisor: Object.freeze({
+        ...base.options.supervisor,
+        async launchWriter() {
+          return invalidReceipt;
+        },
+      }),
+    });
+    await assert.rejects(
+      invalid.binding.supervisor.launchWriter(exact({
+        attempt: exact({ launchAttemptId: "attempt-invalid" }),
+        contractVersion: 1,
+      })),
+      { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },
+    );
+  }
+});
+
+test("forwards reconciliation terminal records only for matching owner complete-stopped receipts", async () => {
+  const base = await fixture();
+  const completeRecord = terminalRecord({
+    launchAttemptId: "attempt-reconcile-complete",
+  });
+  const complete = await fixture({
+    supervisor: Object.freeze({
+      ...base.options.supervisor,
+      async reconcileWriterLaunch(input) {
+        return exact({
+          evidence: exact({
+            contractVersion:
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+            launchAttemptId: input.attempt.launchAttemptId,
+            processIncarnationId: completeRecord.processIncarnationId,
+            proofId: completeRecord.stopProofId,
+            status: "complete-stopped",
+            supervisorId: "supervisor-001",
+            writerIncarnationId: completeRecord.writerIncarnationId,
+          }),
+          receiptVersion:
+            POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+          terminalRecord: completeRecord,
+        });
+      },
+    }),
+  });
+  const completed = await complete.binding.supervisor.reconcileWriterLaunch(
+    exact({
+      attempt: exact({ launchAttemptId: completeRecord.launchAttemptId }),
+      contractVersion: 1,
+    }),
+  );
+  assert.equal(completed.evidence.status, "complete-stopped");
+  assert.deepEqual(completed.terminalRecord, completeRecord);
+
+  for (const { evidenceStatus, terminal } of [
+    { evidenceStatus: "not-started", terminal: completeRecord },
+    {
+      evidenceStatus: "complete-stopped",
+      terminal: terminalRecord({ launchAttemptId: "attempt-other" }),
+    },
+  ]) {
+    const invalid = await fixture({
+      supervisor: Object.freeze({
+        ...base.options.supervisor,
+        async reconcileWriterLaunch(input) {
+          return exact({
+            evidence: exact({
+              contractVersion:
+                POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+              launchAttemptId: input.attempt.launchAttemptId,
+              processIncarnationId:
+                evidenceStatus === "complete-stopped"
+                  ? completeRecord.processIncarnationId
+                  : null,
+              proofId:
+                evidenceStatus === "complete-stopped"
+                  ? completeRecord.stopProofId
+                  : "not-started-proof",
+              status: evidenceStatus,
+              supervisorId: "supervisor-001",
+              writerIncarnationId:
+                evidenceStatus === "complete-stopped"
+                  ? completeRecord.writerIncarnationId
+                  : null,
+            }),
+            receiptVersion:
+              POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+            terminalRecord: terminal,
+          });
+        },
+      }),
+    });
+    await assert.rejects(
+      invalid.binding.supervisor.reconcileWriterLaunch(exact({
+        attempt: exact({
+          launchAttemptId: "attempt-reconcile-complete",
+        }),
+        contractVersion: 1,
+      })),
+      { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },
+    );
+  }
 });
 
 test("does not consult a poisoned Array iterator after module initialization", async () => {
@@ -546,6 +906,39 @@ test("rejects an invalid facade version before dispatch without poisoning settle
 test("rejects hostile values and exact option, policy, request, and outcome violations", async () => {
   const { options, binding } = await fixture();
   assert.throws(
+    () =>
+      createPostgresDetachedRestorePhysicalBindings({
+        ...options,
+        supervisor: Object.freeze({
+          ...options.supervisor,
+          contractVersion: 2,
+        }),
+      }),
+    {
+      code: "invalid_postgres_detached_restore_physical_bindings_options",
+    },
+  );
+  assert.throws(
+    () => createPostgresDetachedRestorePhysicalBindings({
+      ...options,
+      supervisor: Object.freeze({
+        ...options.supervisor,
+        stateOwnerId: "state-owner:short",
+      }),
+    }),
+    { code: "invalid_postgres_detached_restore_physical_bindings_options" },
+  );
+  assert.throws(
+    () => createPostgresDetachedRestorePhysicalBindings({
+      ...options,
+      supervisorStateCollector: Object.freeze({
+        ...options.supervisorStateCollector,
+        stateOwnerId: `state-owner:${"e".repeat(64)}`,
+      }),
+    }),
+    { code: "invalid_postgres_detached_restore_physical_bindings_options" },
+  );
+  assert.throws(
     () => createPostgresDetachedRestorePhysicalBindings({ ...options, extra: true }),
     (error) => error instanceof PostgresDetachedRestorePhysicalBindingsError &&
       error.code === "invalid_postgres_detached_restore_physical_bindings_options" &&
@@ -565,6 +958,35 @@ test("rejects hostile values and exact option, policy, request, and outcome viol
     binding.supervisor.launchWriter(),
     { code: "invalid_postgres_detached_restore_physical_bindings_request" },
   );
+  await assert.rejects(
+    binding.supervisorStateCollector.collectTerminalState(exact({
+      stateOwnerId: `state-owner:${"e".repeat(64)}`,
+      terminalRecord: terminalRecord(),
+    })),
+    { code: "invalid_postgres_detached_restore_physical_bindings_request" },
+  );
+  const wrongReceiptOwner = await fixture({
+    supervisorStateCollector: Object.freeze({
+      ...options.supervisorStateCollector,
+      async collectTerminalState(input) {
+        return exact({
+          contractVersion:
+            POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+          launchAttemptId: input.terminalRecord.launchAttemptId,
+          stateOwnerId: `state-owner:${"e".repeat(64)}`,
+          status: "collected",
+          terminalRecordSha256: "c".repeat(64),
+        });
+      },
+    }),
+  });
+  await assert.rejects(
+    wrongReceiptOwner.binding.supervisorStateCollector.collectTerminalState(
+      exact({ stateOwnerId: STATE_OWNER_ID, terminalRecord: terminalRecord() }),
+    ),
+    { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },
+  );
+  await wrongReceiptOwner.binding.stop();
   assert.equal(isPostgresDetachedRestorePhysicalBindings(new Proxy({}, {})), false);
   assert.equal(isPostgresDetachedRestorePublicationBinding(Object.freeze(Object.create(null))), false);
 
@@ -938,9 +1360,10 @@ test("aggregate stop is single-flight during synchronous fatal reentry", async (
   assert.equal(fatalCalls, 1);
 });
 
-test("aggregate stop aborts active settlements across every physical method family", async (t) => {
+test("aggregate stop retains state collection quiescence while aborting every physical method family", async (t) => {
   const rawPublication = await physicalPublicationFixture(t);
   const never = new Promise(() => {});
+  const rawCollection = deferred();
   const observedSignals = [];
   const fatalContexts = [];
   const base = await fixture();
@@ -949,6 +1372,13 @@ test("aggregate stop aborts active settlements across every physical method fami
     launchWriter(input) {
       observedSignals.push(input.signal);
       return never;
+    },
+  });
+  const supervisorStateCollector = Object.freeze({
+    ...base.options.supervisorStateCollector,
+    collectTerminalState(input) {
+      observedSignals.push(input.signal);
+      return rawCollection.promise;
     },
   });
   const lifecycleBackend = lifecycleWithMethod(
@@ -984,6 +1414,8 @@ test("aggregate stop aborts active settlements across every physical method fami
     supervisorSettlement: policyRegistry(SUPERVISOR_METHODS, {
       launchWriter: policy,
     }),
+    supervisorStateCollectionSettlement: policy,
+    supervisorStateCollector,
   });
 
   const active = [
@@ -995,14 +1427,32 @@ test("aggregate stop aborts active settlements across every physical method fami
     binding.resolveRestoreDestination(
       exact({ candidate: 1, generation: 2, kind: "fresh" }),
     ),
+    binding.supervisorStateCollector.collectTerminalState(
+      exact({ stateOwnerId: STATE_OWNER_ID, terminalRecord: terminalRecord() }),
+    ),
   ];
   const activeResults = Promise.allSettled(active);
-  assert.equal(observedSignals.length, 3);
+  assert.equal(observedSignals.length, 4);
   await rawPublication.acquireEntered;
   const stopped = binding.stop();
   const stoppedResult = Promise.allSettled([stopped]);
   assert.equal(observedSignals.every((signal) => signal.aborted), true);
   await new Promise((resolve) => setTimeout(resolve, 20));
+
+  let stopSettled = false;
+  void stopped.finally(() => {
+    stopSettled = true;
+  }).catch(() => {});
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(stopSettled, false);
+  rawCollection.resolve(exact({
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    launchAttemptId: "attempt-001",
+    stateOwnerId: STATE_OWNER_ID,
+    status: "collected",
+    terminalRecordSha256: "d".repeat(64),
+  }));
 
   const results = [...(await activeResults), ...(await stoppedResult)];
   assert.equal(results.every((result) => result.status === "rejected"), true);
@@ -1012,7 +1462,7 @@ test("aggregate stop aborts active settlements across every physical method fami
       "postgres_detached_restore_physical_bindings_outcome_uncertain",
     );
   }
-  assert.equal(fatalContexts.length, 4);
+  assert.equal(fatalContexts.length, 5);
   assert.equal(
     fatalContexts.every((context) => context.outcome === "no-settlement"),
     true,
@@ -1040,6 +1490,109 @@ test("deadline and grace breach rejects one family invocation, signals fatal, an
   await assert.rejects(binding.stop(), {
     code: "postgres_detached_restore_physical_bindings_outcome_uncertain",
   });
+});
+
+test("state collection settlement retains quiescence through late and grace-breached outcomes", async () => {
+  const base = await fixture();
+  let lateFatalCalls = 0;
+  const late = await fixture({
+    onFatal() {
+      lateFatalCalls += 1;
+    },
+    supervisorStateCollectionSettlement: {
+      deadlineMilliseconds: 1,
+      settlementGraceMilliseconds: 100,
+    },
+    supervisorStateCollector: Object.freeze({
+      ...base.options.supervisorStateCollector,
+      collectTerminalState(input) {
+        return new Promise((resolve) => {
+          setTimeout(() => resolve(exact({
+            contractVersion:
+              POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+            launchAttemptId: input.terminalRecord.launchAttemptId,
+            stateOwnerId: STATE_OWNER_ID,
+            status: "collected",
+            terminalRecordSha256: "d".repeat(64),
+          })), 10);
+        });
+      },
+    }),
+  });
+  await assert.rejects(
+    late.binding.supervisorStateCollector.collectTerminalState(
+      exact({ stateOwnerId: STATE_OWNER_ID, terminalRecord: terminalRecord() }),
+    ),
+    { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },
+  );
+  assert.equal(lateFatalCalls, 0);
+  assert.deepEqual(await late.binding.stop(), exact({ status: "stopped" }));
+
+  let fatalContext = null;
+  let observedSignal = null;
+  const raw = deferred();
+  const breached = await fixture({
+    onFatal(context) {
+      fatalContext = context;
+    },
+    supervisorStateCollectionSettlement: {
+      deadlineMilliseconds: 1,
+      settlementGraceMilliseconds: 1,
+    },
+    supervisorStateCollector: Object.freeze({
+      ...base.options.supervisorStateCollector,
+      collectTerminalState(input) {
+        observedSignal = input.signal;
+        return raw.promise;
+      },
+    }),
+  });
+  let collectionSettled = false;
+  const collection = breached.binding.supervisorStateCollector
+    .collectTerminalState(exact({
+      stateOwnerId: STATE_OWNER_ID,
+      terminalRecord: terminalRecord(),
+    }))
+    .finally(() => {
+      collectionSettled = true;
+    });
+  const collectionOutcome = collection.then(
+    () => null,
+    (error) => error,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(observedSignal.aborted, true);
+  assert.equal(fatalContext.outcome, "no-settlement");
+  assert.equal(collectionSettled, false);
+  let stopSettled = false;
+  const stop = breached.binding.stop().finally(() => {
+    stopSettled = true;
+  });
+  const stopOutcome = stop.then(
+    () => null,
+    (error) => error,
+  );
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(stopSettled, false);
+
+  raw.resolve(exact({
+    contractVersion:
+      POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
+    launchAttemptId: "attempt-001",
+    stateOwnerId: STATE_OWNER_ID,
+    status: "collected",
+    terminalRecordSha256: "d".repeat(64),
+  }));
+  assert.equal(
+    (await collectionOutcome).code,
+    "postgres_detached_restore_physical_bindings_outcome_uncertain",
+  );
+  assert.equal(
+    (await stopOutcome).code,
+    "postgres_detached_restore_physical_bindings_outcome_uncertain",
+  );
+  assert.equal(collectionSettled, true);
+  assert.equal(stopSettled, true);
 });
 
 test("supervisor and lifecycle no-settlement breaches use their private policies and fatal hook", async () => {

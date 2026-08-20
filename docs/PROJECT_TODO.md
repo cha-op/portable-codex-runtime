@@ -77,8 +77,9 @@
 - [done] Compose detached restore activation and recovery: source-free verify
   only an exact committed destination, bind version 1 provider attachment
   evidence without treating pathname equality as authority, atomically install
-  the canonical attachment plus prepared launch, and sweep four bounded
-  generation/activation/launch/current-inventory lanes without relaunching.
+  the canonical attachment plus prepared launch, and sweep five bounded
+  generation, activation, launch, current-inventory, and
+  `supervisor-state-gc` lanes without relaunching.
 - [done] Add a fleet-gated capture-bound activation request that proves
   the exact current-writer stop, clean checkpoint capture, and subsequent
   release or force-fence before a distinct target restore generation can
@@ -134,15 +135,17 @@
   optional first attach, and finalization inside one coordinator-owned
   per-operation guard; retained, ambiguous, or copied caller state cannot
   reconstruct a second attach dispatch. A deployment-private physical binding
-  graph now gives the three supervisor methods, nine storage-lifecycle methods,
-  four publication methods, and restore-destination resolver independent
+  graph now gives the three supervisor methods, a separate supervisor-state
+  collector, nine storage-lifecycle methods, four publication methods, and
+  restore-destination resolver independent
   deadlines and grace periods while preserving existing durable authority.
   Deployment now derives the two database-clock critical-window bounds from
   those method policies, an explicit aggregate database allowance, and a
   positive safety margin; stable-plan provision and every resolution enforce
-  the exact admitted lease. The completed safety matrix classifies all nineteen
-  settlement leaves, maps the seven protocol-surface mutators to seven
-  real-PostgreSQL acknowledgement-loss paths, and binds a
+  the exact admitted lease. The completed version 2 safety matrix classifies
+  all twenty settlement leaves as nine protocol-surface mutators, six
+  observations, and five contract-only leaves; it maps the nine mutators to
+  nine real-PostgreSQL acknowledgement-loss paths and binds a
   same-database/stable-plan retry
   through fresh physical bindings, image binding, runtime, and controller plus
   separate registry rehydration, an explicit test-only publication-seam router,
@@ -163,11 +166,59 @@
   into a trusted Podman filesystem authority and exercise that bridge with the
   initialized backend in one non-root process. This closes the current
   production identity gap without depending on either retention track below.
-- [pending] Second, add authority-owned bounded retention or garbage collection
-  for terminal local supervisor state, but only after PostgreSQL has permanently
-  committed the exact terminal attempt and every callback for that attempt is
-  quiescent. The stopped-only reconciler remains read-only and cannot authorize
-  this mutation.
+- [done] Second, add authority-owned bounded retention or garbage collection
+  for terminal local supervisor state. Migration 009 permanently records exact
+  owner-finalizer authorization, an immutable pre-dispatch route to the
+  private root's persistent `state-owner:<64 lowercase hex>` marker, and
+  collection completion. First owner preparation atomically publishes only a
+  fully written and synced marker-bearing root from a unique same-parent
+  staging directory; pre-rename crashes leave inert debris, while a retry
+  after rename or acknowledgement loss adopts the exact complete marker.
+  Existing malformed or unmarked final roots remain fail-closed. The third and
+  fifth recovery lanes are filtered by
+  that local owner, while the assembled production cold-start runner hashes
+  the caller's base recovery scope with the marker for cursor isolation and
+  holds the database-global exclusive lifecycle guard, with a dedicated
+  physical settlement. Migration 009 refuses active legacy
+  `starting`/`uncertain` launches and any non-null session current-launch
+  pointer, including malformed or orphaned pointer data, before installation.
+  That gate requires a committed current launch to be stopped or physically
+  fenced and its current-launch pointer cleared before rollout. It then fences
+  ownerless dispatch from already-running old binaries with a deferred
+  commit-time constraint. Owner updates are forbidden, while deletion requires
+  same-transaction teardown of the permanent operation-ID claim; no runtime
+  API exposes partial owner deletion or rebinding. Historical unbound
+  terminal work that is no longer current is not retroactively authorized and
+  remains an explicit cleanup case. The collector deletes exact stopped
+  revisions in two directory-
+  synced phases and accepts acknowledgement-loss replay from `collected` to
+  `absent`. Its fifth-lane cursor persists
+  `(sessionId, authorizedAt, terminalOperationId)` rather than collapsing each
+  session to its oldest item, so a pending item cannot starve later work from
+  that session before the next wrap. On Linux, destructive artifact operations
+  resolve through a revalidated held-root FD clone; non-Linux retains explicit
+  pathname brackets without claiming active same-UID ABA resistance.
+  Production deployment accepts only the exact process-local
+  supervisor/collector pair returned by
+  `createPodmanWriterSupervisorBundle()`; matching IDs and owner strings are
+  necessary but insufficient, and direct `createPodmanWriterSupervisor()` is
+  caller-asserted/raw only. Owner preparation and state/supervisor bundle
+  construction fail closed before physical dispatch. Runtime fixes that owner
+  into foreground launch-attempt reads as exact
+  `{ operationId, stateOwnerId }`, outside public restore admission.
+  Only the exact durable revision 4 cold-reconciliation branch may retire its
+  stopped container with idempotent removal plus exact name/ID absence proofs,
+  return the terminal record, and use the owner-bound GC finalizer. Ambiguous
+  removal, proof, adaptation, or a pre-commit finalizer failure preserves
+  revision 4 and commits no database finalization. A post-COMMIT
+  acknowledgement loss may instead follow an atomic commit of the operation
+  and owner-bound GC authorization; exact authorization readback determines
+  whether that commit exists. Revision 4 remains until the authorized collector
+  removes it in either case. Observer-only `complete-stopped`/`not-started`
+  remains null-record and no-GC. This marker is routing identity, not
+  cryptographic host
+  attestation or protection against an administrator cloning both root and
+  marker.
 - [pending] Third, define an authority-safe provider-state exact-replay
   retention floor or move permanent operation history to a PostgreSQL-indexed
   representation. This track has its own replay authority and does not inherit
