@@ -1,7 +1,7 @@
 import { Buffer } from "node:buffer";
 import { createHash, timingSafeEqual } from "node:crypto";
 import { constants as fsConstants } from "node:fs";
-import { lstat, open, realpath, unlink } from "node:fs/promises";
+import { lstat, open, realpath, rename, unlink } from "node:fs/promises";
 import { basename, dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { types as utilTypes } from "node:util";
 
@@ -280,6 +280,7 @@ const MAX_CANONICAL_NODES = 16_384;
 const MAX_FRAME_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
 const MAX_FRAME_COUNT = 65_535;
+const MAX_ADOPTION_MARKER_BYTES = 4 * 1024;
 const MAX_UINT32 = 4_294_967_295;
 const MAX_PATH_BYTES = 4_095;
 const MAX_PHYSICAL_OBJECT_ID_BYTES = 512;
@@ -288,7 +289,7 @@ const MAX_UINT64 = 18_446_744_073_709_551_615n;
 // protects Linux lexical nameability; file identity and access policy are
 // proved separately after descriptor acquisition.
 const MAX_STATE_DERIVED_NAME_BYTES = bufferByteLength(
-  `state.g${StringConstructor(MAX_UINT64)}.checkpoint`,
+  `state.g${StringConstructor(MAX_UINT64)}.verified.staging`,
   "utf8",
 );
 const MAX_STATE_DIRECTORY_BYTES =
@@ -2993,6 +2994,92 @@ function stateLedgerName(generation, code) {
   return `state.g${canonicalNonnegativeUint64(generation, code)}.log`;
 }
 
+function adoptionMarkerName(generation, phase, code) {
+  ensure(arrayIncludes(["pending", "verified"], phase), code);
+  return `state.g${canonicalNonnegativeUint64(generation, code)}.${phase}`;
+}
+
+function adoptionMarkerStagingName(generation, phase, code) {
+  return `${adoptionMarkerName(generation, phase, code)}.staging`;
+}
+
+function canonicalAdoptionMarker(value, expectedPhase, code) {
+  const marker = exactDataObject(
+    value,
+    ["contractVersion", "expectedHead", "nextHead", "phase"],
+    ["contractVersion", "expectedHead", "nextHead", "phase"],
+    code,
+  );
+  const expectedHead = canonicalLedgerHead(marker.expectedHead, code);
+  const nextHead = canonicalLedgerHead(marker.nextHead, code);
+  ensure(
+    marker.contractVersion === 1 &&
+      marker.phase === expectedPhase &&
+      arrayIncludes(["pending", "verified"], marker.phase) &&
+      expectedHead.contractVersion ===
+        FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION &&
+      nextHead.contractVersion ===
+        FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION &&
+      nextHead.generation ===
+        incrementNonnegativeUint64(expectedHead.generation, code) &&
+      nextHead.anchorRevision ===
+        incrementNonnegativeUint64(expectedHead.anchorRevision, code) &&
+      nextHead.stateRevision === expectedHead.stateRevision &&
+      nextHead.baseHeadChecksum === headChecksum(expectedHead, code) &&
+      nextHead.checkpointStateRevision === expectedHead.stateRevision &&
+      nextHead.frameCount === 0 &&
+      nextHead.ledgerBytes === 0 &&
+      nextHead.lastChecksum === nextHead.checkpointChecksum,
+    code,
+  );
+  return objectFreeze({
+    contractVersion: 1,
+    expectedHead,
+    nextHead,
+    phase: marker.phase,
+  });
+}
+
+function adoptionMarkerBytes(value, phase, code) {
+  const marker = canonicalAdoptionMarker(
+    {
+      contractVersion: 1,
+      expectedHead: value.expectedHead,
+      nextHead: value.nextHead,
+      phase,
+    },
+    phase,
+    code,
+  );
+  const bytes = bufferFrom(canonicalString(marker), "utf8");
+  ensure(bytes.length > 0 && bytes.length <= MAX_ADOPTION_MARKER_BYTES, code);
+  return objectFreeze({ bytes, marker });
+}
+
+function parseAdoptionMarker(bytes, expectedPhase) {
+  ensure(
+    bufferIsBuffer(bytes) &&
+      bytes.length > 0 &&
+      bytes.length <= MAX_ADOPTION_MARKER_BYTES,
+    "corrupt_ledger",
+  );
+  const text = bufferToString(bytes, "utf8");
+  ensure(bufferEquals(bufferFrom(text, "utf8"), bytes), "corrupt_ledger");
+  let parsed;
+  try {
+    parsed = jsonParseIntrinsic(text);
+  } catch {
+    fail("corrupt_ledger");
+  }
+  const marker = canonicalAdoptionMarker(
+    parsed,
+    expectedPhase,
+    "corrupt_ledger",
+  );
+  ensure(canonicalString(marker) === text, "corrupt_ledger");
+  return marker;
+}
+
 function metadataSnapshot(metadata) {
   return objectFreeze({
     ctimeNs: metadata.ctimeNs,
@@ -3012,7 +3099,7 @@ function sameMetadataSnapshot(left, right) {
 async function openNamedStateFile(
   authority,
   name,
-  { expectedPin, writable = false } = {},
+  { allowMissing = false, expectedPin, writable = false } = {},
 ) {
   const path = stateDirectChildPath(authority.path, name, "corrupt_ledger");
   let handle;
@@ -3047,6 +3134,18 @@ async function openNamedStateFile(
     };
   } catch (error) {
     if (handle !== undefined) await ignoreRejection(handle.close());
+    if (
+      allowMissing &&
+      handle === undefined &&
+      safeErrorCode(error) === "ENOENT"
+    ) {
+      try {
+        await authority.assertCurrent();
+      } catch {
+        fail("corrupt_ledger");
+      }
+      return undefined;
+    }
     if (isInternalError(error)) throw error;
     fail("corrupt_ledger");
   }
@@ -3140,6 +3239,164 @@ async function cleanupCheckpointFile(authority, generation, syncDirectory) {
   }
 }
 
+async function readAdoptionMarker(authority, generation, phase) {
+  let file;
+  try {
+    file = await openNamedStateFile(
+      authority,
+      adoptionMarkerName(generation, phase, "corrupt_ledger"),
+      { allowMissing: true },
+    );
+    if (file === undefined) return null;
+    ensure(
+      file.metadata.size > 0n &&
+        file.metadata.size <= BigIntConstructor(MAX_ADOPTION_MARKER_BYTES),
+      "corrupt_ledger",
+    );
+    const marker = parseAdoptionMarker(
+      await readStableLedger(authority, file),
+      phase,
+    );
+    ensure(marker.nextHead.generation === generation, "corrupt_ledger");
+    return marker;
+  } finally {
+    await closeStateFile(file);
+  }
+}
+
+async function createAdoptionMarker(
+  authority,
+  markerValue,
+  phase,
+  syncDirectory,
+) {
+  const { bytes, marker } = adoptionMarkerBytes(
+    markerValue,
+    phase,
+    "maintenance_failed",
+  );
+  const generation = marker.nextHead.generation;
+  await cleanupAdoptionMarkerStaging(
+    authority,
+    generation,
+    [phase],
+    syncDirectory,
+  );
+  let existing;
+  try {
+    existing = await openNamedStateFile(
+      authority,
+      adoptionMarkerName(generation, phase, "corrupt_ledger"),
+      { allowMissing: true },
+    );
+    ensure(existing === undefined, "maintenance_failed");
+  } finally {
+    await closeStateFile(existing);
+  }
+  let file;
+  try {
+    file = await createNamedStateFile(
+      authority,
+      adoptionMarkerStagingName(generation, phase, "maintenance_failed"),
+    );
+    await writeAll(file.handle, bytes, 0);
+    await file.handle.sync();
+    ensure(
+      bufferEquals(await readStableLedger(authority, file), bytes),
+      "corrupt_ledger",
+    );
+    const finalPath = stateDirectChildPath(
+      authority.path,
+      adoptionMarkerName(generation, phase, "maintenance_failed"),
+      "maintenance_failed",
+    );
+    // The protected property is atomic publication of complete canonical bytes
+    // bound to this phase. The fixed staging path plus rename prevents readers
+    // from observing a partial final marker. Same-UID arbitrary forgery remains
+    // outside this access-policy boundary and is not claimed to be isolated.
+    await rename(file.pin.path, finalPath);
+    const published = {
+      handle: file.handle,
+      pin: objectFreeze({ identity: file.pin.identity, path: finalPath }),
+    };
+    ensure(
+      bufferEquals(await readStableLedger(authority, published), bytes),
+      "corrupt_ledger",
+    );
+    await syncDirectory(authority.handle, authority.path);
+    await authority.assertCurrent();
+    return marker;
+  } catch (error) {
+    if (isInternalError(error)) throw error;
+    fail("maintenance_failed");
+  } finally {
+    await closeStateFile(file);
+  }
+}
+
+async function cleanupAdoptionMarkerNames(
+  authority,
+  names,
+  syncDirectory,
+) {
+  let removed = false;
+  for (let index = 0; index < names.length; index += 1) {
+    removed =
+      (await unlinkSafeStateFile(authority, names[index])) || removed;
+  }
+  if (removed) {
+    try {
+      await syncDirectory(authority.handle, authority.path);
+    } catch {
+      fail("maintenance_failed");
+    }
+  }
+}
+
+async function cleanupAdoptionMarkerStaging(
+  authority,
+  generation,
+  phases,
+  syncDirectory,
+) {
+  const names = [];
+  for (let index = 0; index < phases.length; index += 1) {
+    arrayPush(
+      names,
+      adoptionMarkerStagingName(
+        generation,
+        phases[index],
+        "corrupt_ledger",
+      ),
+    );
+  }
+  await cleanupAdoptionMarkerNames(authority, names, syncDirectory);
+}
+
+async function cleanupAdoptionMarkers(
+  authority,
+  generation,
+  phases,
+  syncDirectory,
+) {
+  const names = [];
+  for (let index = 0; index < phases.length; index += 1) {
+    arrayPush(
+      names,
+      adoptionMarkerName(generation, phases[index], "corrupt_ledger"),
+    );
+    arrayPush(
+      names,
+      adoptionMarkerStagingName(
+        generation,
+        phases[index],
+        "corrupt_ledger",
+      ),
+    );
+  }
+  await cleanupAdoptionMarkerNames(authority, names, syncDirectory);
+}
+
 function parseEnvelopeFromBuffer(
   bytes,
   offset,
@@ -3202,6 +3459,153 @@ function parseEnvelopeFromBuffer(
     frame,
     frameEnd,
   });
+}
+
+function stateEnvelopeContractVersion(bytes, kind, generation) {
+  ensure(
+    bufferIsBuffer(bytes) &&
+      bytes.length >= FRAME_HEADER_BYTES + FRAME_FOOTER_BYTES + 1,
+    "corrupt_ledger",
+  );
+  const payloadLength = bufferReadUInt32BE(bytes, FRAME_MAGIC.length);
+  const payloadStart = FRAME_HEADER_BYTES;
+  const payloadEnd = payloadStart + payloadLength;
+  ensure(
+    payloadLength > 0 &&
+      payloadLength <= MAX_FRAME_PAYLOAD_BYTES &&
+      payloadEnd + FRAME_FOOTER_BYTES === bytes.length,
+    "corrupt_ledger",
+  );
+  const payload = bufferSubarray(bytes, payloadStart, payloadEnd);
+  const text = bufferToString(payload, "utf8");
+  ensure(
+    bufferEquals(bufferFrom(text, "utf8"), payload),
+    "corrupt_ledger",
+  );
+  let untrusted;
+  try {
+    untrusted = jsonParseIntrinsic(text);
+  } catch {
+    fail("corrupt_ledger");
+  }
+  inspectPlainObject(untrusted, "corrupt_ledger");
+  const contractVersion = ownDataValue(
+    untrusted,
+    "contractVersion",
+    "corrupt_ledger",
+  );
+  const format = stateFormatForContractVersion(
+    contractVersion,
+    "corrupt_ledger",
+  );
+  const normalizer =
+    kind === "checkpoint"
+      ? (value, code) =>
+          normalizeCheckpointFrame(value, code, format.contractVersion)
+      : kind === "ledger"
+        ? (value, code) =>
+            normalizeDeltaFrame(value, code, format.contractVersion)
+        : fail("corrupt_ledger");
+  const parsed = parseEnvelopeFromBuffer(
+    bytes,
+    0,
+    1,
+    normalizer,
+    format,
+  );
+  ensure(parsed.frame.generation === generation, "corrupt_ledger");
+  return format.contractVersion;
+}
+
+async function readFirstStateFileContractVersion(
+  authority,
+  file,
+  kind,
+  generation,
+) {
+  const readEnvelope = async () => {
+    const header = await readExact(file.handle, FRAME_HEADER_BYTES, 0);
+    ensure(
+      bufferEquals(bufferSubarray(header, 0, FRAME_MAGIC.length), FRAME_MAGIC),
+      "corrupt_ledger",
+    );
+    const payloadLength = bufferReadUInt32BE(header, FRAME_MAGIC.length);
+    ensure(
+      payloadLength > 0 && payloadLength <= MAX_FRAME_PAYLOAD_BYTES,
+      "corrupt_ledger",
+    );
+    const frameBytes = FRAME_HEADER_BYTES + payloadLength + FRAME_FOOTER_BYTES;
+    ensure(
+      BigIntConstructor(frameBytes) <= file.metadata.size,
+      "corrupt_ledger",
+    );
+    return await readExact(file.handle, frameBytes, 0);
+  };
+  const first = await readEnvelope();
+  const contractVersion = stateEnvelopeContractVersion(first, kind, generation);
+  const after = await assertPathFileCurrent(
+    file.pin.path,
+    file.handle,
+    file.pin.identity,
+    authority.currentUid,
+  );
+  if (
+    after.size !== file.metadata.size ||
+    after.mtimeNs !== file.metadata.mtimeNs ||
+    after.ctimeNs !== file.metadata.ctimeNs
+  ) {
+    file.metadata = after;
+    const second = await readEnvelope();
+    const finalMetadata = await assertPathFileCurrent(
+      file.pin.path,
+      file.handle,
+      file.pin.identity,
+      authority.currentUid,
+    );
+    ensure(
+      finalMetadata.size === after.size &&
+        finalMetadata.mtimeNs === after.mtimeNs &&
+        finalMetadata.ctimeNs === after.ctimeNs &&
+        bufferEquals(first, second) &&
+        stateEnvelopeContractVersion(second, kind, generation) ===
+          contractVersion,
+      "corrupt_ledger",
+    );
+  }
+  return contractVersion;
+}
+
+async function predecessorStateContractVersion(authority, generation) {
+  let file;
+  try {
+    file = await openNamedStateFile(
+      authority,
+      stateCheckpointName(generation, "corrupt_ledger"),
+      { allowMissing: true },
+    );
+    if (file !== undefined) {
+      return await readFirstStateFileContractVersion(
+        authority,
+        file,
+        "checkpoint",
+        generation,
+      );
+    }
+    file = await openNamedStateFile(
+      authority,
+      stateLedgerName(generation, "corrupt_ledger"),
+      { allowMissing: true },
+    );
+    if (file === undefined) return null;
+    return await readFirstStateFileContractVersion(
+      authority,
+      file,
+      "ledger",
+      generation,
+    );
+  } finally {
+    await closeStateFile(file);
+  }
 }
 
 function validateUnanchoredDeltaTail(bytes, offset, head, state) {
@@ -3637,6 +4041,7 @@ async function closeStateFile(file) {
 }
 
 async function loadGenerationState({
+  allowTruncate = true,
   authority,
   cache,
   head,
@@ -3686,11 +4091,13 @@ async function loadGenerationState({
           cacheSameGeneration && cache.ledgerPin !== null
             ? cache.ledgerPin
             : undefined,
-        writable: true,
+        writable: allowTruncate,
       },
     );
     ensure(
-      ledger.metadata.size >= BigIntConstructor(head.ledgerBytes) &&
+      (allowTruncate
+        ? ledger.metadata.size >= BigIntConstructor(head.ledgerBytes)
+        : ledger.metadata.size === BigIntConstructor(head.ledgerBytes)) &&
         ledger.metadata.size <= BigIntConstructor(MAX_LEDGER_BYTES),
       "corrupt_ledger",
     );
@@ -3732,6 +4139,7 @@ async function loadGenerationState({
     let bytes = await readStableLedger(authority, ledger);
     const parsed = parseActiveLedger(bytes, head, checkpointState);
     if (parsed.truncateOffset !== null) {
+      ensure(allowTruncate, "corrupt_ledger");
       bytes = await truncateActiveTail(
         authority,
         headAnchor,
@@ -3945,6 +4353,386 @@ function assertAdoptionCanonicalCapacity(operations, storages) {
   }
 }
 
+function v2AdoptionMaterial(sourceState) {
+  validateV2CheckpointState(sourceState, "corrupt_ledger");
+  const targetState = v3RecoveryStateFromV2(sourceState);
+  const sourceSnapshot = checkpointArrays(
+    sourceState,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
+  );
+  const targetSnapshot = checkpointArrays(
+    targetState,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+  );
+  ensure(
+    sourceSnapshot.operations.length <= MAX_FRAME_COUNT &&
+      targetSnapshot.storages.length <= MAX_FRAME_COUNT,
+    "state_capacity_exhausted",
+  );
+  assertAdoptionCanonicalCapacity(
+    sourceSnapshot.operations,
+    targetSnapshot.storages,
+  );
+  return objectFreeze({ sourceSnapshot, targetSnapshot, targetState });
+}
+
+function assertExactAdoptionCandidate(candidateState, material) {
+  ensure(
+    candidateState.contractVersion ===
+      FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION &&
+      candidateState.stateRevision === material.targetState.stateRevision,
+    "corrupt_ledger",
+  );
+  const candidateSnapshot = checkpointArrays(
+    candidateState,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+  );
+  ensure(
+    canonicalEqual(
+      candidateSnapshot.operations,
+      material.targetSnapshot.operations,
+    ) &&
+      canonicalEqual(
+        candidateSnapshot.storages,
+        material.targetSnapshot.storages,
+      ),
+    "corrupt_ledger",
+  );
+}
+
+async function compareAndResolveAdoption(
+  adoptionAuthority,
+  stateAuthority,
+  marker,
+  material,
+) {
+  let adopted;
+  try {
+    adopted = await invokeNativePromise(
+      adoptionAuthority.compareAndAdopt,
+      [
+        objectFreeze({
+          expectedHead: marker.expectedHead,
+          nextHead: marker.nextHead,
+          operations: material.sourceSnapshot.operations,
+          storages: material.targetSnapshot.storages,
+        }),
+      ],
+      "io_failed",
+    );
+  } catch {
+    return "unknown";
+  }
+  if (adopted === true) return "advanced";
+  if (adopted !== false) return "unknown";
+  try {
+    const observed = await readTrustedLedgerHead(stateAuthority);
+    // A false result never proves that this request installed nextHead:
+    // the public head does not bind the authority's complete history.
+    if (canonicalEqual(observed, marker.expectedHead)) return "unchanged";
+  } catch {
+    // The durable pending marker retains both generations for recovery.
+  }
+  return "unknown";
+}
+
+async function finishVerifiedV2Adoption({
+  authority,
+  loaded,
+  lock,
+  marker,
+  stateAuthority,
+  syncDirectory,
+  verified,
+}) {
+  await lock.assertHeld();
+  await authority.assertCurrent();
+  const authorityProjectionReceipt = await validateV3AuthorityProjection(
+    stateAuthority,
+    marker.nextHead,
+    loaded.state,
+  );
+  await lock.assertHeld();
+  await authority.assertCurrent();
+  const observedAfterProjection = await readTrustedLedgerHead(stateAuthority);
+  if (!canonicalEqual(observedAfterProjection, marker.nextHead)) {
+    fail("commit_outcome_uncertain");
+  }
+  if (!verified) {
+    await createAdoptionMarker(authority, marker, "verified", syncDirectory);
+  }
+  await lock.assertHeld();
+  await authority.assertCurrent();
+  await cleanupGeneration(
+    authority,
+    marker.expectedHead.generation,
+    syncDirectory,
+  );
+  await lock.assertHeld();
+  await authority.assertCurrent();
+  await cleanupAdoptionMarkers(
+    authority,
+    marker.nextHead.generation,
+    ["pending"],
+    syncDirectory,
+  );
+  await lock.assertHeld();
+  await authority.assertCurrent();
+  await cleanupAdoptionMarkers(
+    authority,
+    marker.nextHead.generation,
+    ["verified"],
+    syncDirectory,
+  );
+  return objectFreeze({
+    cache: objectFreeze({
+      ...loaded.cache,
+      authorityProjectionReceipt,
+    }),
+    head: marker.nextHead,
+    state: loaded.state,
+  });
+}
+
+async function discardUnchangedV2Adoption({
+  authority,
+  lock,
+  marker,
+  syncDirectory,
+}) {
+  try {
+    await cleanupAdoptionMarkers(
+      authority,
+      marker.nextHead.generation,
+      ["pending"],
+      syncDirectory,
+    );
+    await lock.assertHeld();
+    await authority.assertCurrent();
+    await cleanupGeneration(
+      authority,
+      marker.nextHead.generation,
+      syncDirectory,
+    );
+  } catch (error) {
+    if (isInternalError(error)) throw error;
+    fail("maintenance_failed");
+  }
+  fail("maintenance_failed");
+}
+
+async function requiredGenerationPresence(authority, head) {
+  const names =
+    head.generation === "0"
+      ? head.stateRevision === "0"
+        ? []
+        : [stateLedgerName("0", "corrupt_ledger")]
+      : [
+          stateCheckpointName(head.generation, "corrupt_ledger"),
+          stateLedgerName(head.generation, "corrupt_ledger"),
+        ];
+  if (names.length === 0) return "complete";
+  let present = 0;
+  for (let index = 0; index < names.length; index += 1) {
+    let file;
+    try {
+      file = await openNamedStateFile(authority, names[index], {
+        allowMissing: true,
+      });
+      if (file !== undefined) present += 1;
+    } finally {
+      await closeStateFile(file);
+    }
+  }
+  if (present === names.length) return "complete";
+  return present === 0 ? "absent" : "partial";
+}
+
+async function recoverV2AdoptionMaterial({
+  adoptionAuthority,
+  authority,
+  lock,
+  marker,
+  stateAuthority,
+  syncDirectory,
+  verified,
+}) {
+  const source = await loadGenerationState({
+    allowTruncate: false,
+    authority,
+    cache: undefined,
+    head: marker.expectedHead,
+    headAnchor: stateAuthority,
+    lock,
+  });
+  const material = v2AdoptionMaterial(source.state);
+  const candidate = await loadGenerationState({
+    allowTruncate: false,
+    authority,
+    cache: undefined,
+    head: marker.nextHead,
+    headAnchor: stateAuthority,
+    lock,
+  });
+  assertExactAdoptionCandidate(candidate.state, material);
+  await lock.assertHeld();
+  await authority.assertCurrent();
+  const outcome = await compareAndResolveAdoption(
+    adoptionAuthority,
+    stateAuthority,
+    marker,
+    material,
+  );
+  if (outcome === "unchanged") {
+    return await discardUnchangedV2Adoption({
+      authority,
+      lock,
+      marker,
+      syncDirectory,
+    });
+  }
+  if (outcome !== "advanced") fail("commit_outcome_uncertain");
+  return await finishVerifiedV2Adoption({
+    authority,
+    loaded: candidate,
+    lock,
+    marker,
+    stateAuthority,
+    syncDirectory,
+    verified,
+  });
+}
+
+async function recoverV2AdoptionIfNeeded({
+  adoptionAuthority,
+  authority,
+  lock,
+  stateAuthority,
+  syncDirectory,
+  trustedHead,
+}) {
+  let markerGeneration;
+  if (
+    trustedHead.contractVersion ===
+    FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION
+  ) {
+    if (
+      canonicalUint64(trustedHead.generation, "corrupt_ledger").parsed ===
+      MAX_UINT64
+    ) {
+      return null;
+    }
+    markerGeneration = incrementNonnegativeUint64(
+      trustedHead.generation,
+      "corrupt_ledger",
+    );
+  } else {
+    ensure(
+      trustedHead.contractVersion ===
+        FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+      "corrupt_ledger",
+    );
+    markerGeneration = trustedHead.generation;
+  }
+  await cleanupAdoptionMarkerStaging(
+    authority,
+    markerGeneration,
+    ["pending", "verified"],
+    syncDirectory,
+  );
+  const pending = await readAdoptionMarker(
+    authority,
+    markerGeneration,
+    "pending",
+  );
+  const verified = await readAdoptionMarker(
+    authority,
+    markerGeneration,
+    "verified",
+  );
+  if (pending !== null && verified !== null) {
+    ensure(
+      canonicalEqual(pending.expectedHead, verified.expectedHead) &&
+        canonicalEqual(pending.nextHead, verified.nextHead),
+      "corrupt_ledger",
+    );
+  }
+  const marker = verified ?? pending;
+  if (marker !== null) {
+    const sourcePresence = await requiredGenerationPresence(
+      authority,
+      marker.expectedHead,
+    );
+    if (verified !== null) {
+      ensure(canonicalEqual(trustedHead, marker.nextHead), "corrupt_ledger");
+      if (sourcePresence === "complete") {
+        return await recoverV2AdoptionMaterial({
+          adoptionAuthority,
+          authority,
+          lock,
+          marker,
+          stateAuthority,
+          syncDirectory,
+          verified: true,
+        });
+      }
+      const candidate = await loadGenerationState({
+        allowTruncate: false,
+        authority,
+        cache: undefined,
+        head: marker.nextHead,
+        headAnchor: stateAuthority,
+        lock,
+      });
+      return await finishVerifiedV2Adoption({
+        authority,
+        loaded: candidate,
+        lock,
+        marker,
+        stateAuthority,
+        syncDirectory,
+        verified: true,
+      });
+    }
+    ensure(sourcePresence === "complete", "corrupt_ledger");
+    ensure(
+      canonicalEqual(trustedHead, marker.expectedHead) ||
+        canonicalEqual(trustedHead, marker.nextHead),
+      "corrupt_ledger",
+    );
+    return await recoverV2AdoptionMaterial({
+      adoptionAuthority,
+      authority,
+      lock,
+      marker,
+      stateAuthority,
+      syncDirectory,
+      verified: false,
+    });
+  }
+  if (
+    trustedHead.contractVersion ===
+      FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION &&
+    trustedHead.generation !== "0"
+  ) {
+    const predecessorGeneration = decrementPositiveUint64(
+      trustedHead.generation,
+      "corrupt_ledger",
+    );
+    const predecessorContractVersion = await predecessorStateContractVersion(
+      authority,
+      predecessorGeneration,
+    );
+    if (
+      predecessorContractVersion ===
+      FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION
+    ) {
+      fail("commit_outcome_uncertain");
+    }
+  }
+  return null;
+}
+
 async function adoptV2Generation({
   adoptionAuthority,
   authority,
@@ -3966,33 +4754,15 @@ async function adoptV2Generation({
     headAnchor: stateAuthority,
     lock,
   });
-  validateV2CheckpointState(source.state, "corrupt_ledger");
-  const targetState = v3RecoveryStateFromV2(source.state);
+  const material = v2AdoptionMaterial(source.state);
   const nextGeneration = incrementNonnegativeUint64(
     expectedHead.generation,
     "state_capacity_exhausted",
   );
   const baseHeadChecksum = headChecksum(expectedHead, "corrupt_ledger");
-  const sourceSnapshot = checkpointArrays(
-    source.state,
-    FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
-  );
-  const targetSnapshot = checkpointArrays(
-    targetState,
-    FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
-  );
   // Adoption contract v1 is a bounded full-array handoff. Reject before any
   // candidate cleanup or creation so an over-cap source cannot be mistaken
   // for an uncertain authority outcome and cannot mutate generation G+1.
-  ensure(
-    sourceSnapshot.operations.length <= MAX_FRAME_COUNT &&
-      targetSnapshot.storages.length <= MAX_FRAME_COUNT,
-    "state_capacity_exhausted",
-  );
-  assertAdoptionCanonicalCapacity(
-    sourceSnapshot.operations,
-    targetSnapshot.storages,
-  );
   await lock.assertHeld();
   await authority.assertCurrent();
   const observedBeforeMaterialize = await readTrustedLedgerHead(stateAuthority);
@@ -4002,6 +4772,7 @@ async function adoptV2Generation({
   let checkpoint;
   let ledger;
   let adoptionStarted = false;
+  let pendingCreated = false;
   let authorityAdvanced = false;
   let candidateCreated = false;
   try {
@@ -4016,7 +4787,7 @@ async function adoptV2Generation({
     );
     const checkpointResult = await writeCheckpointFrames(
       checkpoint.handle,
-      targetState,
+      material.targetState,
       nextGeneration,
       baseHeadChecksum,
       FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
@@ -4067,100 +4838,85 @@ async function adoptV2Generation({
       { ...checkpoint, metadata: checkpointMetadata },
       nextHead,
     );
-    const loadedSnapshot = checkpointArrays(
-      loaded.state,
-      FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
-    );
-    ensure(
-      checkpointStateChecksum(
-        FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
-        loaded.state.stateRevision,
-        loadedSnapshot.operations,
-        loadedSnapshot.storages,
-      ) ===
-        checkpointStateChecksum(
-          FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
-          targetState.stateRevision,
-          targetSnapshot.operations,
-          targetSnapshot.storages,
-        ),
-      "corrupt_ledger",
-    );
+    assertExactAdoptionCandidate(loaded.state, material);
     await lock.assertHeld();
     await authority.assertCurrent();
     const observedBeforeAdopt = await readTrustedLedgerHead(stateAuthority);
     ensure(canonicalEqual(observedBeforeAdopt, expectedHead), "io_failed");
-
-    let adopted;
-    let adoptionUncertain = false;
+    const marker = canonicalAdoptionMarker(
+      { contractVersion: 1, expectedHead, nextHead, phase: "pending" },
+      "pending",
+      "corrupt_ledger",
+    );
+    await createAdoptionMarker(authority, marker, "pending", syncDirectory);
+    pendingCreated = true;
+    await lock.assertHeld();
+    await authority.assertCurrent();
     adoptionStarted = true;
-    try {
-      adopted = await invokeNativePromise(
-        adoptionAuthority.compareAndAdopt,
-        [
-          objectFreeze({
-            expectedHead,
-            nextHead,
-            operations: sourceSnapshot.operations,
-            storages: targetSnapshot.storages,
-          }),
-        ],
-        "io_failed",
-      );
-    } catch {
-      adopted = undefined;
-      adoptionUncertain = true;
-    }
-    let outcome = adopted === true ? "advanced" : "unknown";
-    if (adopted === false && !adoptionUncertain) {
-      try {
-        const observedAfterAdopt = await readTrustedLedgerHead(stateAuthority);
-        if (canonicalEqual(observedAfterAdopt, nextHead)) {
-          outcome = "advanced";
-        } else if (canonicalEqual(observedAfterAdopt, expectedHead)) {
-          outcome = "unchanged";
-        }
-      } catch {
-        outcome = "unknown";
-      }
-    }
+    const outcome = await compareAndResolveAdoption(
+      adoptionAuthority,
+      stateAuthority,
+      marker,
+      material,
+    );
     if (outcome === "unchanged") {
       await ignoreRejection(checkpoint.handle.close());
       checkpoint = undefined;
       await ignoreRejection(ledger.handle.close());
       ledger = undefined;
-      await cleanupGeneration(authority, nextGeneration, syncDirectory);
-      fail("maintenance_failed");
+      return await discardUnchangedV2Adoption({
+        authority,
+        lock,
+        marker,
+        syncDirectory,
+      });
     }
     if (outcome !== "advanced") fail("commit_outcome_uncertain");
     authorityAdvanced = true;
-    const authorityProjectionReceipt = await validateV3AuthorityProjection(
+    const completed = await finishVerifiedV2Adoption({
+      authority,
+      loaded: objectFreeze({
+        cache: objectFreeze({
+          authorityProjectionReceipt: null,
+          checkpointMetadata: metadataSnapshot(loaded.metadata),
+          checkpointPin: checkpoint.pin,
+          checkpointState: loaded.state,
+          head: nextHead,
+          ledgerMetadata: metadataSnapshot(ledgerMetadata),
+          ledgerPin: ledger.pin,
+          state: loaded.state,
+        }),
+        head: nextHead,
+        state: loaded.state,
+      }),
+      lock,
+      marker,
       stateAuthority,
-      nextHead,
-      loaded.state,
-    );
-    const nextCache = objectFreeze({
-      authorityProjectionReceipt,
-      checkpointMetadata: metadataSnapshot(loaded.metadata),
-      checkpointPin: checkpoint.pin,
-      checkpointState: loaded.state,
-      head: nextHead,
-      ledgerMetadata: metadataSnapshot(ledgerMetadata),
-      ledgerPin: ledger.pin,
-      state: loaded.state,
+      syncDirectory,
+      verified: false,
     });
     await ignoreRejection(checkpoint.handle.close());
     checkpoint = undefined;
     await ignoreRejection(ledger.handle.close());
     ledger = undefined;
-    await cleanupGeneration(authority, expectedHead.generation, syncDirectory);
-    return objectFreeze({ cache: nextCache, head: nextHead, state: loaded.state });
+    return completed;
   } catch (error) {
     if (checkpoint !== undefined) await ignoreRejection(checkpoint.handle.close());
     if (ledger !== undefined) await ignoreRejection(ledger.handle.close());
-    if (candidateCreated && !adoptionStarted && !authorityAdvanced) {
+    if (
+      candidateCreated &&
+      !pendingCreated &&
+      !adoptionStarted &&
+      !authorityAdvanced
+    ) {
       try {
         await cleanupGeneration(authority, nextGeneration, syncDirectory);
+        await cleanupAdoptionMarkers(
+          authority,
+          nextGeneration,
+          ["pending", "verified"],
+          syncDirectory,
+        );
       } catch {
         fail("maintenance_failed");
       }
@@ -4844,7 +5600,20 @@ export class FilesystemImageProviderState {
           );
         }
         let loaded;
+        if (this.#exactMode) {
+          loaded = await recoverV2AdoptionIfNeeded({
+            adoptionAuthority: this.#adoptionAuthority,
+            authority,
+            lock,
+            stateAuthority: this.#stateAuthority,
+            syncDirectory: this.#syncDirectory,
+            trustedHead,
+          });
+          if (loaded !== null) trustedHead = loaded.head;
+          else loaded = undefined;
+        }
         if (
+          loaded === undefined &&
           this.#exactMode &&
           trustedHead.contractVersion ===
             FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION
@@ -4875,7 +5644,7 @@ export class FilesystemImageProviderState {
             syncDirectory: this.#syncDirectory,
           });
           trustedHead = loaded.head;
-        } else {
+        } else if (loaded === undefined) {
           const trueGenesis =
             trustedHead.generation === "0" && trustedHead.stateRevision === "0";
           if (trueGenesis) {

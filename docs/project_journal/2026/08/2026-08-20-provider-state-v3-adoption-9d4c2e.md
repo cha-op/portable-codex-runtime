@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-20
 updated: 2026-08-20
 branch: wip/provider-state-v3-adoption
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/56
 supersedes: []
 superseded_by:
 ---
@@ -94,6 +94,20 @@ superseded_by:
   commit. Any third head or mismatched, missing, extra, or unreadable evidence
   preserves both filesystem generations and reports
   `commit_outcome_uncertain`.
+- The filesystem records each in-flight adoption with canonical,
+  generation-scoped `pending` and `verified` markers. Each phase is bound into
+  the canonical bytes, written and synced under a staging name, then atomically
+  published and directory-synced. A cold `pending` recovery reads both
+  retained generations without truncation, reconstructs the complete version
+  2 operation manifest and target storage projection, and asks PostgreSQL to
+  verify or replay that exact request. Only an exact successful authority
+  result plus projection validation may create `verified`; the version 2
+  source is deleted only after that marker is durable. Verified recovery
+  replays the exact manifest while the complete source remains, and safely
+  finishes an interrupted source cleanup when only part or none of that source
+  remains. A marker/head mismatch, marker tamper, or a version 3 head with an
+  unmarked version 2 predecessor fails closed and preserves the recovery
+  material.
 - A permanent lifecycle registry owns each `(provider_id, anchor_id)` key.
   Every head insert claims that same unique row, while complete teardown of any
   operation history moves it from active to immutable retired. This real
@@ -125,9 +139,12 @@ superseded_by:
   outside those operational limits fails with `state_capacity_exhausted`
   before candidate cleanup or creation. Supporting the wider version 2 format
   range requires a future streaming or paged adoption contract.
-- The filesystem candidate is durable before the database cut. A definite
-  unchanged outcome removes only that candidate; an uncertain outcome never
-  guesses which generation is authoritative.
+- The filesystem candidate and `pending` marker are durable before the
+  database cut. A definite unchanged outcome removes only that candidate and
+  its marker; an uncertain outcome never guesses which generation is
+  authoritative. After exact success and projection validation, a durable
+  `verified` marker protects the source-cleanup crash window; cold recovery
+  revalidates the projection before completing source or marker cleanup.
 - PostgreSQL is exact replay authority, not physical ext4 mutation authority.
   The provider lock, filesystem descriptors, external head, canonical storage
   lineage, and ext4/Podman observation boundary remain separate requirements.

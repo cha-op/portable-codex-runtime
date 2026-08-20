@@ -214,6 +214,11 @@ function createSerializedLockProvider(tracker = {}) {
     let released = false;
     return {
       async assertHeld() {
+        tracker.assertions = (tracker.assertions ?? 0) + 1;
+        if (tracker.failNextAssertion === true) {
+          tracker.failNextAssertion = false;
+          throw new Error("lock lost");
+        }
         if (!held || released) throw new Error("lock lost");
       },
       async release() {
@@ -294,6 +299,24 @@ function v3GenesisHead() {
   });
 }
 
+function adoptionMarkerPath(directory, generation, phase) {
+  return join(directory, `state.g${generation}.${phase}`);
+}
+
+function adoptionMarkerStagingPath(directory, generation, phase) {
+  return join(directory, `state.g${generation}.${phase}.staging`);
+}
+
+async function fileExists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+
 function createTrustedHeadAnchor(tracker = {}) {
   let head = genesisHead();
   tracker.reads = 0;
@@ -340,6 +363,7 @@ function createExactStateAuthorities(options = {}) {
   let head = normalizeFilesystemImageProviderStateHead(
     options.head ?? v3GenesisHead(),
   );
+  let committedAdoptionKey = null;
   const operations = new Map();
   for (const record of options.operations ?? []) {
     operations.set(record.operationId, Object.freeze(record));
@@ -497,10 +521,26 @@ function createExactStateAuthorities(options = {}) {
       storages,
     }) {
       tracker.adoptions = (tracker.adoptions ?? 0) + 1;
+      tracker.adoptionOperations = adoptedOperations;
       tracker.adoptionStorages = storages;
+      const adoptionKey = canonicalJson({
+        expectedHead,
+        nextHead,
+        operations: adoptedOperations,
+        storages,
+      });
+      if (sameLedgerHead(head, nextHead)) {
+        return adoptionKey === committedAdoptionKey;
+      }
       if (!sameLedgerHead(head, expectedHead)) return false;
       if (tracker.returnFalseNextAdoption === true) {
         tracker.returnFalseNextAdoption = false;
+        return false;
+      }
+      if (tracker.returnFalseWithNextHeadObservation === true) {
+        tracker.returnFalseWithNextHeadObservation = false;
+        head = normalizeFilesystemImageProviderStateHead(nextHead);
+        tracker.head = copyLedgerHead(head);
         return false;
       }
       if (tracker.failAdoptionBeforeCommit === true) {
@@ -512,6 +552,7 @@ function createExactStateAuthorities(options = {}) {
       }
       head = normalizeFilesystemImageProviderStateHead(nextHead);
       tracker.head = copyLedgerHead(head);
+      committedAdoptionKey = adoptionKey;
       if (tracker.loseNextAdoptionAcknowledgement === true) {
         tracker.loseNextAdoptionAcknowledgement = false;
         throw new Error("adoption acknowledgement lost");
@@ -655,6 +696,7 @@ async function createExactFixture(t, options = {}) {
     createState,
     directory,
     ledgerPath: join(directory, FILESYSTEM_IMAGE_PROVIDER_STATE_LEDGER_NAME),
+    lockTracker,
     lockPath: join(directory, FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME),
     root,
     state: createState(),
@@ -824,23 +866,57 @@ async function createRotatedFixture(t) {
   };
 }
 
+async function createRotatedV2AdoptionHarness(t, tracker) {
+  const legacy = await createFixture(t);
+  const legacyState = legacy.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+  });
+  await prepareAndCommit(legacyState, {
+    operationId: "operation-adoption-recovery-001",
+    request: operationRequest("provision"),
+    storage: storageState(),
+  });
+  const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+  assert(sourceHead.generation !== "0");
+  const candidateGeneration = String(BigInt(sourceHead.generation) + 1n);
+  const exact = createExactStateAuthorities({ head: sourceHead, tracker });
+  const createState = (overrides = {}) =>
+    new FilesystemImageProviderState({
+      acquireLock: legacy.acquireLock,
+      adoptionAuthority: exact.adoptionAuthority,
+      directory: legacy.directory,
+      stateAuthority: exact.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+      ...overrides,
+    });
+  return {
+    candidateGeneration,
+    createState,
+    exact,
+    legacy,
+    sourceHead,
+    state: createState(),
+  };
+}
+
 test("state directory admission reserves the longest generated pathname", () => {
   const headAnchor = createTrustedHeadAnchor();
   const options = {
-    directory: `/${"d".repeat(4_055)}`,
+    directory: `/${"d".repeat(4_049)}`,
     headAnchor,
     ...TRUSTED_ACL_INSPECTORS,
   };
-  const longestName = filesystemImageProviderStateCheckpointName(
-    "18446744073709551615",
-  );
-  assert.equal(Buffer.byteLength(options.directory, "utf8"), 4_056);
-  assert.equal(Buffer.byteLength(longestName, "utf8"), 38);
+  const longestName = "state.g18446744073709551615.verified.staging";
+  assert.equal(Buffer.byteLength(options.directory, "utf8"), 4_050);
+  assert.equal(Buffer.byteLength(longestName, "utf8"), 44);
   assert.equal(Buffer.byteLength(join(options.directory, longestName), "utf8"), 4_095);
   assert.doesNotThrow(() => new FilesystemImageProviderState(options));
 
-  const maximumMultibyteDirectory = `/${"é".repeat(2_027)}a`;
-  assert.equal(Buffer.byteLength(maximumMultibyteDirectory, "utf8"), 4_056);
+  const maximumMultibyteDirectory = `/${"é".repeat(2_024)}a`;
+  assert.equal(Buffer.byteLength(maximumMultibyteDirectory, "utf8"), 4_050);
   assert.doesNotThrow(
     () =>
       new FilesystemImageProviderState({
@@ -850,8 +926,8 @@ test("state directory admission reserves the longest generated pathname", () => 
   );
 
   for (const directory of [
-    `/${"d".repeat(4_056)}`,
-    `/${"é".repeat(2_028)}`,
+    `/${"d".repeat(4_050)}`,
+    `/${"é".repeat(2_025)}`,
     `/${"d".repeat(1_000_000)}`,
   ]) {
     assert.throws(
@@ -1528,29 +1604,345 @@ test("v3 cold load rejects prepared-index and attachment-origin divergence", asy
 
 test("v2 adoption preserves target files across an uncertain acknowledgement", async (t) => {
   const tracker = { loseNextAdoptionAcknowledgement: true };
-  const fixture = await createExactFixture(t, { head: genesisHead(), tracker });
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
   await assert.rejects(
     fixture.state.snapshot(),
     stateError("commit_outcome_uncertain"),
   );
   const targetCheckpoint = join(
-    fixture.directory,
-    filesystemImageProviderStateCheckpointName("1"),
+    fixture.legacy.directory,
+    filesystemImageProviderStateCheckpointName(fixture.candidateGeneration),
   );
   const targetLedger = join(
-    fixture.directory,
-    filesystemImageProviderStateLedgerName("1"),
+    fixture.legacy.directory,
+    filesystemImageProviderStateLedgerName(fixture.candidateGeneration),
+  );
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const verifiedMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "verified",
   );
   assert.equal((await lstat(targetCheckpoint)).isFile(), true);
   assert.equal((await lstat(targetLedger)).isFile(), true);
-  assert.equal(fixture.tracker.head.contractVersion, 3);
+  assert.equal((await lstat(pendingMarker)).isFile(), true);
+  await assert.rejects(lstat(verifiedMarker), (error) => error.code === "ENOENT");
+  assert.equal(fixture.exact.tracker.head.contractVersion, 3);
   const recovered = await fixture.createState().snapshot();
   assert.deepEqual(recovered, {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "2",
+    storages: [storageState()],
+  });
+  assert.equal(fixture.exact.tracker.adoptions, 2);
+  assert.equal(fixture.exact.tracker.operations.size, 1);
+  for (const name of [
+    filesystemImageProviderStateCheckpointName(fixture.sourceHead.generation),
+    filesystemImageProviderStateLedgerName(fixture.sourceHead.generation),
+  ]) {
+    await assert.rejects(
+      lstat(join(fixture.legacy.directory, name)),
+      (error) => error.code === "ENOENT",
+    );
+  }
+  assert.equal((await lstat(targetCheckpoint)).isFile(), true);
+  assert.equal((await lstat(targetLedger)).isFile(), true);
+  await assert.rejects(lstat(pendingMarker), (error) => error.code === "ENOENT");
+  await assert.rejects(lstat(verifiedMarker), (error) => error.code === "ENOENT");
+});
+
+test("verified adoption marker completes cleanup after restart", async (t) => {
+  const fixture = await createRotatedV2AdoptionHarness(t, {});
+  let directorySyncs = 0;
+  const stopAfterVerified = async (handle) => {
+    await handle.sync();
+    directorySyncs += 1;
+    if (directorySyncs === 3) {
+      fixture.legacy.tracker.failNextAssertion = true;
+    }
+  };
+  await assert.rejects(
+    fixture.createState({ syncDirectory: stopAfterVerified }).snapshot(),
+    stateError("maintenance_failed"),
+  );
+  assert.equal(directorySyncs, 3);
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const verifiedMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "verified",
+  );
+  assert.equal((await lstat(pendingMarker)).isFile(), true);
+  assert.equal((await lstat(verifiedMarker)).isFile(), true);
+  for (const generation of [
+    fixture.sourceHead.generation,
+    fixture.candidateGeneration,
+  ]) {
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+  }
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 1);
+  assert.deepEqual(await fixture.createState().snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "2",
+    storages: [storageState()],
+  });
+  assert.equal(fixture.exact.tracker.adoptions, 2);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 2);
+  for (const path of [pendingMarker, verifiedMarker]) {
+    await assert.rejects(lstat(path), (error) => error.code === "ENOENT");
+  }
+  for (const name of [
+    filesystemImageProviderStateCheckpointName(fixture.sourceHead.generation),
+    filesystemImageProviderStateLedgerName(fixture.sourceHead.generation),
+  ]) {
+    await assert.rejects(
+      lstat(join(fixture.legacy.directory, name)),
+      (error) => error.code === "ENOENT",
+    );
+  }
+});
+
+test("verified recovery completes partial source cleanup cuts", async (t) => {
+  for (const remaining of ["checkpoint", "ledger"]) {
+    await t.test(`${remaining}-only`, async (t) => {
+      const fixture = await createRotatedV2AdoptionHarness(t, {});
+      let directorySyncs = 0;
+      const stopAfterVerified = async (handle) => {
+        await handle.sync();
+        directorySyncs += 1;
+        if (directorySyncs === 3) {
+          fixture.legacy.tracker.failNextAssertion = true;
+        }
+      };
+      await assert.rejects(
+        fixture.createState({ syncDirectory: stopAfterVerified }).snapshot(),
+        stateError("maintenance_failed"),
+      );
+      const sourcePaths = {
+        checkpoint: join(
+          fixture.legacy.directory,
+          filesystemImageProviderStateCheckpointName(
+            fixture.sourceHead.generation,
+          ),
+        ),
+        ledger: join(
+          fixture.legacy.directory,
+          filesystemImageProviderStateLedgerName(
+            fixture.sourceHead.generation,
+          ),
+        ),
+      };
+      const removed = remaining === "checkpoint" ? "ledger" : "checkpoint";
+      await rm(sourcePaths[removed]);
+      const directoryHandle = await open(fixture.legacy.directory, "r");
+      try {
+        // Model either durable unlink ordering at a source-cleanup crash cut.
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+      assert.equal(await fileExists(sourcePaths[remaining]), true);
+      assert.equal(await fileExists(sourcePaths[removed]), false);
+      assert.equal(fixture.exact.tracker.adoptions, 1);
+      assert.equal(fixture.exact.tracker.projectionComparisons, 1);
+
+      assert.deepEqual(await fixture.createState().snapshot(), {
+        contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+        stateRevision: "2",
+        storages: [storageState()],
+      });
+      assert.equal(fixture.exact.tracker.adoptions, 1);
+      assert.equal(fixture.exact.tracker.projectionComparisons, 2);
+      assert.equal(await fileExists(sourcePaths.checkpoint), false);
+      assert.equal(await fileExists(sourcePaths.ledger), false);
+      for (const phase of ["pending", "verified"]) {
+        assert.equal(
+          await fileExists(
+            adoptionMarkerPath(
+              fixture.legacy.directory,
+              fixture.candidateGeneration,
+              phase,
+            ),
+          ),
+          false,
+        );
+      }
+    });
+  }
+});
+
+test("verified recovery skips replay only after durable source cleanup", async (t) => {
+  const fixture = await createRotatedV2AdoptionHarness(t, {});
+  const sourcePaths = [
+    join(
+      fixture.legacy.directory,
+      filesystemImageProviderStateCheckpointName(
+        fixture.sourceHead.generation,
+      ),
+    ),
+    join(
+      fixture.legacy.directory,
+      filesystemImageProviderStateLedgerName(fixture.sourceHead.generation),
+    ),
+  ];
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const verifiedMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "verified",
+  );
+  let pendingDeletionSynced = false;
+  const stopAfterPendingDeletion = async (handle) => {
+    await handle.sync();
+    if (
+      !pendingDeletionSynced &&
+      (await fileExists(verifiedMarker)) &&
+      !(await fileExists(pendingMarker)) &&
+      !(await fileExists(sourcePaths[0])) &&
+      !(await fileExists(sourcePaths[1]))
+    ) {
+      pendingDeletionSynced = true;
+      fixture.legacy.tracker.failNextAssertion = true;
+    }
+  };
+  await assert.rejects(
+    fixture
+      .createState({ syncDirectory: stopAfterPendingDeletion })
+      .snapshot(),
+    stateError("maintenance_failed"),
+  );
+  assert.equal(pendingDeletionSynced, true);
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 1);
+  for (const path of sourcePaths) assert.equal(await fileExists(path), false);
+  assert.equal(await fileExists(pendingMarker), false);
+  assert.equal(await fileExists(verifiedMarker), true);
+
+  assert.deepEqual(await fixture.createState().snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "2",
+    storages: [storageState()],
+  });
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 2);
+  assert.equal(await fileExists(pendingMarker), false);
+  assert.equal(await fileExists(verifiedMarker), false);
+});
+
+test("cold adoption removes incomplete phase staging files", async (t) => {
+  const fixture = await createExactFixture(t, { head: genesisHead() });
+  const pendingStaging = adoptionMarkerStagingPath(
+    fixture.directory,
+    "1",
+    "pending",
+  );
+  const verifiedStaging = adoptionMarkerStagingPath(
+    fixture.directory,
+    "1",
+    "verified",
+  );
+  await writeFile(pendingStaging, Buffer.alloc(0), { mode: 0o600 });
+  await writeFile(verifiedStaging, Buffer.from("partial", "utf8"), {
+    mode: 0o600,
+  });
+
+  assert.deepEqual(await fixture.state.snapshot(), {
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
     stateRevision: "0",
     storages: [],
   });
   assert.equal(fixture.tracker.adoptions, 1);
+  assert.equal(fixture.tracker.projectionComparisons, 1);
+  for (const phase of ["pending", "verified"]) {
+    assert.equal(
+      await fileExists(adoptionMarkerPath(fixture.directory, "1", phase)),
+      false,
+    );
+    assert.equal(
+      await fileExists(
+        adoptionMarkerStagingPath(fixture.directory, "1", phase),
+      ),
+      false,
+    );
+  }
+});
+
+test("adoption publishes complete phase-bound markers before directory sync", async (t) => {
+  const fixture = await createExactFixture(t, { head: genesisHead() });
+  const observedPhases = [];
+  const syncDirectory = async (handle) => {
+    for (const phase of ["pending", "verified"]) {
+      if (observedPhases.includes(phase)) continue;
+      const finalPath = adoptionMarkerPath(fixture.directory, "1", phase);
+      if (!(await fileExists(finalPath))) continue;
+      assert.equal(
+        await fileExists(
+          adoptionMarkerStagingPath(fixture.directory, "1", phase),
+        ),
+        false,
+      );
+      const bytes = await readFile(finalPath);
+      const marker = JSON.parse(bytes.toString("utf8"));
+      assert.equal(bytes.toString("utf8"), canonicalJson(marker));
+      assert.deepEqual(Object.keys(marker).sort(), [
+        "contractVersion",
+        "expectedHead",
+        "nextHead",
+        "phase",
+      ]);
+      assert.equal(marker.contractVersion, 1);
+      assert.equal(marker.phase, phase);
+      assert.deepEqual(marker.expectedHead, genesisHead());
+      assert.equal(marker.nextHead.contractVersion, 3);
+      assert.equal(marker.nextHead.generation, "1");
+      observedPhases.push(phase);
+    }
+    await handle.sync();
+  };
+
+  assert.deepEqual(
+    await fixture.createState({ syncDirectory }).snapshot(),
+    {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "0",
+      storages: [],
+    },
+  );
+  assert.deepEqual(observedPhases, ["pending", "verified"]);
 });
 
 test("v2 adoption removes an inert target generation after a definite stale result", async (t) => {
@@ -1575,7 +1967,418 @@ test("v2 adoption removes an inert target generation after a definite stale resu
     ),
     (error) => error.code === "ENOENT",
   );
+  for (const phase of ["pending", "verified"]) {
+    await assert.rejects(
+      lstat(adoptionMarkerPath(fixture.directory, "1", phase)),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(adoptionMarkerStagingPath(fixture.directory, "1", phase)),
+      (error) => error.code === "ENOENT",
+    );
+  }
   assert.equal(fixture.tracker.head.contractVersion, 2);
+  assert.equal(fixture.tracker.projectionComparisons ?? 0, 0);
+});
+
+test("unchanged adoption cleanup survives the pending-delete crash cut", async (t) => {
+  const runFinalRetryAssertions = async (fixture) => {
+    assert.deepEqual(await fixture.createState().snapshot(), {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "0",
+      storages: [],
+    });
+    assert.equal(fixture.tracker.adoptions, 2);
+    for (const phase of ["pending", "verified"]) {
+      assert.equal(
+        await fileExists(adoptionMarkerPath(fixture.directory, "1", phase)),
+        false,
+      );
+      assert.equal(
+        await fileExists(
+          adoptionMarkerStagingPath(fixture.directory, "1", phase),
+        ),
+        false,
+      );
+    }
+  };
+
+  await t.test("fresh unchanged result", async (t) => {
+    const tracker = { returnFalseNextAdoption: true };
+    const fixture = await createExactFixture(t, {
+      head: genesisHead(),
+      tracker,
+    });
+    const pending = adoptionMarkerPath(fixture.directory, "1", "pending");
+    const candidate = join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("1"),
+    );
+    let pendingPublished = false;
+    let crashCutReached = false;
+    const syncDirectory = async (handle) => {
+      await handle.sync();
+      const pendingExists = await fileExists(pending);
+      if (pendingExists) pendingPublished = true;
+      else if (pendingPublished && (await fileExists(candidate))) {
+        crashCutReached = true;
+        fixture.lockTracker.failNextAssertion = true;
+      }
+    };
+    await assert.rejects(
+      fixture.createState({ syncDirectory }).snapshot(),
+      stateError("maintenance_failed"),
+    );
+    assert.equal(crashCutReached, true);
+    assert.equal(await fileExists(pending), false);
+    assert.equal(await fileExists(candidate), true);
+    assert.equal(fixture.tracker.head.contractVersion, 2);
+    await runFinalRetryAssertions(fixture);
+  });
+
+  await t.test("recovered unchanged result", async (t) => {
+    const tracker = { returnFalseNextAdoption: true };
+    const fixture = await createExactFixture(t, {
+      head: genesisHead(),
+      tracker,
+    });
+    const pending = adoptionMarkerPath(fixture.directory, "1", "pending");
+    const candidate = join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("1"),
+    );
+    let pendingPublished = false;
+    const stopBeforeCompare = async (handle) => {
+      await handle.sync();
+      if (!pendingPublished && (await fileExists(pending))) {
+        pendingPublished = true;
+        fixture.lockTracker.failNextAssertion = true;
+      }
+    };
+    await assert.rejects(
+      fixture.createState({ syncDirectory: stopBeforeCompare }).snapshot(),
+      stateError("io_failed"),
+    );
+    assert.equal(await fileExists(pending), true);
+    assert.equal(await fileExists(candidate), true);
+    let crashCutReached = false;
+    const stopAfterPendingDelete = async (handle) => {
+      await handle.sync();
+      if (!(await fileExists(pending)) && (await fileExists(candidate))) {
+        crashCutReached = true;
+        fixture.lockTracker.failNextAssertion = true;
+      }
+    };
+    await assert.rejects(
+      fixture
+        .createState({ syncDirectory: stopAfterPendingDelete })
+        .snapshot(),
+      stateError("maintenance_failed"),
+    );
+    assert.equal(crashCutReached, true);
+    assert.equal(await fileExists(pending), false);
+    assert.equal(await fileExists(candidate), true);
+    assert.equal(fixture.tracker.head.contractVersion, 2);
+    await runFinalRetryAssertions(fixture);
+  });
+});
+
+test("v2 adoption does not accept next-head observation after a false result", async (t) => {
+  const tracker = { returnFalseWithNextHeadObservation: true };
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  const { candidateGeneration, exact, legacy, sourceHead } = fixture;
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  const retainedPaths = [
+    adoptionMarkerPath(legacy.directory, candidateGeneration, "pending"),
+  ];
+  for (const generation of [sourceHead.generation, candidateGeneration]) {
+    retainedPaths.push(
+      join(
+        legacy.directory,
+        filesystemImageProviderStateCheckpointName(generation),
+      ),
+      join(legacy.directory, filesystemImageProviderStateLedgerName(generation)),
+    );
+  }
+  const retainedBytes = await Promise.all(retainedPaths.map((path) => readFile(path)));
+  const pendingMarker = JSON.parse(retainedBytes[0].toString("utf8"));
+  assert.equal(retainedBytes[0].toString("utf8"), canonicalJson(pendingMarker));
+  assert.deepEqual(pendingMarker, {
+    contractVersion: 1,
+    expectedHead: sourceHead,
+    nextHead: exact.tracker.head,
+    phase: "pending",
+  });
+  await assert.rejects(
+    lstat(adoptionMarkerPath(legacy.directory, candidateGeneration, "verified")),
+    (error) => error.code === "ENOENT",
+  );
+  assert.equal(exact.tracker.head.contractVersion, 3);
+  assert.equal(exact.tracker.head.generation, candidateGeneration);
+  assert.deepEqual(
+    exact.tracker.adoptionOperations.map((operation) => operation.operationId),
+    ["operation-adoption-recovery-001"],
+  );
+  assert.equal(exact.tracker.operations.size, 0);
+  assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  assert.equal(exact.tracker.adoptions, 2);
+  assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+  for (let index = 0; index < retainedPaths.length; index += 1) {
+    assert.deepEqual(await readFile(retainedPaths[index]), retainedBytes[index]);
+  }
+});
+
+test("verified marker cannot bypass exact retained-source replay", async (t) => {
+  for (const mode of ["copied-pending", "phase-rewritten"]) {
+    await t.test(mode, async (t) => {
+      const tracker = { returnFalseWithNextHeadObservation: true };
+      const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+      await assert.rejects(
+        fixture.state.snapshot(),
+        stateError("commit_outcome_uncertain"),
+      );
+      const pendingPath = adoptionMarkerPath(
+        fixture.legacy.directory,
+        fixture.candidateGeneration,
+        "pending",
+      );
+      const verifiedPath = adoptionMarkerPath(
+        fixture.legacy.directory,
+        fixture.candidateGeneration,
+        "verified",
+      );
+      const pendingBytes = await readFile(pendingPath);
+      const verifiedBytes =
+        mode === "copied-pending"
+          ? pendingBytes
+          : Buffer.from(
+              canonicalJson({
+                ...JSON.parse(pendingBytes.toString("utf8")),
+                phase: "verified",
+              }),
+              "utf8",
+            );
+      await writeFile(verifiedPath, verifiedBytes, { mode: 0o600 });
+      const retainedPaths = [pendingPath, verifiedPath];
+      for (const generation of [
+        fixture.sourceHead.generation,
+        fixture.candidateGeneration,
+      ]) {
+        retainedPaths.push(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        );
+      }
+      const retainedBytes = await Promise.all(
+        retainedPaths.map((path) => readFile(path)),
+      );
+      await assert.rejects(
+        fixture.createState().snapshot(),
+        stateError(
+          mode === "copied-pending"
+            ? "corrupt_ledger"
+            : "commit_outcome_uncertain",
+        ),
+      );
+      assert.equal(
+        fixture.exact.tracker.adoptions,
+        mode === "copied-pending" ? 1 : 2,
+      );
+      assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+      for (let index = 0; index < retainedPaths.length; index += 1) {
+        assert.deepEqual(await readFile(retainedPaths[index]), retainedBytes[index]);
+      }
+    });
+  }
+});
+
+test("tampered adoption marker fails closed without authority replay", async (t) => {
+  const tracker = { returnFalseWithNextHeadObservation: true };
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const tampered = Buffer.from(await readFile(pendingMarker));
+  const marker = Buffer.from('"contractVersion":1', "utf8");
+  const markerOffset = tampered.indexOf(marker);
+  assert(markerOffset >= 0);
+  tampered[markerOffset + marker.length - 1] = 0x32;
+  await writeFile(pendingMarker, tampered, { mode: 0o600 });
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("corrupt_ledger"),
+  );
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+  assert.deepEqual(await readFile(pendingMarker), tampered);
+  for (const generation of [
+    fixture.sourceHead.generation,
+    fixture.candidateGeneration,
+  ]) {
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+  }
+});
+
+test("pending adoption recovery never truncates retained ledgers", async (t) => {
+  for (const target of ["source", "candidate"]) {
+    await t.test(target, async (t) => {
+      const tracker = { returnFalseWithNextHeadObservation: true };
+      const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+      await assert.rejects(
+        fixture.state.snapshot(),
+        stateError("commit_outcome_uncertain"),
+      );
+      const generation =
+        target === "source"
+          ? fixture.sourceHead.generation
+          : fixture.candidateGeneration;
+      const ledger = join(
+        fixture.legacy.directory,
+        filesystemImageProviderStateLedgerName(generation),
+      );
+      await appendFile(ledger, Buffer.from("retained-tail", "utf8"));
+      const retained = await readFile(ledger);
+      await assert.rejects(
+        fixture.createState().snapshot(),
+        stateError("corrupt_ledger"),
+      );
+      assert.deepEqual(await readFile(ledger), retained);
+      assert.equal(fixture.exact.tracker.adoptions, 1);
+      assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+      assert.equal(
+        (
+          await lstat(
+            adoptionMarkerPath(
+              fixture.legacy.directory,
+              fixture.candidateGeneration,
+              "pending",
+            ),
+          )
+        ).isFile(),
+        true,
+      );
+    });
+  }
+});
+
+test("v3 head without an adoption marker retains a v2 predecessor", async (t) => {
+  const tracker = { returnFalseWithNextHeadObservation: true };
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  await rm(
+    adoptionMarkerPath(
+      fixture.legacy.directory,
+      fixture.candidateGeneration,
+      "pending",
+    ),
+  );
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+  for (const generation of [
+    fixture.sourceHead.generation,
+    fixture.candidateGeneration,
+  ]) {
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+  }
+});
+
+test("v2 head replaces a candidate left before pending-marker durability", async (t) => {
+  const fixture = await createExactFixture(t, { head: genesisHead() });
+  const candidateCheckpoint = join(
+    fixture.directory,
+    filesystemImageProviderStateCheckpointName("1"),
+  );
+  const candidateLedger = join(
+    fixture.directory,
+    filesystemImageProviderStateLedgerName("1"),
+  );
+  const checkpointSentinel = Buffer.from("candidate-before-pending", "utf8");
+  const ledgerSentinel = Buffer.from("candidate-before-pending", "utf8");
+  await writeFile(candidateCheckpoint, checkpointSentinel, { mode: 0o600 });
+  await writeFile(candidateLedger, ledgerSentinel, { mode: 0o600 });
+  assert.deepEqual(await fixture.state.snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "0",
+    storages: [],
+  });
+  assert.notDeepEqual(await readFile(candidateCheckpoint), checkpointSentinel);
+  assert.deepEqual(await readFile(candidateLedger), Buffer.alloc(0));
+  for (const phase of ["pending", "verified"]) {
+    await assert.rejects(
+      lstat(adoptionMarkerPath(fixture.directory, "1", phase)),
+      (error) => error.code === "ENOENT",
+    );
+  }
+  assert.equal(fixture.tracker.adoptions, 1);
+  assert.equal(fixture.tracker.head.contractVersion, 3);
 });
 
 test("repeated rotation preserves committed evidence, tombstones, and prepared ambiguity", async (t) => {

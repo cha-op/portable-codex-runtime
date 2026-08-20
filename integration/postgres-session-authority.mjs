@@ -1682,6 +1682,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
 
     await revisionCollisionClient.query("BEGIN");
     revisionCollisionOpen = true;
+    await revisionCollisionClient.query("SET LOCAL lock_timeout = '5s'");
     const revisionCollisionBackendPid = (
       await revisionCollisionClient.query(
         "SELECT pg_catalog.pg_backend_pid() AS backend_pid",
@@ -1711,7 +1712,10 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
         (value) => ({ status: "fulfilled", value }),
         (error) => ({ error, status: "rejected" }),
       );
-    await waitForBackendLockWait(pool, revisionCollisionBackendPid);
+    await waitForBackendLockWait(
+      revisionClaimClient,
+      revisionCollisionBackendPid,
+    );
     await revisionClaimClient.query("COMMIT");
     revisionClaimOpen = false;
     const outcome = await revisionCollisionOutcome;
@@ -4263,6 +4267,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
 
     await lifecycleReinsertClient.query("BEGIN");
     lifecycleReinsertOpen = true;
+    await lifecycleReinsertClient.query("SET LOCAL lock_timeout = '5s'");
     const lifecycleReinsertBackendPid = (
       await lifecycleReinsertClient.query(
         "SELECT pg_catalog.pg_backend_pid() AS backend_pid",
@@ -4281,7 +4286,10 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
         (value) => ({ status: "fulfilled", value }),
         (error) => ({ error, status: "rejected" }),
       );
-    await waitForBackendLockWait(pool, lifecycleReinsertBackendPid);
+    await waitForBackendLockWait(
+      lifecycleTeardownClient,
+      lifecycleReinsertBackendPid,
+    );
     await lifecycleTeardownClient.query("COMMIT");
     lifecycleTeardownOpen = false;
     const outcome = await lifecycleReinsertOutcome;
@@ -5726,6 +5734,7 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
 
 async function waitForBackendLockWait(observer, backendPid) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
+    await observer.query("SELECT pg_catalog.pg_stat_clear_snapshot()");
     const result = await observer.query(
       [
         "SELECT wait_event_type",
