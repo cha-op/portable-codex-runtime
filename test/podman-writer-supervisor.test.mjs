@@ -79,6 +79,7 @@ function closedStdioDescendantPodmanScript({
   descendantExitPath,
   descendantPidPath,
   descendantReadyPath,
+  descendantStartedPath,
   failureMode,
   sourceAttemptedPath,
   sourceMissingPath,
@@ -146,7 +147,7 @@ case "$1" in
     test -d "$source_path"
     direct_pid=$$
     (
-      : > ${shellQuote(descendantReadyPath)}
+      : > ${shellQuote(descendantStartedPath)}
       while kill -0 "$direct_pid" 2>/dev/null; do
         /bin/sleep 0.01
       done
@@ -154,9 +155,12 @@ case "$1" in
     ) </dev/null >/dev/null 2>/dev/null &
     descendant_pid=$!
     printf '%s\\n' "$descendant_pid" > ${shellQuote(descendantPidPath)}
-    while ! test -f ${shellQuote(descendantReadyPath)}; do
+    while ! test -f ${shellQuote(descendantStartedPath)}; do
       /bin/sleep 0.01
     done
+    # Publish readiness only after the PID receipt is complete and the
+    # descendant has executed behind its closed-stdio redirections.
+    : > ${shellQuote(descendantReadyPath)}
     ${failureBody}
     ;;
   *)
@@ -3707,6 +3711,7 @@ test("Linux default runner kills closed-stdio descendants before releasing autho
       let descendantExitPath;
       let descendantPidPath;
       let descendantReadyPath;
+      let descendantStartedPath;
       let heldFd = null;
       let settlementCount = 0;
       let sourceAttemptedPath;
@@ -3719,6 +3724,7 @@ test("Linux default runner kills closed-stdio descendants before releasing autho
           descendantExitPath = join(parent, "podman-descendant-exit");
           descendantPidPath = join(parent, "podman-descendant-pid");
           descendantReadyPath = join(parent, "podman-descendant-ready");
+          descendantStartedPath = join(parent, "podman-descendant-started");
           sourceAttemptedPath = join(parent, "podman-descendant-source-attempted");
           sourceMissingPath = join(parent, "podman-descendant-source-missing");
           sourceVisiblePath = join(parent, "podman-descendant-source-visible");
@@ -3726,6 +3732,7 @@ test("Linux default runner kills closed-stdio descendants before releasing autho
             descendantExitPath,
             descendantPidPath,
             descendantReadyPath,
+            descendantStartedPath,
             failureMode,
             sourceAttemptedPath,
             sourceMissingPath,
