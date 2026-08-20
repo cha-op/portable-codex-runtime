@@ -2776,6 +2776,10 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.doesNotMatch(imageProviderMigration.sql, /jsonb/u);
   assert.match(
     latestMigration.sql,
+    /LOCK TABLE session_authority\.sessions IN EXCLUSIVE MODE;[\s\S]+LOCK TABLE session_authority\.operation_claims IN ACCESS EXCLUSIVE MODE;[\s\S]+writer_supervisor_state_owner_migration[\s\S]+kind = 'writer-launch-attempt-v1'[\s\S]+state IN \('starting', 'uncertain'\)[\s\S]+writer_supervisor_state_owners_require_quiescent_launches[\s\S]+CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
+  );
+  assert.match(
+    latestMigration.sql,
     /CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
   );
   assert.match(
@@ -2797,6 +2801,14 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.match(
     latestMigration.sql,
     /CREATE TRIGGER writer_supervisor_state_owners_reject_update[\s\S]+BEFORE UPDATE ON session_authority\.writer_supervisor_state_owners/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE CONSTRAINT TRIGGER operation_claims_writer_launch_state_owner_guard[\s\S]+AFTER INSERT OR UPDATE ON session_authority\.operation_claims[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_writer_launch_state_owner[\s\S]+OLD\.state = 'prepared'[\s\S]+NEW\.result #>> '\{outcome\}' = 'cancelled-before-dispatch'[\s\S]+FROM session_authority\.writer_supervisor_state_owners AS owner[\s\S]+owner\.launch_attempt_id = NEW\.operation_id[\s\S]+owner\.session_id = NEW\.session_id[\s\S]+owner\.supervisor_id =[\s\S]+NEW\.request #>> '\{payload,supervisor,supervisorId\}'[\s\S]+owner\.bound_at >= NEW\.created_at[\s\S]+operation_claims_writer_launch_state_owner/u,
   );
   assert.match(latestMigration.sql, /writer_supervisor_state_gc/u);
   assert.match(

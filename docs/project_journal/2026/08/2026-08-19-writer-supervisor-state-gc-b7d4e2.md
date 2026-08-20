@@ -102,9 +102,15 @@ superseded_by:
 - The state-root marker prevents accidental cross-root routing but does not
   prove cryptographic host identity and cannot detect an administrator cloning
   both root and marker. Missing, malformed, or mismatched markers fail owner
-  preparation or bundle construction before physical dispatch. Active legacy
-  attempts without a binding are quarantined and have no adoption API; only
-  unbound prepared attempts remain owner-neutral for read/cancel cleanup.
+  preparation or bundle construction before physical dispatch. Migration 009
+  refuses legacy `starting`/`uncertain` launches while holding the runtime's
+  session-to-operation lock order. Its deferred commit-time constraint then
+  prevents already-running old binaries from making ownerless dispatch
+  durable. Unbound prepared attempts remain owner-neutral for read/cancel
+  cleanup; historical unbound terminal work gains no GC/adoption authority and
+  remains an explicit legacy cleanup case. A committed started attempt still
+  referenced as the current launch must be stopped or physically fenced before
+  rollout.
 - The destructive collector's deadline-plus-grace breach aborts and reports a
   fatal deployment failure but retains the active invocation and aggregate
   stop until the raw native Promise settles. This keeps the fifth lane's

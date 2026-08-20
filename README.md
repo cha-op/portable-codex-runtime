@@ -369,12 +369,17 @@ root's row. The configured base `recoveryScopeId` remains an operator-facing
 fairness/replay label, not an owner identity: runtime hashes that base label
 with the local marker into the effective cursor scope, so two roots may safely
 reuse the same base label while restart of the same root reuses its cursor.
-There is no implicit legacy adoption API. An active `starting`/`uncertain` or
-dispatch-derived committed attempt without a binding is quarantined: direct
-claim/read fails closed and owner-filtered recovery omits it. An unbound
+There is no implicit legacy adoption API. Migration 009 takes the runtime's
+session-to-operation table-lock order and refuses to install while any legacy
+writer launch is `starting` or `uncertain`. Its deferred commit-time constraint
+then prevents an already-running old binary from making an ownerless dispatch
+durable, while allowing an exact pre-dispatch cancellation. An unbound
 `prepared` attempt remains owner-neutral only for read/cancel cleanup; it
 cannot be adopted for physical dispatch, and a prepared row with a conflicting
-binding is likewise hidden/fail-closed.
+binding is likewise hidden/fail-closed. Historical unbound committed work does
+not gain GC or adoption authority. A committed started attempt that is still
+the session's current launch must be stopped or physically fenced before
+rollout; other historical terminal artifacts require explicit legacy cleanup.
 
 A database-global restore lifecycle guard now uses one versioned PostgreSQL
 session advisory-lock identity for the complete authority candidate universe.

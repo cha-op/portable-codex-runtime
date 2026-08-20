@@ -447,9 +447,14 @@ Restore and launcher authority are now split into eight serial pull requests:
      aggregate binding are versions 4, 3, 2, and 3. Migration 009 binds each
      launch attempt immutably to its local owner before dispatch; GC
      authorization/request/receipt repeat the marker and completion rechecks it.
-     The durable launch request remains version 1. Active legacy work without
-     a binding is quarantined with no adoption API; only unbound prepared work
-     remains owner-neutral for read/cancel cleanup. The marker is routing
+     The durable launch request remains version 1. Migration 009 refuses any
+     legacy `starting`/`uncertain` launch, then uses a deferred database
+     constraint to keep an already-running old binary from committing an
+     ownerless dispatch. Only unbound prepared work remains owner-neutral for
+     read/cancel cleanup; historical unbound terminal work receives no new GC
+     or adoption authority. A committed started attempt that remains the
+     current launch must be stopped or physically fenced before rollout. The
+     marker is routing
      identity, not cryptographic host attestation or protection against an
      administrator cloning the root and marker together.
    - Operational lease admission is now complete. Deployment derives separate

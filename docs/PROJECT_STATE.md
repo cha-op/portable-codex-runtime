@@ -309,9 +309,14 @@
   insufficient. Owner preparation and state/supervisor bundle construction
   fail closed before physical dispatch. Direct
   `createPodmanWriterSupervisor()` carries only a caller-asserted owner and is
-  not a production deployment input. Active
-  legacy attempts without a binding are quarantined with no adoption API;
-  only unbound `prepared` work remains owner-neutral for read/cancel cleanup.
+  not a production deployment input. Migration 009 refuses to install while
+  any legacy writer launch is `starting` or `uncertain`; after installation, a
+  deferred database constraint prevents an old binary from committing an
+  ownerless dispatch. Only unbound `prepared` work remains owner-neutral for
+  read/cancel cleanup. Historical unbound committed work receives no GC or
+  adoption authority. A committed started attempt that remains the session's
+  current launch must be stopped or physically fenced before rollout; other
+  terminal artifacts require explicit legacy cleanup.
   The marker prevents accidental routing but is neither cryptographic host
   attestation nor protection against an administrator cloning the root and
   marker together.

@@ -1040,6 +1040,441 @@ async function assertLegacyRestoreV2MigrationGate(
   );
 }
 
+async function assertWriterSupervisorStateOwnerMigrationGate(
+  pool,
+  store,
+  trackedMigrations,
+) {
+  await pool.query("DROP SCHEMA IF EXISTS session_authority CASCADE");
+  await installAuthorityMigrations(pool, trackedMigrations.slice(0, 8));
+
+  const firstOperationId = `legacy-writer-launch-${randomUUID()}`;
+  const firstSessionId = randomUUID();
+  const secondOperationId = `legacy-writer-launch-${randomUUID()}`;
+  const secondSessionId = randomUUID();
+  const staleOperationId = `post-migration-writer-launch-${randomUUID()}`;
+  const boundOperationId = `post-migration-writer-launch-${randomUUID()}`;
+  const supervisorId = `migration-supervisor-${randomUUID()}`;
+  const stateOwnerId = `state-owner:${"a".repeat(64)}`;
+  const timestamp = await pool.query(
+    "SELECT pg_catalog.transaction_timestamp() AS value",
+  );
+  const now = timestamp.rows[0].value;
+  const request = JSON.stringify({
+    payload: {
+      contractVersion: 1,
+      supervisor: { contractVersion: 1, supervisorId },
+    },
+  });
+
+  for (const sessionId of [firstSessionId, secondSessionId]) {
+    await pool.query(
+      [
+        "INSERT INTO session_authority.sessions",
+        "(session_id, document, created_at, updated_at)",
+        "VALUES ($1, $2::jsonb, $3, $3)",
+      ].join(" "),
+      [sessionId, EMPTY_JSON_OBJECT, now],
+    );
+  }
+  for (const [operationId, sessionId] of [
+    [firstOperationId, firstSessionId],
+    [secondOperationId, secondSessionId],
+  ]) {
+    await insertDirectOperationIdClaim(pool, {
+      claimedAt: now,
+      operationId,
+      sessionId,
+    });
+    await pool.query(
+      [
+        "INSERT INTO session_authority.operation_claims",
+        "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+        "VALUES ($1, $2, 'writer-launch-attempt-v1',",
+        "$3::jsonb, 'prepared', $4, $4)",
+      ].join(" "),
+      [operationId, sessionId, request, now],
+    );
+  }
+
+  const oldWriter = await pool.connect();
+  let oldWriterTransactionOpen = false;
+  try {
+    await oldWriter.query("BEGIN");
+    oldWriterTransactionOpen = true;
+    const lockedSession = await oldWriter.query(
+      [
+        "SELECT session_id",
+        "FROM session_authority.sessions",
+        "WHERE session_id = $1",
+        "FOR UPDATE",
+      ].join(" "),
+      [firstSessionId],
+    );
+    assert.equal(lockedSession.rows.length, 1);
+    const migrationOutcome = store.migrate().then(
+      (value) => ({ error: null, value }),
+      (error) => ({ error, value: null }),
+    );
+    await waitForMigrationSessionTableLock(oldWriter);
+    const starting = await oldWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'starting', revision = revision + 1, updated_at = $2",
+        "WHERE operation_id = $1 AND state = 'prepared'",
+        "RETURNING state, revision",
+      ].join(" "),
+      [firstOperationId, now],
+    );
+    assert.deepEqual(starting.rows, [{ revision: "1", state: "starting" }]);
+    await oldWriter.query("COMMIT");
+    oldWriterTransactionOpen = false;
+    const outcome = await migrationOutcome;
+    assert.equal(outcome.value, null);
+    assert.ok(outcome.error instanceof PostgresSerializableStoreError);
+    assert.equal(outcome.error.code, "migration_failed");
+    assert.equal(outcome.error.commitState, "not-committed");
+  } finally {
+    if (oldWriterTransactionOpen) await oldWriter.query("ROLLBACK");
+    oldWriter.release();
+  }
+  assert.deepEqual(
+    await readMigrationLedger(pool),
+    trackedMigrations.slice(0, 8).map(({ checksum, version }) => ({
+      checksum,
+      version,
+    })),
+  );
+  const absentOwnerTable = await pool.query(
+    "SELECT pg_catalog.to_regclass('session_authority.writer_supervisor_state_owners') AS value",
+  );
+  assert.equal(absentOwnerTable.rows[0].value, null);
+
+  await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'prepared', revision = 0, updated_at = $2",
+      "WHERE operation_id = $1",
+    ].join(" "),
+    [firstOperationId, now],
+  );
+  await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'uncertain', revision = 2, updated_at = $2",
+      "WHERE operation_id = $1",
+    ].join(" "),
+    [secondOperationId, now],
+  );
+  await assert.rejects(store.migrate(), (error) => {
+    assert.ok(error instanceof PostgresSerializableStoreError);
+    assert.equal(error.code, "migration_failed");
+    assert.equal(error.commitState, "not-committed");
+    return true;
+  });
+  assert.deepEqual(
+    await readMigrationLedger(pool),
+    trackedMigrations.slice(0, 8).map(({ checksum, version }) => ({
+      checksum,
+      version,
+    })),
+  );
+  await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'prepared', revision = 0, updated_at = $2",
+      "WHERE operation_id = $1",
+    ].join(" "),
+    [secondOperationId, now],
+  );
+
+  await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'committed', result = $2::jsonb, revision = 1,",
+      "updated_at = $3, retired_at = $3",
+      "WHERE operation_id = $1 AND state = 'prepared'",
+    ].join(" "),
+    [
+      firstOperationId,
+      JSON.stringify({
+        outcome: "cancelled-before-dispatch",
+        reason: "legacy-migration-cancellation",
+        resultVersion: 1,
+      }),
+      now,
+    ],
+  );
+  await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'committed', result = $2::jsonb, revision = 1,",
+      "updated_at = $3, retired_at = $3",
+      "WHERE operation_id = $1 AND state = 'prepared'",
+    ].join(" "),
+    [
+      secondOperationId,
+      JSON.stringify({
+        outcome: "writer-launch-complete-stopped",
+        resultVersion: 1,
+      }),
+      now,
+    ],
+  );
+  for (const [operationId, sessionId] of [
+    [staleOperationId, firstSessionId],
+    [boundOperationId, secondSessionId],
+  ]) {
+    await insertDirectOperationIdClaim(pool, {
+      claimedAt: now,
+      operationId,
+      sessionId,
+    });
+    await pool.query(
+      [
+        "INSERT INTO session_authority.operation_claims",
+        "(operation_id, session_id, kind, request, state, created_at, updated_at)",
+        "VALUES ($1, $2, 'writer-launch-attempt-v1',",
+        "$3::jsonb, 'prepared', $4, $4)",
+      ].join(" "),
+      [operationId, sessionId, request, now],
+    );
+  }
+
+  assert.deepEqual(await store.migrate(), {
+    applied: true,
+    checksum: trackedMigrations.at(-1).checksum,
+    version: 9,
+  });
+  const legacyTerminal = await pool.query(
+    [
+      "SELECT operation_id, result #>> '{outcome}' AS outcome",
+      "FROM session_authority.operation_claims",
+      "WHERE operation_id IN ($1, $2)",
+      "ORDER BY operation_id",
+    ].join(" "),
+    [firstOperationId, secondOperationId],
+  );
+  assert.deepEqual(
+    legacyTerminal.rows,
+    [
+      {
+        operation_id: firstOperationId,
+        outcome: "cancelled-before-dispatch",
+      },
+      {
+        operation_id: secondOperationId,
+        outcome: "writer-launch-complete-stopped",
+      },
+    ].sort((left, right) =>
+      left.operation_id.localeCompare(right.operation_id),
+    ),
+  );
+
+  const staleWriter = await pool.connect();
+  let staleWriterTransactionOpen = false;
+  try {
+    await staleWriter.query("BEGIN");
+    staleWriterTransactionOpen = true;
+    const starting = await staleWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'starting', revision = revision + 1, updated_at = $2",
+        "WHERE operation_id = $1 AND state = 'prepared'",
+        "RETURNING state, revision",
+      ].join(" "),
+      [staleOperationId, now],
+    );
+    assert.deepEqual(starting.rows, [{ revision: "1", state: "starting" }]);
+    await assert.rejects(staleWriter.query("COMMIT"), (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "operation_claims_writer_launch_state_owner",
+      );
+      return true;
+    });
+  } finally {
+    if (staleWriterTransactionOpen) await staleWriter.query("ROLLBACK");
+    staleWriter.release();
+  }
+  const ownerless = await pool.query(
+    [
+      "SELECT state, revision::text AS revision",
+      "FROM session_authority.operation_claims",
+      "WHERE operation_id = $1",
+    ].join(" "),
+    [staleOperationId],
+  );
+  assert.deepEqual(ownerless.rows, [{ revision: "0", state: "prepared" }]);
+
+  const cancelled = await pool.query(
+    [
+      "UPDATE session_authority.operation_claims",
+      "SET state = 'committed', result = $2::jsonb,",
+      "revision = revision + 1, updated_at = $3, retired_at = $3",
+      "WHERE operation_id = $1 AND state = 'prepared'",
+      "RETURNING state, result, revision::text AS revision",
+    ].join(" "),
+    [
+      staleOperationId,
+      JSON.stringify({
+        outcome: "cancelled-before-dispatch",
+        reason: "migration-ownerless-cancellation",
+        resultVersion: 1,
+      }),
+      now,
+    ],
+  );
+  assert.deepEqual(cancelled.rows, [
+    {
+      result: {
+        outcome: "cancelled-before-dispatch",
+        reason: "migration-ownerless-cancellation",
+        resultVersion: 1,
+      },
+      revision: "1",
+      state: "committed",
+    },
+  ]);
+
+  const earlyBindingWriter = await pool.connect();
+  let earlyBindingTransactionOpen = false;
+  try {
+    await earlyBindingWriter.query("BEGIN");
+    earlyBindingTransactionOpen = true;
+    const committed = await earlyBindingWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'committed', result = $2::jsonb, revision = 1,",
+        "updated_at = $3, retired_at = $3",
+        "WHERE operation_id = $1 AND state = 'prepared'",
+        "RETURNING session_id",
+      ].join(" "),
+      [
+        boundOperationId,
+        JSON.stringify({
+          outcome: "writer-launch-complete-stopped",
+          resultVersion: 1,
+        }),
+        now,
+      ],
+    );
+    assert.equal(committed.rows.length, 1);
+    await earlyBindingWriter.query(
+      [
+        "INSERT INTO session_authority.writer_supervisor_state_owners",
+        "(launch_attempt_id, session_id, supervisor_id, state_owner_id, bound_at)",
+        "VALUES ($1, $2, $3, $4, $5)",
+      ].join(" "),
+      [
+        boundOperationId,
+        committed.rows[0].session_id,
+        supervisorId,
+        stateOwnerId,
+        new Date(now.getTime() - 1_000),
+      ],
+    );
+    await assert.rejects(earlyBindingWriter.query("COMMIT"), (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "operation_claims_writer_launch_state_owner",
+      );
+      return true;
+    });
+  } finally {
+    if (earlyBindingTransactionOpen) {
+      await earlyBindingWriter.query("ROLLBACK");
+    }
+    earlyBindingWriter.release();
+  }
+
+  const boundWriter = await pool.connect();
+  let boundWriterTransactionOpen = false;
+  try {
+    await boundWriter.query("BEGIN");
+    boundWriterTransactionOpen = true;
+    const starting = await boundWriter.query(
+      [
+        "UPDATE session_authority.operation_claims",
+        "SET state = 'starting', revision = revision + 1,",
+        "updated_at = $2",
+        "WHERE operation_id = $1 AND state = 'prepared'",
+        "RETURNING session_id, updated_at",
+      ].join(" "),
+      [boundOperationId, now],
+    );
+    assert.equal(starting.rows.length, 1);
+    await boundWriter.query(
+      [
+        "INSERT INTO session_authority.writer_supervisor_state_owners",
+        "(launch_attempt_id, session_id, supervisor_id, state_owner_id, bound_at)",
+        "VALUES ($1, $2, $3, $4, $5)",
+      ].join(" "),
+      [
+        boundOperationId,
+        starting.rows[0].session_id,
+        supervisorId,
+        stateOwnerId,
+        starting.rows[0].updated_at,
+      ],
+    );
+    await boundWriter.query("COMMIT");
+    boundWriterTransactionOpen = false;
+  } finally {
+    if (boundWriterTransactionOpen) await boundWriter.query("ROLLBACK");
+    boundWriter.release();
+  }
+  const bound = await pool.query(
+    [
+      "SELECT launch.state, owner.state_owner_id",
+      "FROM session_authority.operation_claims AS launch",
+      "JOIN session_authority.writer_supervisor_state_owners AS owner",
+      "ON owner.launch_attempt_id = launch.operation_id",
+      "AND owner.session_id = launch.session_id",
+      "WHERE launch.operation_id = $1",
+    ].join(" "),
+    [boundOperationId],
+  );
+  assert.deepEqual(bound.rows, [
+    { state: "starting", state_owner_id: stateOwnerId },
+  ]);
+
+  await pool.query(
+    "DELETE FROM session_authority.writer_supervisor_state_owners WHERE launch_attempt_id = $1",
+    [boundOperationId],
+  );
+  await pool.query(
+    [
+      "DELETE FROM session_authority.operation_claims",
+      "WHERE operation_id IN ($1, $2, $3, $4)",
+    ].join(" "),
+    [
+      firstOperationId,
+      secondOperationId,
+      staleOperationId,
+      boundOperationId,
+    ],
+  );
+  await pool.query(
+    [
+      "DELETE FROM session_authority.operation_id_registry",
+      "WHERE operation_id IN ($1, $2, $3, $4)",
+    ].join(" "),
+    [
+      firstOperationId,
+      secondOperationId,
+      staleOperationId,
+      boundOperationId,
+    ],
+  );
+  await pool.query(
+    "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2)",
+    [firstSessionId, secondSessionId],
+  );
+}
+
 async function waitForBackendLockWait(observer, backendPid) {
   for (let attempt = 0; attempt < 100; attempt += 1) {
     const result = await observer.query(
@@ -4219,6 +4654,11 @@ test(
     });
     await assertFilesystemImageProviderHeadAnchorSchemaAndStore(pool, store);
     await assertLegacyRestoreV2MigrationGate(
+      pool,
+      store,
+      trackedMigrations,
+    );
+    await assertWriterSupervisorStateOwnerMigrationGate(
       pool,
       store,
       trackedMigrations,

@@ -1,3 +1,27 @@
+-- Runtime writers lock the session row before touching operation relations.
+-- Join that order and wait for every pre-migration writer before deciding
+-- whether all dispatch-bearing launch attempts have a durable owner route.
+LOCK TABLE session_authority.sessions IN EXCLUSIVE MODE;
+
+LOCK TABLE session_authority.operation_claims IN ACCESS EXCLUSIVE MODE;
+
+DO $writer_supervisor_state_owner_migration$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM session_authority.operation_claims
+    WHERE kind = 'writer-launch-attempt-v1'
+      AND state IN ('starting', 'uncertain')
+  ) THEN
+    RAISE EXCEPTION
+      'writer supervisor state-owner migration requires no active legacy launch attempts'
+      USING
+        ERRCODE = '55000',
+        CONSTRAINT = 'writer_supervisor_state_owners_require_quiescent_launches';
+  END IF;
+END
+$writer_supervisor_state_owner_migration$;
+
 CREATE TABLE session_authority.writer_supervisor_state_owners (
   launch_attempt_id character varying(128) PRIMARY KEY,
   session_id uuid NOT NULL,
@@ -36,6 +60,76 @@ CREATE TRIGGER writer_supervisor_state_owners_reject_update
 BEFORE UPDATE ON session_authority.writer_supervisor_state_owners
 FOR EACH ROW
 EXECUTE FUNCTION session_authority.reject_writer_supervisor_state_owner_update();
+
+-- This constraint is deferred because the current writer claim transaction
+-- moves the operation to starting before it inserts the immutable owner row.
+-- The commit boundary must see both writes or neither write may become
+-- durable. It also fences an already-running pre-migration binary: that
+-- binary can update the row, but its ownerless transaction cannot commit.
+CREATE FUNCTION session_authority.enforce_writer_launch_state_owner()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $enforce_writer_launch_state_owner$
+BEGIN
+  IF NEW.kind <> 'writer-launch-attempt-v1'
+    OR NEW.state = 'prepared'
+  THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE'
+    AND OLD.state = 'prepared'
+    AND OLD.result IS NULL
+    AND OLD.retired_at IS NULL
+    AND NEW.state = 'committed'
+    AND NEW.result #>> '{outcome}' = 'cancelled-before-dispatch'
+    AND NEW.revision = OLD.revision + 1
+    AND NEW.retired_at = NEW.updated_at
+    AND NEW.kind = OLD.kind
+    AND NEW.request = OLD.request
+    AND NEW.session_id = OLD.session_id
+  THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.state IN ('starting', 'uncertain', 'committed')
+    AND EXISTS (
+      SELECT 1
+      FROM session_authority.writer_supervisor_state_owners AS owner
+      WHERE owner.launch_attempt_id = NEW.operation_id
+        AND owner.session_id = NEW.session_id
+        AND owner.supervisor_id =
+          NEW.request #>> '{payload,supervisor,supervisorId}'
+        AND owner.bound_at >= NEW.created_at
+        AND (
+          (
+            NEW.state = 'starting'
+            AND owner.bound_at = NEW.updated_at
+          )
+          OR (
+            NEW.state IN ('uncertain', 'committed')
+            AND owner.bound_at <= NEW.updated_at
+          )
+        )
+    )
+  THEN
+    RETURN NEW;
+  END IF;
+
+  RAISE EXCEPTION
+    'writer launch dispatch requires an immutable state-owner binding'
+    USING
+      ERRCODE = '23514',
+      CONSTRAINT = 'operation_claims_writer_launch_state_owner';
+END
+$enforce_writer_launch_state_owner$;
+
+CREATE CONSTRAINT TRIGGER operation_claims_writer_launch_state_owner_guard
+AFTER INSERT OR UPDATE ON session_authority.operation_claims
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION session_authority.enforce_writer_launch_state_owner();
 
 CREATE TABLE session_authority.writer_supervisor_state_gc (
   terminal_operation_id character varying(128) PRIMARY KEY,
