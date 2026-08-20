@@ -608,8 +608,25 @@ for exact acknowledgement-loss replay, but terminal stopped state now has a
 separate bounded collector. `createPodmanWriterSupervisorStateBundle()` keeps
 the original state ABI separate from its terminal collector and exposes the
 root's persistent high-entropy `stateOwnerId`, whose exact syntax is
-`state-owner:<64 lowercase hex>`. Owner preparation first reads or initializes
-and durably validates that marker; the branded state bundle then supplies
+`state-owner:<64 lowercase hex>`. First owner preparation creates a unique
+sibling staging directory under the held private parent, writes the final-name
+canonical marker there, and proves marker identity, exact bytes, `0600` mode,
+and single-link policy plus the candidate root's identity, exact namespace,
+and `0700` mode. It syncs marker, candidate root, and parent before a same-parent
+rename, then revalidates the published root and marker and repeats marker,
+final-root, and parent barriers. A pre-rename crash leaves only inert staging
+debris, while a retry after rename or acknowledgement loss adopts only the
+complete exact marker. Existing malformed or unmarked final roots fail closed
+without in-place repair. Node exposes ordinary POSIX `rename()`, not
+`renameat2(RENAME_NOREPLACE)`, so an active non-cooperative same-UID process can
+still insert an empty final root in the last absence-check window; the protocol
+does not claim that stronger property. Exact cleanup of a proven concurrent
+loser similarly uses held marker/root descriptors and `nlink == 0` as
+post-operation proof because Node exposes no inode-conditioned
+`unlink`/`rmdir`. An active same-UID replacement can therefore make cleanup
+remove a bait object before the held-object proof fails closed; it cannot make
+that failed cleanup authoritative. Later owner preparation reads and
+durably validates the published marker; the branded state bundle then supplies
 `createPodmanWriterSupervisorBundle()`, which returns the raw supervisor and
 collector as one exact process-local branded pair. Production deployment
 checks that pair before constructing the physical adapter. Equal

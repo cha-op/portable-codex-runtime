@@ -356,8 +356,14 @@ Restore and launcher authority are now split into eight serial pull requests:
      matching strings are necessary but not sufficient in production.
      Deployment requires the exact process-local pair returned by
      `createPodmanWriterSupervisorBundle()` before constructing the physical
-     adapter. Owner preparation and state/supervisor bundle construction fail
-     closed before physical dispatch; direct
+     adapter. First owner preparation writes and syncs a complete canonical
+     marker in a unique same-parent staging directory, atomically renames that
+     directory to the final root, then revalidates and repeats the file, root,
+     and parent barriers. A pre-rename crash leaves only inert staging debris;
+     a post-rename or lost-ack retry adopts only the complete exact marker.
+     Existing malformed or unmarked final roots remain fail-closed. Owner
+     preparation and state/supervisor bundle construction fail closed before
+     physical dispatch; direct
      `createPodmanWriterSupervisor()` carries only a caller-asserted owner and
      cannot satisfy that deployment boundary.
      Private list wrappers inject that owner into the third launch-attempt and

@@ -170,7 +170,12 @@
   for terminal local supervisor state. Migration 009 permanently records exact
   owner-finalizer authorization, an immutable pre-dispatch route to the
   private root's persistent `state-owner:<64 lowercase hex>` marker, and
-  collection completion. The third and fifth recovery lanes are filtered by
+  collection completion. First owner preparation atomically publishes only a
+  fully written and synced marker-bearing root from a unique same-parent
+  staging directory; pre-rename crashes leave inert debris, while a retry
+  after rename or acknowledgement loss adopts the exact complete marker.
+  Existing malformed or unmarked final roots remain fail-closed. The third and
+  fifth recovery lanes are filtered by
   that local owner, while the assembled production cold-start runner hashes
   the caller's base recovery scope with the marker for cursor isolation and
   holds the database-global exclusive lifecycle guard, with a dedicated

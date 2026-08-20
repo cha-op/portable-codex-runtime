@@ -291,6 +291,18 @@
   attempt, plus one immutable pre-dispatch owner binding in
   `writer_supervisor_state_owners`. Each private state root supplies a
   persistent high-entropy marker matching `state-owner:<64 lowercase hex>`.
+  First preparation creates the complete canonical marker in a unique sibling
+  staging directory, syncs marker, candidate root, and parent, then renames the
+  complete directory to the final root and repeats those durability barriers.
+  Pre-rename crashes leave only inert staging debris; post-rename or lost-ack
+  retries adopt only a complete exact marker. Existing malformed or unmarked
+  final roots remain fail-closed and are not repaired in place. Because Node
+  exposes plain POSIX `rename()` rather than `RENAME_NOREPLACE`, this does not
+  exclude an active same-UID process inserting an empty final root in the last
+  absence-check window. Node also has no inode-conditioned `unlink`/`rmdir`;
+  Linux loser cleanup uses held-FD `nlink == 0` as a post-operation proof,
+  while non-Linux hosts retain held/name brackets and durable name absence
+  without claiming active same-UID ABA resistance.
   Owner updates are rejected immediately. Owner deletion is accepted only
   with same-transaction teardown of the permanent operation-ID claim, so
   delete-and-reinsert cannot transfer recovery authority to another root.

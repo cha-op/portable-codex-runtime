@@ -337,7 +337,20 @@ Migration 009 adds the permanent
 and the immutable
 `session_authority.writer_supervisor_state_owners` launch-attempt route. Each
 private supervisor state root supplies one persistent high-entropy marker with
-the exact form `state-owner:<64 lowercase hex>`. The authority binds that
+the exact form `state-owner:<64 lowercase hex>`. First initialization writes
+the complete canonical marker inside a unique same-parent staging directory,
+syncs marker, candidate root, and parent, then atomically renames that complete
+directory to the final root and repeats the three durability barriers. A crash
+before rename leaves only inert staging debris; a retry after rename or lost
+acknowledgement adopts only the exact complete marker. An existing unmarked or
+malformed final root still fails closed and is never repaired in place. Plain
+POSIX `rename()` is not `RENAME_NOREPLACE`, so this protocol does not claim to
+exclude a non-cooperative same-UID process inserting an empty final root in the
+last absence-check window. Node also exposes no inode-conditioned
+`unlink`/`rmdir`; on Linux, exact losing-candidate cleanup uses held-FD
+`nlink == 0` only as a post-operation proof. Non-Linux hosts retain held/name
+identity and policy brackets plus durable name absence, without claiming the
+active same-UID ABA property. The authority binds that
 `stateOwnerId` before physical launch dispatch, and only an owner-bound
 finalizer that commits exact `complete-stopped` evidence with its stopped
 revision 4 `terminalRecord` can insert an authorization. Owner updates are

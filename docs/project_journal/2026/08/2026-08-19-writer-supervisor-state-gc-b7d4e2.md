@@ -33,7 +33,13 @@ superseded_by:
   authorization to that owner, the terminal operation, and launch attempt. It
   rejects owner updates and permits owner deletion only with same-transaction
   permanent operation-ID teardown, preventing delete-and-reinsert ownership
-  transfer. It
+  transfer. First owner preparation writes and syncs the complete canonical
+  marker inside a unique sibling staging directory, renames that complete
+  directory to the final root, then revalidates and repeats the marker, root,
+  and parent durability barriers. Pre-rename crashes leave only inert staging
+  debris; post-rename or lost-ack retries adopt only the exact complete marker.
+  Existing malformed or unmarked final roots remain fail-closed rather than
+  being repaired in place. It
   retains the exact stopped revision 4 `terminalRecord` and digests and
   permanently records `collected` or `absent` completion. Observer-only launch
   reconciliation returns a null terminal record, remains no-GC, and ordinary
@@ -136,7 +142,10 @@ superseded_by:
 - The state-root marker prevents accidental cross-root routing but does not
   prove cryptographic host identity and cannot detect an administrator cloning
   both root and marker. Missing, malformed, or mismatched markers fail owner
-  preparation or bundle construction before physical dispatch. Migration 009
+  preparation or bundle construction before physical dispatch. Its same-parent
+  publication uses ordinary POSIX `rename()`, not `RENAME_NOREPLACE`, and does
+  not claim resistance to an active same-UID empty-root insertion in the final
+  absence-check window. Migration 009
   refuses legacy `starting`/`uncertain` launches and any non-null session
   current-launch pointer, including malformed or orphaned pointer data, while
   holding the runtime's session-to-operation lock order. The latter gate

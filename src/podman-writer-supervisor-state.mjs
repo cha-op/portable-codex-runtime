@@ -7,6 +7,9 @@ import {
   lstat,
   mkdir,
   open,
+  readdir,
+  rename,
+  rmdir,
   unlink,
 } from "node:fs/promises";
 import { basename, dirname, isAbsolute, resolve } from "node:path";
@@ -91,6 +94,17 @@ const CONTAINER_NAME_PATTERN = /^[a-z0-9][a-z0-9_.-]{0,127}$/u;
 const CONTAINER_ID_PATTERN = /^[0-9a-f]{12,64}$/u;
 const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
 const STATE_OWNER_MARKER_NAME = ".state-owner-v1.json";
+// The fixed 48-byte basename leaves room for `/.state-owner-v1.json` even when
+// the final root has the shortest possible basename at MAX_STATE_ROOT_BYTES.
+// The 16 random bytes provide a 128-bit namespace token.
+const STATE_OWNER_STAGING_PREFIX = ".pws-owner-init-";
+const STATE_OWNER_STAGING_RANDOM_BYTES = 16;
+const STATE_OWNER_STAGING_BASENAME_BYTES =
+  STATE_OWNER_STAGING_PREFIX.length + STATE_OWNER_STAGING_RANDOM_BYTES * 2;
+const STATE_OWNER_STAGING_MARKER_WORST_CASE_BYTES =
+  MAX_STATE_ROOT_BYTES - 2 +
+  1 + STATE_OWNER_STAGING_BASENAME_BYTES +
+  1 + STATE_OWNER_MARKER_NAME.length;
 const RECORD_KEYS = Object.freeze([
   "containerId",
   "containerName",
@@ -1196,6 +1210,721 @@ async function closeStateOwnerMarker(marker) {
   }
 }
 
+function privateDirectoryChildPath(parent, name) {
+  ensure(
+    typeof parent === "string" &&
+      typeof name === "string" &&
+      name.length > 0 &&
+      name !== "." &&
+      name !== "..",
+    "podman_writer_state_io_failed",
+  );
+  const path = parent === "/" ? `/${name}` : `${parent}/${name}`;
+  ensure(
+    pathDirnameIntrinsic(path) === parent &&
+      pathBasenameIntrinsic(path) === name &&
+      pathResolveIntrinsic(path) === path,
+    "podman_writer_state_io_failed",
+  );
+  return path;
+}
+
+function stateOwnerStagingPath(root) {
+  const random = callIntrinsic(randomBytesIntrinsic, undefined, [
+    STATE_OWNER_STAGING_RANDOM_BYTES,
+  ]);
+  const suffix = callIntrinsic(bufferToStringIntrinsic, random, ["hex"]);
+  const name = `${STATE_OWNER_STAGING_PREFIX}${suffix}`;
+  ensure(
+    name.length === STATE_OWNER_STAGING_BASENAME_BYTES &&
+      STATE_OWNER_STAGING_BASENAME_BYTES === 48 &&
+      STATE_OWNER_STAGING_MARKER_WORST_CASE_BYTES === 4_083 &&
+      STATE_OWNER_STAGING_MARKER_WORST_CASE_BYTES <= MAX_NATIVE_PATH_BYTES,
+    "podman_writer_state_io_failed",
+  );
+  const path = privateDirectoryChildPath(pathDirnameIntrinsic(root), name);
+  ensure(path !== root, "podman_writer_state_io_failed");
+  const markerPath = `${path}/${STATE_OWNER_MARKER_NAME}`;
+  // Worst case: (MAX_STATE_ROOT_BYTES - "/x") + "/" + 48-byte
+  // basename + "/" + 20-byte marker = 4083 bytes, below 4095.
+  ensure(
+    callIntrinsic(bufferFromIntrinsic, Buffer, [markerPath, "utf8"]).length <=
+      MAX_NATIVE_PATH_BYTES,
+    "podman_writer_state_io_failed",
+  );
+  return path;
+}
+
+function privateParentEntryName(parent, path) {
+  const name = pathBasenameIntrinsic(path);
+  ensure(
+    name.length > 0 &&
+      name !== "." &&
+      name !== ".." &&
+      pathDirnameIntrinsic(path) === parent.path &&
+      path === privateDirectoryChildPath(parent.path, name),
+    "podman_writer_state_io_failed",
+  );
+  return name;
+}
+
+// Initial owner publication needs two sibling names resolved under one held
+// private parent. Linux binds both lookups to a validated clone of that parent
+// fd. Other hosts retain the held-versus-named parent bracket and, as with the
+// existing directory helpers, do not claim to exclude an active same-uid ABA.
+async function withHeldPrivateParentEntryPaths(
+  parent,
+  firstPath,
+  secondPath,
+  callback,
+) {
+  const firstName = privateParentEntryName(parent, firstPath);
+  const secondName = secondPath === null
+    ? null
+    : privateParentEntryName(parent, secondPath);
+  let descriptorHandle = null;
+  let primaryError = null;
+  let result;
+  try {
+    await assertPrivateParentHeld(parent);
+    let basePath = parent.path;
+    if (runtimePlatform === "linux") {
+      const descriptor = parent.handle.fd;
+      ensure(
+        numberIsSafeIntegerIntrinsic(descriptor) && descriptor >= 0,
+        "podman_writer_state_io_failed",
+      );
+      descriptorHandle = await open(
+        `/proc/self/fd/${descriptor}`,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY,
+      );
+      const descriptorStat = await descriptorHandle.stat({ bigint: true });
+      const parentStat = await parent.handle.stat({ bigint: true });
+      ensure(
+        safeDirectoryStat(descriptorStat) &&
+          safeDirectoryStat(parentStat) &&
+          sameIdentity(parent.identity, descriptorStat) &&
+          sameIdentity(parent.identity, parentStat),
+        "podman_writer_state_io_failed",
+      );
+      const anchoredDescriptor = descriptorHandle.fd;
+      ensure(
+        numberIsSafeIntegerIntrinsic(anchoredDescriptor) &&
+          anchoredDescriptor >= 0,
+        "podman_writer_state_io_failed",
+      );
+      basePath = `/proc/self/fd/${anchoredDescriptor}`;
+    }
+    try {
+      result = await callback(
+        privateDirectoryChildPath(basePath, firstName),
+        secondName === null
+          ? null
+          : privateDirectoryChildPath(basePath, secondName),
+      );
+    } catch (error) {
+      primaryError = error;
+    }
+    if (descriptorHandle !== null) {
+      try {
+        const descriptorStat = await descriptorHandle.stat({ bigint: true });
+        const parentStat = await parent.handle.stat({ bigint: true });
+        ensure(
+          safeDirectoryStat(descriptorStat) &&
+            safeDirectoryStat(parentStat) &&
+            sameIdentity(parent.identity, descriptorStat) &&
+            sameIdentity(parent.identity, parentStat),
+          "podman_writer_state_io_failed",
+        );
+      } catch (error) {
+        primaryError = isStateError(error)
+          ? error
+          : new PodmanWriterSupervisorStateError(
+              "podman_writer_state_io_failed",
+            );
+      }
+    }
+    try {
+      await assertPrivateParentHeld(parent);
+    } catch (error) {
+      primaryError = isStateError(error)
+        ? error
+        : new PodmanWriterSupervisorStateError(
+            "podman_writer_state_io_failed",
+          );
+    }
+  } catch (error) {
+    primaryError = isStateError(error)
+      ? error
+      : new PodmanWriterSupervisorStateError(
+          "podman_writer_state_io_failed",
+        );
+  }
+  if (descriptorHandle !== null) {
+    try {
+      await descriptorHandle.close();
+    } catch {
+      primaryError = new PodmanWriterSupervisorStateError(
+        "podman_writer_state_io_failed",
+      );
+    }
+  }
+  if (primaryError !== null) throw primaryError;
+  return result;
+}
+
+function privateParentFromHeldDirectory(held) {
+  return callIntrinsic(objectFreezeIntrinsic, Object, [{
+    handle: held.parentHandle,
+    identity: held.parentIdentity,
+    path: held.parentPath,
+  }]);
+}
+
+// Owner initialization protects exactly three properties. Directory and
+// marker object identity are held-fd plus dev+ino equality with their names;
+// marker content is the exact canonical byte string; access policy is the
+// current-uid 0700 parent/root and current-uid 0600, nlink-one marker. ctime,
+// mtime, and benign sibling-entry churn are not mutation evidence.
+async function assertStateOwnerDirectoryEntryHeld(root, held) {
+  const parent = privateParentFromHeldDirectory(held);
+  try {
+    const handleStat = await held.handle.stat({ bigint: true });
+    const pathStat = await withHeldPrivateParentEntryPaths(
+      parent,
+      root,
+      null,
+      (path) => lstat(path, { bigint: true }),
+    );
+    ensure(
+      safeDirectoryStat(handleStat) &&
+        safeDirectoryStat(pathStat) &&
+        sameIdentity(held.identity, handleStat) &&
+        sameIdentity(held.identity, pathStat),
+      "podman_writer_state_io_failed",
+    );
+  } catch (error) {
+    if (isStateError(error)) throw error;
+    fail("podman_writer_state_io_failed");
+  }
+}
+
+async function createStateOwnerStagingDirectory(root, parent, stagingPath) {
+  let handle = null;
+  let identity = null;
+  try {
+    await withHeldPrivateParentEntryPaths(
+      parent,
+      root,
+      stagingPath,
+      async (_rootPath, heldStagingPath) => {
+        await mkdir(heldStagingPath, { mode: 0o700 });
+        await chmod(heldStagingPath, 0o700);
+        const before = await lstat(heldStagingPath, { bigint: true });
+        ensure(safeDirectoryStat(before), "podman_writer_state_io_failed");
+        handle = await open(
+          heldStagingPath,
+          fsConstants.O_RDONLY |
+            fsConstants.O_DIRECTORY |
+            fsConstants.O_NOFOLLOW,
+        );
+        const opened = await handle.stat({ bigint: true });
+        const current = await lstat(heldStagingPath, { bigint: true });
+        ensure(
+          safeDirectoryStat(opened) &&
+            safeDirectoryStat(current) &&
+            sameIdentity(before, opened) &&
+            sameIdentity(before, current),
+          "podman_writer_state_io_failed",
+        );
+        identity = opened;
+      },
+    );
+    ensure(handle !== null && identity !== null, "podman_writer_state_io_failed");
+    const held = callIntrinsic(objectFreezeIntrinsic, Object, [{
+      created: true,
+      handle,
+      identity,
+      parentHandle: parent.handle,
+      parentIdentity: parent.identity,
+      parentPath: parent.path,
+    }]);
+    await assertStateOwnerDirectoryEntryHeld(stagingPath, held);
+    return held;
+  } catch (error) {
+    if (handle !== null) {
+      try {
+        await handle.close();
+      } catch {
+        // Preserve the primary fail-closed result.
+      }
+    }
+    if (isStateError(error)) throw error;
+    fail("podman_writer_state_io_failed");
+  }
+}
+
+function stateOwnerMarkerAtRoot(root, marker) {
+  return callIntrinsic(objectFreezeIntrinsic, Object, [{
+    bytes: marker.bytes,
+    handle: marker.handle,
+    path: stateOwnerMarkerPath(root),
+    stat: marker.stat,
+    stateOwnerId: marker.stateOwnerId,
+  }]);
+}
+
+async function reconcilePublishedStateOwnerCandidate(root, held, marker) {
+  const parent = privateParentFromHeldDirectory(held);
+  const status = await withHeldPrivateParentEntryPaths(
+    parent,
+    root,
+    null,
+    async (heldRootPath) => {
+      let pathStat;
+      try {
+        pathStat = await lstat(heldRootPath, { bigint: true });
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") return "absent";
+        throw error;
+      }
+      const handleStat = await held.handle.stat({ bigint: true });
+      ensure(
+        safeDirectoryStat(handleStat) &&
+          sameIdentity(held.identity, handleStat),
+        "podman_writer_state_io_failed",
+      );
+      if (!sameIdentity(held.identity, pathStat)) return "different";
+      ensure(safeDirectoryStat(pathStat), "podman_writer_state_io_failed");
+      return "ours";
+    },
+  );
+  if (status !== "ours") return frozenRecord({ marker: null, status });
+  const publishedMarker = stateOwnerMarkerAtRoot(root, marker);
+  // Once the final name resolves to the held candidate, every marker or guard
+  // failure is authoritative. It must never be downgraded to "different" and
+  // routed through winner adoption.
+  await assertStateOwnerMarkerHeld(root, held, publishedMarker);
+  return frozenRecord({ marker: publishedMarker, status });
+}
+
+// `heldStagingPath` must come from withHeldPrivateParentEntryPaths. The first
+// and final directory listings bracket exact marker identity/content checks,
+// proving that the rename source namespace contains only the canonical marker.
+async function assertInitialStateOwnerCandidateNamespace(
+  heldStagingPath,
+  held,
+  marker,
+) {
+  const candidatePathStat = await lstat(heldStagingPath, { bigint: true });
+  const candidateHandleStat = await held.handle.stat({ bigint: true });
+  ensure(
+    safeDirectoryStat(candidatePathStat) &&
+      safeDirectoryStat(candidateHandleStat) &&
+      sameIdentity(held.identity, candidatePathStat) &&
+      sameIdentity(held.identity, candidateHandleStat),
+    "podman_writer_state_io_failed",
+  );
+  const firstEntries = await readdir(heldStagingPath);
+  ensure(
+    firstEntries.length === 1 &&
+      firstEntries[0] === STATE_OWNER_MARKER_NAME,
+    "podman_writer_state_io_failed",
+  );
+  const heldMarkerPath = `${heldStagingPath}/${STATE_OWNER_MARKER_NAME}`;
+  const markerPathStat = await lstat(heldMarkerPath, { bigint: true });
+  const markerHandleStat = await marker.handle.stat({ bigint: true });
+  const markerBytes = await readHeldFileExactly(
+    marker.handle,
+    marker.bytes.length,
+  );
+  const markerFinalStat = await marker.handle.stat({ bigint: true });
+  const finalEntries = await readdir(heldStagingPath);
+  const candidateFinalStat = await lstat(heldStagingPath, { bigint: true });
+  ensure(
+    safeStateOwnerMarkerStat(markerPathStat, marker.bytes.length) &&
+      safeStateOwnerMarkerStat(markerHandleStat, marker.bytes.length) &&
+      safeStateOwnerMarkerStat(markerFinalStat, marker.bytes.length) &&
+      sameIdentity(marker.stat, markerPathStat) &&
+      sameIdentity(marker.stat, markerHandleStat) &&
+      sameIdentity(marker.stat, markerFinalStat) &&
+      callIntrinsic(bufferEqualsIntrinsic, markerBytes, [marker.bytes]) &&
+      finalEntries.length === 1 &&
+      finalEntries[0] === STATE_OWNER_MARKER_NAME &&
+      safeDirectoryStat(candidateFinalStat) &&
+      sameIdentity(held.identity, candidateFinalStat),
+    "podman_writer_state_io_failed",
+  );
+}
+
+function unlinkedStateOwnerMarkerStat(stat, expectedSize) {
+  const uid = effectiveUid();
+  return (
+    stat.isFile() &&
+    !stat.isSymbolicLink() &&
+    stat.nlink === 0n &&
+    uid !== null &&
+    stat.uid === uid &&
+    Number(stat.mode & 0o7777n) === 0o600 &&
+    stat.size === BigInt(expectedSize)
+  );
+}
+
+async function assertStateOwnerCandidateNameAbsent(
+  root,
+  stagingPath,
+  parent,
+  winner,
+) {
+  const stagingAbsent = await withHeldPrivateParentEntryPaths(
+    parent,
+    root,
+    stagingPath,
+    async (heldRootPath, heldStagingPath) => {
+      const winnerPathStat = await lstat(heldRootPath, { bigint: true });
+      const winnerHandleStat = await winner.held.handle.stat({ bigint: true });
+      ensure(
+        safeDirectoryStat(winnerPathStat) &&
+          safeDirectoryStat(winnerHandleStat) &&
+          sameIdentity(winner.held.identity, winnerPathStat) &&
+          sameIdentity(winner.held.identity, winnerHandleStat),
+        "podman_writer_state_io_failed",
+      );
+      try {
+        await lstat(heldStagingPath, { bigint: true });
+        return false;
+      } catch (error) {
+        if (errorCode(error) === "ENOENT") return true;
+        throw error;
+      }
+    },
+  );
+  ensure(stagingAbsent, "podman_writer_state_io_failed");
+}
+
+async function cleanupExactLosingStateOwnerCandidate(
+  root,
+  stagingPath,
+  held,
+  marker,
+  winner,
+) {
+  const parent = privateParentFromHeldDirectory(held);
+  ensure(
+    sameIdentity(held.parentIdentity, winner.held.parentIdentity) &&
+      !sameIdentity(held.identity, winner.held.identity),
+    "podman_writer_state_io_failed",
+  );
+  await assertStateOwnerDirectoryEntryHeld(root, winner.held);
+  await assertStateOwnerMarkerHeld(root, winner.held, winner.marker);
+  await assertStateOwnerDirectoryEntryHeld(stagingPath, held);
+  await assertStateOwnerMarkerHeld(stagingPath, held, marker);
+  await withHeldPrivateParentEntryPaths(
+    parent,
+    root,
+    stagingPath,
+    async (heldRootPath, heldStagingPath) => {
+      const winnerPathStat = await lstat(heldRootPath, { bigint: true });
+      const winnerHandleStat = await winner.held.handle.stat({ bigint: true });
+      ensure(
+        safeDirectoryStat(winnerPathStat) &&
+          safeDirectoryStat(winnerHandleStat) &&
+          sameIdentity(winner.held.identity, winnerPathStat) &&
+          sameIdentity(winner.held.identity, winnerHandleStat),
+        "podman_writer_state_io_failed",
+      );
+      await assertInitialStateOwnerCandidateNamespace(
+        heldStagingPath,
+        held,
+        marker,
+      );
+    },
+  );
+
+  await withHeldDirectoryEntryPath(
+    stagingPath,
+    held,
+    stateOwnerMarkerPath(stagingPath),
+    async (path) => {
+      const markerPathStat = await lstat(path, { bigint: true });
+      const markerHandleStat = await marker.handle.stat({ bigint: true });
+      const markerBytes = await readHeldFileExactly(
+        marker.handle,
+        marker.bytes.length,
+      );
+      const markerFinalStat = await marker.handle.stat({ bigint: true });
+      ensure(
+        safeStateOwnerMarkerStat(markerPathStat, marker.bytes.length) &&
+          safeStateOwnerMarkerStat(markerHandleStat, marker.bytes.length) &&
+          safeStateOwnerMarkerStat(markerFinalStat, marker.bytes.length) &&
+          sameIdentity(marker.stat, markerPathStat) &&
+          sameIdentity(marker.stat, markerHandleStat) &&
+          sameIdentity(marker.stat, markerFinalStat) &&
+          callIntrinsic(bufferEqualsIntrinsic, markerBytes, [marker.bytes]),
+        "podman_writer_state_io_failed",
+      );
+      await unlink(path);
+    },
+  );
+  // Node has no conditioned unlink-by-inode. The held marker's zero link count
+  // below is a post-operation success proof, not prevention: an active same-uid
+  // process can swap in a bait entry after the final check, causing this call
+  // to delete the bait before the retained marker fd makes us fail closed.
+  const unlinkedMarkerStat = await marker.handle.stat({ bigint: true });
+  const unlinkedMarkerBytes = await readHeldFileExactly(
+    marker.handle,
+    marker.bytes.length,
+  );
+  ensure(
+    unlinkedStateOwnerMarkerStat(unlinkedMarkerStat, marker.bytes.length) &&
+      sameIdentity(marker.stat, unlinkedMarkerStat) &&
+      callIntrinsic(bufferEqualsIntrinsic, unlinkedMarkerBytes, [marker.bytes]),
+    "podman_writer_state_io_failed",
+  );
+  await held.handle.sync();
+
+  await withHeldPrivateParentEntryPaths(
+    parent,
+    root,
+    stagingPath,
+    async (heldRootPath, heldStagingPath) => {
+      const winnerPathStat = await lstat(heldRootPath, { bigint: true });
+      const winnerHandleStat = await winner.held.handle.stat({ bigint: true });
+      const candidatePathStat = await lstat(heldStagingPath, { bigint: true });
+      const candidateHandleStat = await held.handle.stat({ bigint: true });
+      const entries = await readdir(heldStagingPath);
+      ensure(
+        safeDirectoryStat(winnerPathStat) &&
+          safeDirectoryStat(winnerHandleStat) &&
+          sameIdentity(winner.held.identity, winnerPathStat) &&
+          sameIdentity(winner.held.identity, winnerHandleStat) &&
+          safeDirectoryStat(candidatePathStat) &&
+          safeDirectoryStat(candidateHandleStat) &&
+          sameIdentity(held.identity, candidatePathStat) &&
+          sameIdentity(held.identity, candidateHandleStat) &&
+          entries.length === 0,
+        "podman_writer_state_io_failed",
+      );
+      await rmdir(heldStagingPath);
+    },
+  );
+  const removedCandidateStat = await held.handle.stat({ bigint: true });
+  ensure(
+    safeDirectoryStat(removedCandidateStat) &&
+      sameIdentity(held.identity, removedCandidateStat) &&
+      (runtimePlatform !== "linux" || removedCandidateStat.nlink === 0n),
+    "podman_writer_state_io_failed",
+  );
+  // Node likewise has no conditioned rmdir-by-inode. Linux's zero-link held fd
+  // proves successful rmdir removed this exact inode only after the syscall;
+  // a same-uid bait swap can be detected after destructive action, not
+  // prevented. Darwin keeps nlink=2 after rmdir (verified on APFS), so
+  // non-Linux instead relies on held identity/policy plus bracketed name
+  // absence and makes the same active-ABA non-guarantee.
+  await assertStateOwnerCandidateNameAbsent(
+    root,
+    stagingPath,
+    parent,
+    winner,
+  );
+  await held.parentHandle.sync();
+  await assertStateOwnerCandidateNameAbsent(
+    root,
+    stagingPath,
+    parent,
+    winner,
+  );
+  await assertStateOwnerDirectoryEntryHeld(root, winner.held);
+  await assertStateOwnerMarkerHeld(root, winner.held, winner.marker);
+}
+
+async function closeUnpublishedStateOwnerCandidate(held, marker) {
+  let primaryError = null;
+  if (marker !== null) {
+    try {
+      await closeStateOwnerMarker(marker);
+    } catch (error) {
+      primaryError = error;
+    }
+  }
+  if (held !== null) {
+    try {
+      await closeHeldDirectory(held);
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (primaryError !== null) throw primaryError;
+}
+
+async function openPreparedStateOwnerRoot(root) {
+  let held = null;
+  let marker = null;
+  let primaryError = null;
+  try {
+    held = await heldPrivateDirectory(root, { create: false }, frozenRecord({}));
+    if (held === null) return null;
+    marker = await openStateOwnerMarker(root, held, null, { writable: true });
+    return frozenRecord({ held, marker });
+  } catch (error) {
+    primaryError = error;
+  }
+  try {
+    await closeUnpublishedStateOwnerCandidate(held, marker);
+  } catch (error) {
+    primaryError ??= error;
+  }
+  if (isStateError(primaryError)) throw primaryError;
+  fail("podman_writer_state_io_failed");
+}
+
+async function createAndPublishStateOwnerRoot(root) {
+  let parent = null;
+  let held = null;
+  let marker = null;
+  let primaryError = null;
+  let prepared = null;
+  try {
+    parent = await openPrivateParent(root);
+    if (!(await rootAbsentFromHeldParent(root, parent))) {
+      await assertPrivateParentHeld(parent);
+      await parent.handle.close();
+      parent = null;
+      prepared = await openPreparedStateOwnerRoot(root);
+      ensure(prepared !== null, "podman_writer_state_io_failed");
+      return prepared;
+    }
+    await assertPrivateParentHeld(parent);
+    const stagingPath = stateOwnerStagingPath(root);
+    held = await createStateOwnerStagingDirectory(root, parent, stagingPath);
+    parent = null;
+    const random = callIntrinsic(randomBytesIntrinsic, undefined, [32]);
+    const stateOwnerId = `state-owner:${callIntrinsic(
+      bufferToStringIntrinsic,
+      random,
+      ["hex"],
+    )}`;
+    assertStateOwnerId(stateOwnerId);
+
+    // Candidate durability is file -> candidate root -> parent. The marker is
+    // complete and canonical before the final root name can become visible.
+    marker = await createStateOwnerMarker(stagingPath, held, stateOwnerId);
+    await assertStateOwnerDirectoryEntryHeld(stagingPath, held);
+    await assertStateOwnerMarkerHeld(stagingPath, held, marker);
+
+    let publication = null;
+    let renameError = null;
+    try {
+      publication = await withHeldPrivateParentEntryPaths(
+        privateParentFromHeldDirectory(held),
+        root,
+        stagingPath,
+        async (heldRootPath, heldStagingPath) => {
+          // Bind the rename source namespace entry to the candidate fd after
+          // the candidate durability barriers and under this same parent-fd
+          // clone. Metadata timestamps are deliberately irrelevant.
+          await assertInitialStateOwnerCandidateNamespace(
+            heldStagingPath,
+            held,
+            marker,
+          );
+          try {
+            await lstat(heldRootPath, { bigint: true });
+            return "winner";
+          } catch (error) {
+            if (errorCode(error) !== "ENOENT") throw error;
+          }
+          // Node exposes ordinary rename, not renameat2(RENAME_NOREPLACE).
+          // Cooperative initializers publish non-empty complete directories,
+          // so only one wins. A non-cooperative same-uid process can still
+          // insert an empty root after the last absence check; this code does
+          // not claim to exclude that final race.
+          await rename(heldStagingPath, heldRootPath);
+          return "renamed";
+        },
+      );
+    } catch (error) {
+      // Clone-close or parent post-bracket failures are authoritative safety
+      // failures from the path guard, not ambiguous rename acknowledgements.
+      if (isStateError(error)) throw error;
+      renameError = error;
+    }
+
+    if (publication === "renamed" || renameError !== null) {
+      const reconciliation = await reconcilePublishedStateOwnerCandidate(
+        root,
+        held,
+        marker,
+      );
+      if (reconciliation.status === "ours") {
+        marker = reconciliation.marker;
+        // Final durability repeats file -> final root -> parent, followed by a
+        // second exact identity/content/access-policy revalidation.
+        await marker.handle.sync();
+        await held.handle.sync();
+        await held.parentHandle.sync();
+        await assertStateOwnerDirectoryEntryHeld(root, held);
+        await assertStateOwnerMarkerHeld(root, held, marker);
+        prepared = frozenRecord({ held, marker });
+        return prepared;
+      }
+      if (
+        publication === "renamed" ||
+        !arrayIncludes(["EEXIST", "ENOTEMPTY", "ENOENT"], errorCode(renameError))
+      ) {
+        throw renameError ?? new PodmanWriterSupervisorStateError(
+          "podman_writer_state_io_failed",
+        );
+      }
+    }
+
+    // A strictly validated distinct winner makes this candidate a proved
+    // loser. Only that case permits exact, anchored, non-recursive cleanup.
+    // Crash debris and every uncertain topology remain inert and untouched; a
+    // fresh retry always uses a new high-entropy basename.
+    prepared = await openPreparedStateOwnerRoot(root);
+    ensure(prepared !== null, "podman_writer_state_io_failed");
+    await cleanupExactLosingStateOwnerCandidate(
+      root,
+      stagingPath,
+      held,
+      marker,
+      prepared,
+    );
+    await closeUnpublishedStateOwnerCandidate(held, marker);
+    held = null;
+    marker = null;
+    return prepared;
+  } catch (error) {
+    primaryError = error;
+  }
+  if (marker !== null || held !== null) {
+    try {
+      await closeUnpublishedStateOwnerCandidate(held, marker);
+    } catch (error) {
+      primaryError ??= error;
+    }
+  } else if (parent !== null) {
+    try {
+      await parent.handle.close();
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (prepared !== null) {
+    try {
+      await closeUnpublishedStateOwnerCandidate(
+        prepared.held,
+        prepared.marker,
+      );
+    } catch (error) {
+      primaryError ??= error;
+    }
+  }
+  if (isStateError(primaryError)) throw primaryError;
+  fail("podman_writer_state_io_failed");
+}
+
 async function withStateDirectory(
   root,
   create,
@@ -2213,25 +2942,16 @@ export async function preparePodmanWriterSupervisorStateOwner(inputValue) {
   let primaryError = null;
   let owner = null;
   try {
-    held = await heldPrivateDirectory(root, { create: false }, frozenRecord({}));
-    if (held === null) {
+    let prepared = await openPreparedStateOwnerRoot(root);
+    if (prepared === null) {
       ensure(
         input.expectedStateOwnerId === null,
         "podman_writer_state_io_failed",
       );
-      held = await heldPrivateDirectory(root, { create: true }, frozenRecord({}));
-      ensure(held.created, "podman_writer_state_io_failed");
-      const random = callIntrinsic(randomBytesIntrinsic, undefined, [32]);
-      const stateOwnerId = `state-owner:${callIntrinsic(
-        bufferToStringIntrinsic,
-        random,
-        ["hex"],
-      )}`;
-      assertStateOwnerId(stateOwnerId);
-      marker = await createStateOwnerMarker(root, held, stateOwnerId);
-    } else {
-      marker = await openStateOwnerMarker(root, held, null, { writable: true });
+      prepared = await createAndPublishStateOwnerRoot(root);
     }
+    held = prepared.held;
+    marker = prepared.marker;
     if (input.expectedStateOwnerId !== null) {
       ensure(
         marker.stateOwnerId === input.expectedStateOwnerId,

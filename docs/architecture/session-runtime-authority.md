@@ -1411,6 +1411,18 @@ owner with its SHA-256, PostgreSQL authorization time, terminal and launch
 operation identities, terminal kind, exact revision 4 `terminalRecord`, and
 its SHA-256.
 
+First owner preparation never writes the marker through the final state-root
+name. It creates a unique sibling staging directory under the held private
+parent, writes and validates the complete canonical marker there, syncs marker,
+candidate root, and parent, then renames the complete directory to the final
+root. It revalidates identity, content, and access policy and repeats the
+marker, final-root, and parent barriers. A crash before rename leaves only
+inert staging debris; a retry after rename or acknowledgement loss adopts only
+the exact complete marker. An existing malformed or unmarked final root remains
+fail-closed. Ordinary POSIX `rename()` does not provide
+`RENAME_NOREPLACE`, so this initialization does not claim to defeat an active
+same-UID process that inserts an empty final root in the last absence window.
+
 The logical launcher obtains that terminal record only from the owner launch,
 returned physical stop receipt, or exact durable revision 4 cold-retirement
 receipt. The record must be exact stopped revision 4

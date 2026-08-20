@@ -172,10 +172,10 @@ function collectionUncertain(error) {
   );
 }
 
-async function withFsOpenOverride(createReplacement, callback) {
-  const descriptor = Object.getOwnPropertyDescriptor(fs.promises, "open");
+async function withFsPromiseOverride(name, createReplacement, callback) {
+  const descriptor = Object.getOwnPropertyDescriptor(fs.promises, name);
   assert.equal(typeof descriptor?.value, "function");
-  Object.defineProperty(fs.promises, "open", {
+  Object.defineProperty(fs.promises, name, {
     ...descriptor,
     value: createReplacement(descriptor.value),
   });
@@ -183,9 +183,21 @@ async function withFsOpenOverride(createReplacement, callback) {
   try {
     return await callback();
   } finally {
-    Object.defineProperty(fs.promises, "open", descriptor);
+    Object.defineProperty(fs.promises, name, descriptor);
     syncBuiltinESMExports();
   }
+}
+
+function withFsOpenOverride(createReplacement, callback) {
+  return withFsPromiseOverride("open", createReplacement, callback);
+}
+
+function withFsRenameOverride(createReplacement, callback) {
+  return withFsPromiseOverride("rename", createReplacement, callback);
+}
+
+function withFsRmdirOverride(createReplacement, callback) {
+  return withFsPromiseOverride("rmdir", createReplacement, callback);
 }
 
 test("creates an exact owner-private append-only state surface", async (t) => {
@@ -268,6 +280,376 @@ test("prepares a durable branded state owner and adopts it after restart or lost
   assert.equal(isPodmanWriterSupervisorStateOwner({ ...owner }), false);
 });
 
+test(
+  "initial owner publication hides incomplete candidates and fresh retries ignore debris",
+  { concurrency: false },
+  async (t) => {
+    for (const failure of ["marker-open", "partial-marker-write"]) {
+      await t.test(failure, async (subtest) => {
+        const parent = await mkdtemp(
+          join(await realpath(tmpdir()), "podman-writer-owner-stage-failure-"),
+        );
+        const root = join(parent, "state");
+        subtest.after(() => rm(parent, { force: true, recursive: true }));
+        let injections = 0;
+
+        await withFsOpenOverride(
+          (originalOpen) => async function openWithOwnerMarkerFailure(...args) {
+            const flags = args[1];
+            const createsOwnerMarker =
+              injections === 0 &&
+              typeof args[0] === "string" &&
+              args[0].endsWith("/.state-owner-v1.json") &&
+              typeof flags === "number" &&
+              (flags & fs.constants.O_CREAT) !== 0;
+            if (!createsOwnerMarker) {
+              return Reflect.apply(originalOpen, this, args);
+            }
+            injections += 1;
+            if (failure === "marker-open") {
+              throw new Error("simulated owner marker open failure");
+            }
+            const handle = await Reflect.apply(originalOpen, this, args);
+            const originalWriteFile = handle.writeFile;
+            assert.equal(typeof originalWriteFile, "function");
+            Object.defineProperty(handle, "writeFile", {
+              configurable: true,
+              enumerable: false,
+              writable: true,
+              async value(bytes) {
+                assert.equal(Buffer.isBuffer(bytes), true);
+                await Reflect.apply(originalWriteFile, handle, [
+                  bytes.subarray(0, 7),
+                ]);
+                throw new Error("simulated partial owner marker write");
+              },
+            });
+            return handle;
+          },
+          () => assert.rejects(prepareOwner(root), stateIoError),
+        );
+
+        assert.equal(injections, 1);
+        await assert.rejects(
+          lstat(root),
+          (error) => error?.code === "ENOENT",
+        );
+        const failedEntries = await readdir(parent);
+        assert.equal(failedEntries.length, 1);
+        assert.match(
+          failedEntries[0],
+          /^\.pws-owner-init-[0-9a-f]{32}$/u,
+        );
+        assert.equal(Buffer.byteLength(failedEntries[0], "utf8"), 48);
+        const debrisPath = join(parent, failedEntries[0]);
+        const debrisStat = await lstat(debrisPath, { bigint: true });
+        assert.equal(Number(debrisStat.mode & 0o7777n), 0o700);
+
+        const owner = await prepareOwner(root);
+        assert.match(owner.stateOwnerId, /^state-owner:[0-9a-f]{64}$/u);
+        assert.deepEqual((await readdir(parent)).sort(), [
+          failedEntries[0],
+          "state",
+        ].sort());
+        assert.equal(
+          JSON.parse(await readFile(join(root, ".state-owner-v1.json"), "utf8"))
+            .stateOwnerId,
+          owner.stateOwnerId,
+        );
+      });
+    }
+  },
+);
+
+test(
+  "initial owner publication adopts its exact root after rename acknowledgement loss",
+  { concurrency: false },
+  async (t) => {
+    const parent = await mkdtemp(
+      join(await realpath(tmpdir()), "podman-writer-owner-rename-ack-loss-"),
+    );
+    const root = join(parent, "state");
+    t.after(() => rm(parent, { force: true, recursive: true }));
+    let renameCalls = 0;
+
+    const owner = await withFsRenameOverride(
+      (originalRename) => async function renameWithLostAcknowledgement(...args) {
+        renameCalls += 1;
+        await Reflect.apply(originalRename, this, args);
+        const error = new Error("simulated owner root rename acknowledgement loss");
+        error.code = "EIO";
+        throw error;
+      },
+      () => prepareOwner(root),
+    );
+
+    assert.equal(renameCalls, 1);
+    assert.equal((await prepareOwner(root)).stateOwnerId, owner.stateOwnerId);
+    assert.deepEqual(await readdir(parent), ["state"]);
+    assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
+  },
+);
+
+test(
+  "Linux parent-clone close failure remains fail-closed after owner rename",
+  { concurrency: false, skip: process.platform !== "linux" },
+  async (t) => {
+    const parent = await mkdtemp(
+      join(await realpath(tmpdir()), "podman-writer-owner-clone-close-"),
+    );
+    const root = join(parent, "state");
+    t.after(() => rm(parent, { force: true, recursive: true }));
+    let renameCompleted = false;
+    let renameCalls = 0;
+    let closeFailures = 0;
+
+    await withFsOpenOverride(
+      (originalOpen) => async function openWithCloneCloseFailure(...args) {
+        const handle = await Reflect.apply(originalOpen, this, args);
+        if (
+          typeof args[0] === "string" &&
+          /^\/proc\/self\/fd\/\d+$/u.test(args[0])
+        ) {
+          const originalClose = handle.close;
+          assert.equal(typeof originalClose, "function");
+          Object.defineProperty(handle, "close", {
+            configurable: true,
+            enumerable: false,
+            writable: true,
+            async value() {
+              await Reflect.apply(originalClose, handle, []);
+              if (renameCompleted && closeFailures === 0) {
+                closeFailures += 1;
+                throw new Error("simulated parent clone close failure");
+              }
+            },
+          });
+        }
+        return handle;
+      },
+      () => withFsRenameOverride(
+        (originalRename) => async function renameAndMarkComplete(...args) {
+          renameCalls += 1;
+          await Reflect.apply(originalRename, this, args);
+          renameCompleted = true;
+        },
+        () => assert.rejects(prepareOwner(root), stateIoError),
+      ),
+    );
+
+    assert.equal(renameCalls, 1);
+    assert.equal(closeFailures, 1);
+    assert.deepEqual(await readdir(parent), ["state"]);
+    const marker = JSON.parse(
+      await readFile(join(root, ".state-owner-v1.json"), "utf8"),
+    );
+    assert.equal((await prepareOwner(root)).stateOwnerId, marker.stateOwnerId);
+  },
+);
+
+test(
+  "Linux reconcile clone-close failure overrides owner rename acknowledgement loss",
+  { concurrency: false, skip: process.platform !== "linux" },
+  async (t) => {
+    const parent = await mkdtemp(
+      join(await realpath(tmpdir()), "podman-writer-owner-reconcile-close-"),
+    );
+    const root = join(parent, "state");
+    t.after(() => rm(parent, { force: true, recursive: true }));
+    let renameCompleted = false;
+    let renameCalls = 0;
+    let postRenameCloneCloses = 0;
+    let closeFailures = 0;
+
+    await withFsOpenOverride(
+      (originalOpen) => async function openWithReconcileCloseFailure(...args) {
+        const handle = await Reflect.apply(originalOpen, this, args);
+        if (
+          typeof args[0] === "string" &&
+          /^\/proc\/self\/fd\/\d+$/u.test(args[0])
+        ) {
+          const originalClose = handle.close;
+          assert.equal(typeof originalClose, "function");
+          Object.defineProperty(handle, "close", {
+            configurable: true,
+            enumerable: false,
+            writable: true,
+            async value() {
+              await Reflect.apply(originalClose, handle, []);
+              if (renameCompleted) {
+                postRenameCloneCloses += 1;
+                if (postRenameCloneCloses === 2) {
+                  closeFailures += 1;
+                  throw new Error("simulated reconcile clone close failure");
+                }
+              }
+            },
+          });
+        }
+        return handle;
+      },
+      () => withFsRenameOverride(
+        (originalRename) => async function renameWithLostAcknowledgement(...args) {
+          renameCalls += 1;
+          await Reflect.apply(originalRename, this, args);
+          renameCompleted = true;
+          const error = new Error("simulated owner rename acknowledgement loss");
+          error.code = "EIO";
+          throw error;
+        },
+        () => assert.rejects(prepareOwner(root), stateIoError),
+      ),
+    );
+
+    assert.equal(renameCalls, 1);
+    assert.equal(postRenameCloneCloses, 2);
+    assert.equal(closeFailures, 1);
+    const marker = JSON.parse(
+      await readFile(join(root, ".state-owner-v1.json"), "utf8"),
+    );
+    assert.equal((await prepareOwner(root)).stateOwnerId, marker.stateOwnerId);
+  },
+);
+
+test(
+  "concurrent initial owner publishers adopt one complete root",
+  { concurrency: false },
+  async (t) => {
+    const parent = await mkdtemp(
+      join(await realpath(tmpdir()), "podman-writer-owner-concurrent-stage-"),
+    );
+    const root = join(parent, "state");
+    t.after(() => rm(parent, { force: true, recursive: true }));
+    let renameCalls = 0;
+    let releaseRenames;
+    const bothAtRename = new Promise((resolve) => {
+      releaseRenames = resolve;
+    });
+
+    const owners = await withFsRenameOverride(
+      (originalRename) => async function renameAfterBothCandidates(...args) {
+        renameCalls += 1;
+        if (renameCalls === 2) releaseRenames();
+        await bothAtRename;
+        return Reflect.apply(originalRename, this, args);
+      },
+      () => Promise.all([prepareOwner(root), prepareOwner(root)]),
+    );
+
+    assert.equal(renameCalls, 2);
+    assert.equal(owners[0].stateOwnerId, owners[1].stateOwnerId);
+    assert.equal((await prepareOwner(root)).stateOwnerId, owners[0].stateOwnerId);
+    const parentEntries = await readdir(parent);
+    assert.deepEqual(parentEntries, ["state"]);
+    assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
+  },
+);
+
+test(
+  "loser cleanup failure closes winner handles and cold retry adopts it",
+  { concurrency: false },
+  async (t) => {
+    const parent = await mkdtemp(
+      join(await realpath(tmpdir()), "podman-writer-owner-cleanup-failure-"),
+    );
+    const root = join(parent, "state");
+    t.after(() => rm(parent, { force: true, recursive: true }));
+    let renameCalls = 0;
+    let releaseRenames;
+    const bothAtRename = new Promise((resolve) => {
+      releaseRenames = resolve;
+    });
+    let cleanupFailed = false;
+    let rmdirCalls = 0;
+    let winnerRootHandleOpens = 0;
+    let winnerRootHandleCloses = 0;
+
+    const results = await withFsOpenOverride(
+      (originalOpen) => async function openWithWinnerHandleTracking(...args) {
+        const handle = await Reflect.apply(originalOpen, this, args);
+        if (args[0] === root) {
+          winnerRootHandleOpens += 1;
+          const originalClose = handle.close;
+          assert.equal(typeof originalClose, "function");
+          Object.defineProperty(handle, "close", {
+            configurable: true,
+            enumerable: false,
+            writable: true,
+            async value() {
+              await Reflect.apply(originalClose, handle, []);
+              if (cleanupFailed) winnerRootHandleCloses += 1;
+            },
+          });
+        }
+        return handle;
+      },
+      () => withFsRmdirOverride(
+        () => async function failLosingCandidateRmdir() {
+          rmdirCalls += 1;
+          cleanupFailed = true;
+          throw new Error("simulated exact loser rmdir failure");
+        },
+        () => withFsRenameOverride(
+          (originalRename) => async function renameAfterBothCandidates(...args) {
+            renameCalls += 1;
+            if (renameCalls === 2) releaseRenames();
+            await bothAtRename;
+            return Reflect.apply(originalRename, this, args);
+          },
+          () => Promise.allSettled([prepareOwner(root), prepareOwner(root)]),
+        ),
+      ),
+    );
+
+    assert.equal(renameCalls, 2);
+    assert.equal(rmdirCalls, 1);
+    assert.equal(winnerRootHandleOpens, 1);
+    assert.equal(winnerRootHandleCloses, 1);
+    const fulfilled = results.filter((result) => result.status === "fulfilled");
+    const rejected = results.filter((result) => result.status === "rejected");
+    assert.equal(fulfilled.length, 1);
+    assert.equal(rejected.length, 1);
+    assert.equal(stateIoError(rejected[0].reason), true);
+
+    const parentEntries = await readdir(parent);
+    assert.equal(parentEntries.includes("state"), true);
+    const debris = parentEntries.filter((entry) =>
+      /^\.pws-owner-init-[0-9a-f]{32}$/u.test(entry)
+    );
+    assert.equal(debris.length, 1);
+    assert.deepEqual(await readdir(join(parent, debris[0])), []);
+    assert.equal(
+      (await prepareOwner(root)).stateOwnerId,
+      fulfilled[0].value.stateOwnerId,
+    );
+  },
+);
+
+test("owner staging reserves the worst-case marker path budget", async (t) => {
+  const maximumNativePathBytes = 4_095;
+  const maximumStateRootBytes = maximumNativePathBytes - 80;
+  const stagingBasename = `.pws-owner-init-${"a".repeat(32)}`;
+  const markerName = ".state-owner-v1.json";
+  const worstCaseBytes =
+    maximumStateRootBytes - 2 +
+    1 + Buffer.byteLength(stagingBasename, "utf8") +
+    1 + Buffer.byteLength(markerName, "utf8");
+  assert.equal(Buffer.byteLength(stagingBasename, "utf8"), 48);
+  assert.equal(Buffer.byteLength(markerName, "utf8"), 20);
+  assert.equal(worstCaseBytes, 4_083);
+  assert.equal(worstCaseBytes <= maximumNativePathBytes, true);
+
+  const parent = await mkdtemp(
+    join(await realpath(tmpdir()), "podman-writer-owner-staging-name-root-"),
+  );
+  const root = join(parent, stagingBasename);
+  t.after(() => rm(parent, { force: true, recursive: true }));
+  const owner = await prepareOwner(root);
+  assert.match(owner.stateOwnerId, /^state-owner:[0-9a-f]{64}$/u);
+  assert.deepEqual(await readdir(parent), [stagingBasename]);
+  assert.deepEqual(await readdir(root), [markerName]);
+});
+
 test("state owner initialization is root-local and never creates for an expected owner", async (t) => {
   const parent = await mkdtemp(
     join(await realpath(tmpdir()), "podman-writer-state-owner-scope-test-"),
@@ -293,6 +675,12 @@ test("state owner initialization is root-local and never creates for an expected
   await mkdir(unmarkedRoot, { mode: 0o700 });
   await assert.rejects(prepareOwner(unmarkedRoot), stateIoError);
   assert.deepEqual(await readdir(unmarkedRoot), []);
+  assert.equal(
+    (await readdir(parent)).some((entry) =>
+      /^\.pws-owner-init-[0-9a-f]{32}$/u.test(entry)
+    ),
+    false,
+  );
 });
 
 test("owned operations reject root or marker identity, content, and access-policy drift", async (t) => {
