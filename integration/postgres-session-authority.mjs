@@ -10618,7 +10618,14 @@ test(
           stateOwnerId: INTEGRATION_STATE_OWNER_ID,
         });
         assertOperationReceipt(read, "committed");
-        assert.equal(read.status, "complete-stopped");
+        assert.equal(
+          read.operation.result.outcome,
+          "writer-launch-complete-stopped",
+        );
+        assert.equal(
+          read.operation.result.evidence.status,
+          "complete-stopped",
+        );
         const authorization =
           await authority.readWriterSupervisorStateGcAuthorization({
             stateOwnerId: INTEGRATION_STATE_OWNER_ID,
