@@ -1053,6 +1053,8 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   const firstSessionId = randomUUID();
   const secondOperationId = `legacy-writer-launch-${randomUUID()}`;
   const secondSessionId = randomUUID();
+  const currentOperationId = `legacy-current-writer-launch-${randomUUID()}`;
+  const currentSessionId = randomUUID();
   const staleOperationId = `post-migration-writer-launch-${randomUUID()}`;
   const boundOperationId = `post-migration-writer-launch-${randomUUID()}`;
   const supervisorId = `migration-supervisor-${randomUUID()}`;
@@ -1068,7 +1070,11 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
     },
   });
 
-  for (const sessionId of [firstSessionId, secondSessionId]) {
+  for (const sessionId of [
+    firstSessionId,
+    secondSessionId,
+    currentSessionId,
+  ]) {
     await pool.query(
       [
         "INSERT INTO session_authority.sessions",
@@ -1189,6 +1195,71 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
     [secondOperationId, now],
   );
 
+  await insertDirectOperationIdClaim(pool, {
+    claimedAt: now,
+    operationId: currentOperationId,
+    sessionId: currentSessionId,
+  });
+  await pool.query(
+    [
+      "INSERT INTO session_authority.operation_claims",
+      "(operation_id, session_id, kind, request, result, state, revision,",
+      "created_at, updated_at, retired_at)",
+      "VALUES ($1, $2, 'writer-launch-attempt-v1', $3::jsonb,",
+      "$4::jsonb, 'committed', 2, $5, $5, $5)",
+    ].join(" "),
+    [
+      currentOperationId,
+      currentSessionId,
+      request,
+      JSON.stringify({
+        evidence: { status: "started" },
+        outcome: "writer-launch-started",
+        resultVersion: 1,
+      }),
+      now,
+    ],
+  );
+  await pool.query(
+    [
+      "UPDATE session_authority.sessions",
+      "SET document = $2::jsonb, revision = revision + 1, updated_at = $3",
+      "WHERE session_id = $1",
+    ].join(" "),
+    [
+      currentSessionId,
+      // The migration gate is deliberately shape-agnostic: any non-null
+      // current-launch pointer blocks until the session is drained or fenced.
+      JSON.stringify({ launch: { launchAttemptId: currentOperationId } }),
+      now,
+    ],
+  );
+  await assert.rejects(store.migrate(), (error) => {
+    assert.ok(error instanceof PostgresSerializableStoreError);
+    assert.equal(error.code, "migration_failed");
+    assert.equal(error.commitState, "not-committed");
+    return true;
+  });
+  assert.deepEqual(
+    await readMigrationLedger(pool),
+    trackedMigrations.slice(0, 8).map(({ checksum, version }) => ({
+      checksum,
+      version,
+    })),
+  );
+  const absentOwnerTableAfterCurrentLaunch = await pool.query(
+    "SELECT pg_catalog.to_regclass('session_authority.writer_supervisor_state_owners') AS value",
+  );
+  assert.equal(absentOwnerTableAfterCurrentLaunch.rows[0].value, null);
+  await pool.query(
+    [
+      "UPDATE session_authority.sessions",
+      "SET document = $2::jsonb, revision = revision + 1, updated_at = $3",
+      "WHERE session_id = $1",
+    ].join(" "),
+    [currentSessionId, JSON.stringify({ launch: null }), now],
+  );
+
   await pool.query(
     [
       "UPDATE session_authority.operation_claims",
@@ -1251,10 +1322,10 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
     [
       "SELECT operation_id, result #>> '{outcome}' AS outcome",
       "FROM session_authority.operation_claims",
-      "WHERE operation_id IN ($1, $2)",
+      "WHERE operation_id IN ($1, $2, $3)",
       "ORDER BY operation_id",
     ].join(" "),
-    [firstOperationId, secondOperationId],
+    [firstOperationId, secondOperationId, currentOperationId],
   );
   assert.deepEqual(
     legacyTerminal.rows,
@@ -1267,10 +1338,23 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
         operation_id: secondOperationId,
         outcome: "writer-launch-complete-stopped",
       },
+      {
+        operation_id: currentOperationId,
+        outcome: "writer-launch-started",
+      },
     ].sort((left, right) =>
       left.operation_id.localeCompare(right.operation_id),
     ),
   );
+  const unboundLegacyCurrent = await pool.query(
+    [
+      "SELECT launch_attempt_id",
+      "FROM session_authority.writer_supervisor_state_owners",
+      "WHERE launch_attempt_id = $1",
+    ].join(" "),
+    [currentOperationId],
+  );
+  assert.deepEqual(unboundLegacyCurrent.rows, []);
 
   const staleWriter = await pool.connect();
   let staleWriterTransactionOpen = false;
@@ -1449,11 +1533,12 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   await pool.query(
     [
       "DELETE FROM session_authority.operation_claims",
-      "WHERE operation_id IN ($1, $2, $3, $4)",
+      "WHERE operation_id IN ($1, $2, $3, $4, $5)",
     ].join(" "),
     [
       firstOperationId,
       secondOperationId,
+      currentOperationId,
       staleOperationId,
       boundOperationId,
     ],
@@ -1461,18 +1546,19 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   await pool.query(
     [
       "DELETE FROM session_authority.operation_id_registry",
-      "WHERE operation_id IN ($1, $2, $3, $4)",
+      "WHERE operation_id IN ($1, $2, $3, $4, $5)",
     ].join(" "),
     [
       firstOperationId,
       secondOperationId,
+      currentOperationId,
       staleOperationId,
       boundOperationId,
     ],
   );
   await pool.query(
-    "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2)",
-    [firstSessionId, secondSessionId],
+    "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2, $3)",
+    [firstSessionId, secondSessionId, currentSessionId],
   );
 }
 

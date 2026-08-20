@@ -9,12 +9,17 @@ DO $writer_supervisor_state_owner_migration$
 BEGIN
   IF EXISTS (
     SELECT 1
-    FROM session_authority.operation_claims
-    WHERE kind = 'writer-launch-attempt-v1'
-      AND state IN ('starting', 'uncertain')
+    FROM session_authority.operation_claims AS launch
+    WHERE launch.kind = 'writer-launch-attempt-v1'
+      AND launch.state IN ('starting', 'uncertain')
+  ) OR EXISTS (
+    SELECT 1
+    FROM session_authority.sessions AS session
+    WHERE session.document #> '{launch}' IS NOT NULL
+      AND session.document #> '{launch}' <> 'null'::jsonb
   ) THEN
     RAISE EXCEPTION
-      'writer supervisor state-owner migration requires no active legacy launch attempts'
+      'writer supervisor state-owner migration requires no active or current legacy launch attempts'
       USING
         ERRCODE = '55000',
         CONSTRAINT = 'writer_supervisor_state_owners_require_quiescent_launches';

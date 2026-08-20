@@ -312,12 +312,14 @@
   fail closed before physical dispatch. Direct
   `createPodmanWriterSupervisor()` carries only a caller-asserted owner and is
   not a production deployment input. Migration 009 refuses to install while
-  any legacy writer launch is `starting` or `uncertain`; after installation, a
-  deferred database constraint prevents an old binary from committing an
-  ownerless dispatch. Only unbound `prepared` work remains owner-neutral for
-  read/cancel cleanup. Historical unbound committed work receives no GC or
-  adoption authority. A committed started attempt that remains the session's
-  current launch must be stopped or physically fenced before rollout; other
+  any legacy writer launch is `starting` or `uncertain`, or while any session
+  retains a non-null current-launch pointer regardless of its shape or
+  referential validity. The latter gate requires a committed current launch to
+  be stopped or physically fenced and its current-launch pointer cleared before
+  rollout. After installation, a deferred database constraint prevents an old
+  binary from committing an ownerless dispatch. Only unbound `prepared` work remains
+  owner-neutral for read/cancel cleanup. Historical unbound committed work that
+  is no longer current receives no GC or adoption authority; its remaining
   terminal artifacts require explicit legacy cleanup.
   The marker prevents accidental routing but is neither cryptographic host
   attestation nor protection against an administrator cloning the root and

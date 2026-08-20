@@ -121,14 +121,16 @@ superseded_by:
   prove cryptographic host identity and cannot detect an administrator cloning
   both root and marker. Missing, malformed, or mismatched markers fail owner
   preparation or bundle construction before physical dispatch. Migration 009
-  refuses legacy `starting`/`uncertain` launches while holding the runtime's
-  session-to-operation lock order. Its deferred commit-time constraint then
-  prevents already-running old binaries from making ownerless dispatch
-  durable. Unbound prepared attempts remain owner-neutral for read/cancel
-  cleanup; historical unbound terminal work gains no GC/adoption authority and
-  remains an explicit legacy cleanup case. A committed started attempt still
-  referenced as the current launch must be stopped or physically fenced before
-  rollout.
+  refuses legacy `starting`/`uncertain` launches and any non-null session
+  current-launch pointer, including malformed or orphaned pointer data, while
+  holding the runtime's session-to-operation lock order. The latter gate
+  requires a committed current launch to be stopped or physically fenced before
+  rollout and its current-launch pointer to be cleared. Its deferred commit-time
+  constraint then prevents already-running old binaries from making ownerless
+  dispatch durable. Unbound prepared
+  attempts remain owner-neutral for read/cancel cleanup; historical unbound
+  terminal work that is no longer current gains no GC/adoption authority and
+  remains an explicit legacy cleanup case.
 - The destructive collector's deadline-plus-grace breach aborts and reports a
   fatal deployment failure but retains the active invocation and aggregate
   stop until the raw native Promise settles. This keeps the fifth lane's

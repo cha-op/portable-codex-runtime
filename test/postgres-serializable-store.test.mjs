@@ -2776,7 +2776,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.doesNotMatch(imageProviderMigration.sql, /jsonb/u);
   assert.match(
     latestMigration.sql,
-    /LOCK TABLE session_authority\.sessions IN EXCLUSIVE MODE;[\s\S]+LOCK TABLE session_authority\.operation_claims IN ACCESS EXCLUSIVE MODE;[\s\S]+writer_supervisor_state_owner_migration[\s\S]+kind = 'writer-launch-attempt-v1'[\s\S]+state IN \('starting', 'uncertain'\)[\s\S]+writer_supervisor_state_owners_require_quiescent_launches[\s\S]+CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
+    /LOCK TABLE session_authority\.sessions IN EXCLUSIVE MODE;[\s\S]+LOCK TABLE session_authority\.operation_claims IN ACCESS EXCLUSIVE MODE;[\s\S]+writer_supervisor_state_owner_migration[\s\S]+launch\.kind = 'writer-launch-attempt-v1'[\s\S]+launch\.state IN \('starting', 'uncertain'\)[\s\S]+FROM session_authority\.sessions AS session[\s\S]+session\.document #> '\{launch\}' IS NOT NULL[\s\S]+session\.document #> '\{launch\}' <> 'null'::jsonb[\s\S]+writer_supervisor_state_owners_require_quiescent_launches[\s\S]+CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
   );
   assert.match(
     latestMigration.sql,

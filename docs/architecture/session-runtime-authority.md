@@ -1460,17 +1460,20 @@ replay returns the durable first completion without reauthorizing a deletion.
 
 There is no legacy owner-adoption API. Migration 009 first takes the runtime's
 session-to-operation table-lock order and refuses to install if a legacy
-writer launch is `starting` or `uncertain`. A deferred constraint then requires
-the matching immutable owner row at the transaction commit that makes dispatch
-durable. This permits the new authority's operation update followed by owner
-insert in one transaction, while preventing an already-running old binary from
-committing an ownerless dispatch. An exact `prepared` to
+writer launch is `starting` or `uncertain`, or if any session retains a non-null
+current-launch pointer regardless of its shape or referential validity. The
+latter gate requires a committed current launch to be stopped or physically
+fenced and its current-launch pointer cleared before rollout. A deferred
+constraint then requires the matching immutable owner row at the transaction
+commit that makes dispatch durable. This permits the new authority's operation
+update followed by owner insert in one
+transaction, while preventing an already-running old binary from committing an
+ownerless dispatch. An exact `prepared` to
 `cancelled-before-dispatch` transition remains owner-free. Other unbound
 `prepared` attempts are owner-neutral only for read/cancel cleanup and cannot
-be adopted; historical unbound committed launches receive no GC or adoption
-authority. A committed started attempt still referenced as the session's
-current launch must be stopped or physically fenced before rollout; other
-historical terminal artifacts require explicit legacy cleanup.
+be adopted; historical unbound committed launches that are no longer current
+receive no GC or adoption authority, and their remaining terminal artifacts
+require explicit legacy cleanup.
 
 The local collector removes only an exact stopped revision 4 chain. Phase 1
 validates the intact revisions 0 through 4 and their present sidecars, or admits only

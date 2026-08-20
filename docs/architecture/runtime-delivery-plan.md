@@ -451,13 +451,15 @@ Restore and launcher authority are now split into eight serial pull requests:
      launch attempt immutably to its local owner before dispatch; GC
      authorization/request/receipt repeat the marker and completion rechecks it.
      The durable launch request remains version 1. Migration 009 refuses any
-     legacy `starting`/`uncertain` launch, then uses a deferred database
-     constraint to keep an already-running old binary from committing an
-     ownerless dispatch. Only unbound prepared work remains owner-neutral for
-     read/cancel cleanup; historical unbound terminal work receives no new GC
-     or adoption authority. A committed started attempt that remains the
-     current launch must be stopped or physically fenced before rollout. The
-     marker is routing
+     legacy `starting`/`uncertain` launch and any non-null session current-launch
+     pointer regardless of its shape or referential validity, thereby requiring
+     a committed current launch to be stopped or physically fenced before
+     rollout and its current-launch pointer to be cleared. It then uses a
+     deferred database constraint to keep an already-running old binary from
+     committing an ownerless dispatch. Only unbound prepared work remains
+     owner-neutral for read/cancel cleanup;
+     historical unbound terminal work that is no longer current receives no new
+     GC or adoption authority. The marker is routing
      identity, not cryptographic host attestation or protection against an
      administrator cloning the root and marker together.
    - Operational lease admission is now complete. Deployment derives separate

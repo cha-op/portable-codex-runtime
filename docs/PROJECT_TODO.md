@@ -175,12 +175,15 @@
   the caller's base recovery scope with the marker for cursor isolation and
   holds the database-global exclusive lifecycle guard, with a dedicated
   physical settlement. Migration 009 refuses active legacy
-  `starting`/`uncertain` launches before installation, then fences ownerless
-  dispatch from already-running old binaries with a deferred commit-time
-  constraint. Historical unbound terminal work is not retroactively authorized
-  and remains an explicit cleanup case; any committed started attempt still
-  referenced as the current launch must be stopped or physically fenced before
-  rollout. The collector deletes exact stopped revisions in two directory-
+  `starting`/`uncertain` launches and any non-null session current-launch
+  pointer, including malformed or orphaned pointer data, before installation.
+  That gate requires a committed current launch to be stopped or physically
+  fenced and its current-launch pointer cleared before rollout. It then fences
+  ownerless dispatch from already-running old binaries with a deferred
+  commit-time constraint. Historical unbound
+  terminal work that is no longer current is not retroactively authorized and
+  remains an explicit cleanup case. The collector deletes exact stopped
+  revisions in two directory-
   synced phases and accepts acknowledgement-loss replay from `collected` to
   `absent`. Production deployment accepts only the exact process-local
   supervisor/collector pair returned by
