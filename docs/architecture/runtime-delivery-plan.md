@@ -571,18 +571,22 @@ Version 3 checkpoints retain current storage, destroyed tombstones, attachment
 origin IDs, and the live prepared recovery working set; committed operation
 history remains only in PostgreSQL and is available for arbitrary-age exact
 replay. Cold open submits one compact projection to the contract-version-3
-runtime authority, which independently streams and fully normalizes the
-complete prepared set and every attached storage origin through at most three
-data `SELECT` statements in one serializable transaction. It accumulates no
-operation payloads and returns a domain-separated receipt only for an exact
-match. That receipt is cached only for the same exact loaded head and authority
-instance. Native writes continue to store
+runtime authority. In one serializable transaction it reads the exact head,
+then streams and fully normalizes the complete prepared set through one data
+`SELECT` whose `LIMIT` comes from that head's structural bound. It validates
+`A` attachment origins in independent fixed 65,535-ID input/query batches
+through `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements,
+in addition to the exact-head `SELECT`; SQL parameters and additional memory
+remain bounded per batch. It returns a domain-separated receipt only for an
+exact match. That receipt is cached only for the same exact loaded head and
+authority instance. Native writes continue to store
 `indexed-frame-v1`; the one adoption transaction alone may store
 `unavailable-adopted-v2`. The full-array adoption contract is operationally
 capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical
 operation/prepared-projection/storage material, and fails before candidate
-mutation; a future streaming contract is required for valid version 2 state
-outside those limits. See
+mutation. Those limits apply only to adoption, not to legal version 3 runtime
+projection; a future streaming contract is required for valid version 2 state
+outside those adoption limits. See
 `linux-ext4-physical-backend.md`. Later slices own
 power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
 export/compression, content-addressed distribution, encryption, registry trust,

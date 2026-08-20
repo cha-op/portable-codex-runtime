@@ -43,6 +43,8 @@ const MAX_PAGE_SIZE = 4;
 const MAX_ADOPTION_OPERATIONS = 65_535;
 const MAX_ADOPTION_STORAGES = 65_535;
 const MAX_ADOPTION_INSERT_BATCH_SIZE = 64;
+// Runtime projection batching is independent from the frozen adoption ABI.
+const MAX_RUNTIME_ATTACHMENT_ORIGIN_BATCH_SIZE = 65_535;
 // The complete-array ABI also has one shared canonical-material budget. The
 // budget counts every stored operation material (prepared and, when present,
 // committed) plus every projected storage wrapper. Larger states need a
@@ -325,7 +327,7 @@ const READ_ALL_PREPARED_OPERATIONS_QUERY = [
   "FROM session_authority.filesystem_image_provider_operations",
   "WHERE provider_id = $1 AND anchor_id = $2 AND state = 'prepared'",
   'ORDER BY storage_id COLLATE pg_catalog."C"',
-  "LIMIT $3::pg_catalog.int4",
+  "LIMIT $3::pg_catalog.int8",
 ].join(" ");
 const READ_ATTACHMENT_ORIGINS_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
@@ -2180,17 +2182,16 @@ async function comparePreparedProjectionInTransaction(
     [
       identity.providerId,
       identity.anchorId,
-      StringConstructor(MAX_ADOPTION_OPERATIONS + 1),
+      StringConstructor(structuralBound + 1),
     ],
     (row) => {
       const material = normalizeOperationRow(row, identity, code);
       assertOperationVisibleAtHead(material, expectedSnapshot, code);
       const record = material.record;
       observedCount += 1;
+      ensure(observedCount <= structuralBound, code);
       ensure(
         record.state === "prepared" &&
-          observedCount <= MAX_ADOPTION_OPERATIONS &&
-          observedCount <= structuralBound &&
           (previousStorageId === null ||
             record.storageId > previousStorageId),
         code,
@@ -2224,12 +2225,8 @@ function normalizeAttachmentOrigin(value, code) {
   });
 }
 
-function normalizeAttachmentOrigins(value, code) {
-  const count = frozenDenseDataArrayLength(
-    value,
-    MAX_ADOPTION_OPERATIONS,
-    code,
-  );
+function normalizeAttachmentOrigins(value, maximumCount, code) {
+  const count = frozenDenseDataArrayLength(value, maximumCount, code);
   const hash = beginCountedProjectionHash(
     ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
     count,
@@ -2260,7 +2257,7 @@ function normalizeAttachmentOrigins(value, code) {
     byOperationId,
     checksum: callIntrinsic(hashDigestIntrinsic, hash, ["hex"]),
     count,
-    postgresOperationIds: postgresTextArrayLiteral(operationIds),
+    operationIds,
   });
 }
 
@@ -2271,50 +2268,78 @@ async function compareAttachmentOriginsInTransaction(
   origins,
   stateCode,
 ) {
-  let observedCount = 0;
-  let previousOperationId = null;
+  let totalObservedCount = 0;
   let projectionMismatch = false;
-  await consumePostgresSerializableTransactionRows(
-    transaction,
-    READ_ATTACHMENT_ORIGINS_QUERY,
-    [
-      identity.providerId,
-      identity.anchorId,
-      origins.postgresOperationIds,
-      StringConstructor(origins.count + 1),
-    ],
-    (row) => {
-      const material = normalizeOperationRow(row, identity, stateCode);
-      assertOperationVisibleAtHead(material, expectedSnapshot, stateCode);
-      const operationId = material.record.operationId;
-      observedCount += 1;
-      if (
-        previousOperationId !== null && operationId <= previousOperationId
-      ) {
-        projectionMismatch = true;
-      }
-      previousOperationId = operationId;
-      const origin = mapGet(origins.byOperationId, operationId);
-      if (origin === undefined) {
-        projectionMismatch = true;
-        return;
-      }
-      const record = material.record;
-      if (
-        record.state !== "committed" ||
-        (record.kind !== "attach" && record.kind !== "restore-attach") ||
-        record.operationId !== origin.operationId ||
-        record.storageId !== origin.storageId ||
-        BigIntConstructor(record.storageState.revision) >
-          BigIntConstructor(origin.currentStorageRevision) ||
-        stableStorageProjectionChecksum(record.storageState, stateCode) !==
-          origin.stableStorageChecksum
-      ) {
-        projectionMismatch = true;
-      }
-    },
-  );
-  if (observedCount !== origins.count) projectionMismatch = true;
+  let batchStart = 0;
+  do {
+    const batchEnd = callIntrinsic(mathMinIntrinsic, undefined, [
+      origins.count,
+      batchStart + MAX_RUNTIME_ATTACHMENT_ORIGIN_BATCH_SIZE,
+    ]);
+    const batchOperationIds = callIntrinsic(
+      arraySliceIntrinsic,
+      origins.operationIds,
+      [batchStart, batchEnd],
+    );
+    const batchOperationIdSet = new SetConstructor();
+    for (let index = 0; index < batchOperationIds.length; index += 1) {
+      callIntrinsic(setAddIntrinsic, batchOperationIdSet, [
+        batchOperationIds[index],
+      ]);
+    }
+    const batchExpectedCount = batchOperationIds.length;
+    let batchObservedCount = 0;
+    let previousOperationId = null;
+    await consumePostgresSerializableTransactionRows(
+      transaction,
+      READ_ATTACHMENT_ORIGINS_QUERY,
+      [
+        identity.providerId,
+        identity.anchorId,
+        postgresTextArrayLiteral(batchOperationIds),
+        StringConstructor(batchExpectedCount + 1),
+      ],
+      (row) => {
+        const material = normalizeOperationRow(row, identity, stateCode);
+        assertOperationVisibleAtHead(material, expectedSnapshot, stateCode);
+        const operationId = material.record.operationId;
+        batchObservedCount += 1;
+        totalObservedCount += 1;
+        ensure(batchObservedCount <= batchExpectedCount + 1, stateCode);
+        if (
+          (previousOperationId !== null &&
+            operationId <= previousOperationId) ||
+          !callIntrinsic(setHasIntrinsic, batchOperationIdSet, [operationId])
+        ) {
+          projectionMismatch = true;
+        }
+        previousOperationId = operationId;
+        const origin = mapGet(origins.byOperationId, operationId);
+        if (origin === undefined) {
+          projectionMismatch = true;
+          return;
+        }
+        const record = material.record;
+        if (
+          record.state !== "committed" ||
+          (record.kind !== "attach" && record.kind !== "restore-attach") ||
+          record.operationId !== origin.operationId ||
+          record.storageId !== origin.storageId ||
+          BigIntConstructor(record.storageState.revision) >
+            BigIntConstructor(origin.currentStorageRevision) ||
+          stableStorageProjectionChecksum(record.storageState, stateCode) !==
+            origin.stableStorageChecksum
+        ) {
+          projectionMismatch = true;
+        }
+      },
+    );
+    if (batchObservedCount !== batchExpectedCount) {
+      projectionMismatch = true;
+    }
+    batchStart = batchEnd;
+  } while (batchStart < origins.count);
+  if (totalObservedCount !== origins.count) projectionMismatch = true;
   if (projectionMismatch) return null;
   return origins.checksum;
 }
@@ -3218,12 +3243,16 @@ function normalizeProjectionRequestOuter(value, code) {
     code,
   );
   const expectedHead = canonicalHead(input.expectedHead, code);
+  const structuralBound =
+    expectedHead.checkpointFrameCount + expectedHead.frameCount;
+  ensure(numberIsSafeIntegerIntrinsic(structuralBound), code);
   const preparedProjectionChecksum = canonicalChecksum(
     input.preparedProjectionChecksum,
     code,
   );
   const attachmentOrigins = normalizeAttachmentOrigins(
     input.attachmentOrigins,
+    structuralBound,
     code,
   );
   return objectFreeze({

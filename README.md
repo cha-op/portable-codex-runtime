@@ -652,12 +652,18 @@ storage record, destroyed tombstones, and the live prepared recovery working
 set, but no committed history. Arbitrary-age committed replay comes from the
 index. Cold open sends a compact, domain-separated projection summary to the
 runtime authority. In one serializable snapshot, that authority independently
-streams and fully normalizes every prepared row and attached-storage origin,
-without accumulating operation payloads or issuing per-row or per-page SQL,
-and returns a receipt only when both PostgreSQL projections exactly match. The
-provider caches that receipt only for the same authority instance, exact head,
-and unchanged loaded generation; an acknowledgement-loss readback or adoption
-requires a fresh comparison. Each operation append
+streams and fully normalizes every prepared row. Its single prepared data
+`SELECT` takes its `LIMIT` from the exact stored head's structural bound.
+Attachment-origin input is validated in independent fixed batches of at most
+65,535 IDs, and each batch's query results are streamed and validated. For `A`
+attachment origins, projection validation uses one prepared data `SELECT` plus
+`max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements, in
+addition to the exact-head `SELECT`; each batch keeps SQL parameters and
+additional memory bounded. The authority returns a receipt only when both
+PostgreSQL projections exactly match. The provider caches that receipt only
+for the same authority instance, exact head, and unchanged loaded generation;
+an acknowledgement-loss readback or adoption requires a fresh comparison.
+Each operation append
 compares the complete canonical `storageStateBefore` with the latest committed
 PostgreSQL projection in the same serializable transaction. Native commits use
 `indexed-frame-v1`; a validated version 2 adoption may use
@@ -689,10 +695,13 @@ checkpoint storage and the ext4-to-Podman binding requires that exact committed
 attach or restore-attach operation. Current storage may advance only by legal
 monotonic revisions from the origin state. `inspectCapacity()` counts only live
 prepared operations as retained local operations in version 3. The full-array
-adoption contract admits at most 65,535 operations, 65,535 storages, and 64 MiB
-of aggregate canonical operation/prepared-projection/storage material. A valid
-version 2 state above any of those operational limits fails deterministically
-with `state_capacity_exhausted` before any candidate generation is changed and
+adoption version 1 contract admits at most 65,535 operations, 65,535 storages,
+and 64 MiB of aggregate canonical operation/prepared-projection/storage
+material. Those are adoption-only operational limits, not limits on a valid
+version 3 runtime projection: runtime comparison uses the exact head's
+structural bound and fixed attachment-origin batches. A valid version 2 state
+above any adoption limit fails deterministically with
+`state_capacity_exhausted` before any candidate generation is changed and
 requires a future streaming adoption contract. The operation relation remains
 permanent while its anchor exists: `TRUNCATE` is rejected, committed rows are
 immutable, and deletion requires same-transaction teardown of the whole

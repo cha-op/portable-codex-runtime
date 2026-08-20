@@ -258,17 +258,23 @@
   checkpoints retain current storage, destroyed tombstones, attachment-origin
   IDs, and the live prepared recovery working set, but no committed history.
   Arbitrary-age exact replay comes from the permanent PostgreSQL index. The
-  contract-version-3 runtime authority streams the complete prepared and
-  attachment-origin projections through at most three data `SELECT` statements
-  in one serializable transaction and returns a domain-separated receipt; the
-  provider caches it only for the same exact loaded head and authority instance.
+  contract-version-3 runtime authority first reads the exact head through one
+  `SELECT`, then uses one streamed prepared data `SELECT` whose `LIMIT` comes
+  from that head's structural bound. It validates `A` attachment origins in
+  independent fixed 65,535-ID batches through
+  `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements in the
+  same serializable transaction. SQL parameters and
+  additional memory remain bounded per batch, and these runtime projection
+  reads are not capped by the adoption version 1 operational envelope. The
+  authority returns a domain-separated receipt; the provider caches it only for
+  the same exact loaded head and authority instance.
 - [pending] Add a streaming or paged adoption contract for otherwise-valid
   version 2 state containing more than 65,535 operations, 65,535 storages, or
   64 MiB of aggregate canonical operation/prepared-projection/storage
   material. The current full-array adoption v1 contract rejects that state
   with `state_capacity_exhausted` before any candidate generation mutation;
-  its operational capacity must not be described as the version 2 format
-  limit.
+  its operational capacity applies only to adoption and must not be described
+  as either the version 2 format limit or a version 3 runtime projection limit.
 - [pending] Extend beyond that clean/manual-fencing boundary only in separately
   scoped work: power-loss/crash-prefix evidence, automatic stale-writer
   fencing, differential export/compression, content-addressed distribution,

@@ -2027,6 +2027,11 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       tgdeferrable: false,
       tginitdeferred: false,
     },
+    {
+      tgname: "fs_image_operations_event_claim",
+      tgdeferrable: false,
+      tginitdeferred: false,
+    },
   ]);
 
   const assertStateInvalid = (error) => {

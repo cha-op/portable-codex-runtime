@@ -2599,27 +2599,30 @@ readPreparedOperationsPage, compareProjection, compareAndAdvance }`.
 digest of all locally loaded prepared records, and storage-sorted attachment
 origin summaries. In one serializable transaction it validates the exact head
 and completeness marker, then independently streams and fully normalizes every
-prepared row and named attached-origin operation through bounded one-row
-processing. It accumulates no operation payloads and issues no per-row or
-per-page SQL. Each origin must be a committed `attach` or
-`restore-attach` for the named storage; its complete canonical storage state
-must equal the current state after normalizing only a legal monotonic revision
-increase. The prepared and origin streams use separate length-prefixed
-projection digests, and the authority returns a domain-separated receipt only
-when both equal the caller's projection under that exact head. A mismatch
-returns no receipt; corrupt authority material remains state-invalid.
+prepared row in one data `SELECT` whose `LIMIT` is derived from the exact
+stored head's structural bound. It validates attachment-origin input and named
+origin query results in independent fixed batches of at most 65,535 IDs. Each
+origin must be a committed `attach` or `restore-attach` for the named storage;
+its complete canonical storage state must equal the current state after
+normalizing only a legal monotonic revision increase. The prepared and origin
+streams use separate length-prefixed projection digests, and the authority
+returns a domain-separated receipt only when both equal the caller's projection
+under that exact head. A mismatch returns no receipt; corrupt authority
+material remains state-invalid.
 
 The provider caches that receipt only inside the same authority instance and
 for the exact unchanged loaded generation and head. A definite normal append
 or rotation obtains the receipt for its new head before publishing the next
 cache. A cold parse, version 2 adoption, or acknowledgement-loss readback does
-not infer the receipt and must run a new comparison. Thus projection validation
-uses one serializable transaction and at most three data `SELECT` statements:
-one exact-head read, one prepared-row stream, and one attached-origin stream.
-The store rechecks transaction identity once after each statement. Streaming
-keeps database operation material bounded to one fully validated row at a time,
-and statement count is independent of prepared and attachment working-set
-cardinality. This path is bound to the repository-pinned `pg@8.22.0` extended
+not infer the receipt and must run a new comparison. For `A` attachment origins,
+projection validation uses one exact-head `SELECT`, one prepared data `SELECT`,
+and `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements in the
+same serializable transaction. The store rechecks transaction identity once
+after each statement. Streaming keeps database operation material bounded to
+one fully validated row at a time, while each origin batch bounds SQL parameters
+and additional comparison memory. The prepared statement count is independent
+of prepared cardinality; origin statement count grows only by fixed 65,535-ID
+batches. This path is bound to the repository-pinned `pg@8.22.0` extended
 query portal with 1,024-row fetches. Completion requires one `RowDescription`,
 one `SELECT` command completion, an exact streamed row count, no accumulated
 `Result.rows`, and the transaction-identity recheck. A server `ErrorResponse`
@@ -2634,10 +2637,12 @@ Filesystem candidate publication precedes the database adoption. Exact target
 head, marker, manifest, and full-row readback proves success after a lost COMMIT
 acknowledgement; exact unchanged source proves failure; every other observation
 preserves both generations and reports uncertainty. The full-array adoption
-API admits at most 65,535 operations, 65,535 storages, and 64 MiB of aggregate
-canonical operation/prepared-projection/storage material. Valid version 2
-state outside those limits fails with `state_capacity_exhausted` before
-candidate mutation and requires a future streaming contract. Migration 011
+version 1 API admits at most 65,535 operations, 65,535 storages, and 64 MiB of
+aggregate canonical operation/prepared-projection/storage material. Those
+limits apply only to adoption, not to a legal version 3 runtime projection.
+Valid version 2 state outside those adoption limits fails with
+`state_capacity_exhausted` before candidate mutation and requires a future
+streaming contract. Migration 011
 claims every prepared and committed revision in an internal unique event
 registry. Existing non-null markers are validated during migration; later
 indexed heads can append only one claimed revision or rotate without changing

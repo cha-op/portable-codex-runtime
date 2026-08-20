@@ -473,9 +473,12 @@ the same transaction.
 Cold version 3 load builds a compact projection summary from the complete local
 prepared set and every attached storage origin. The contract-version-3 runtime
 authority verifies the exact head and completeness marker, then independently
-streams and fully normalizes every PostgreSQL prepared row and committed origin
-in one serializable transaction. It accumulates no operation payloads and does
-not issue per-row or per-page SQL. Every origin must be a committed
+streams and fully normalizes every PostgreSQL prepared row through one data
+`SELECT` whose `LIMIT` comes from the exact stored head's structural bound. It
+validates `A` committed origins in independent fixed 65,535-ID input/query
+batches through `max(1, ceil(A / 65,535))` streamed origin data `SELECT`
+statements, in addition to the exact-head `SELECT`; SQL parameters and
+additional memory stay bounded per batch. Every origin must be a committed
 `attach` or `restore-attach` whose storage state equals the current state after
 normalizing only the legal monotonic revision increase. It returns a
 domain-separated receipt only when both projections match. The provider reuses
@@ -490,14 +493,16 @@ readback removes an inert candidate, exact target-head plus manifest and full
 row readback publishes it, and any other result preserves both generations and
 reports `commit_outcome_uncertain`. The full-array version 1 adoption API is
 capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical
-operation/prepared-projection/storage material. A valid version 2 state outside
-those limits reports `state_capacity_exhausted` before candidate cleanup or
-creation; supporting it requires a separately versioned streaming or paged
-adoption contract. A permanent anchor-lifecycle row owns the unique
-provider/anchor key. Complete teardown of any permanent operation history moves
-that row from active to immutable retired; every head insert must claim the
-same key, so both an explicit early `SET CONSTRAINTS ... IMMEDIATE` and a
-concurrent recreation are rejected. Every head deletion, including an empty
+operation/prepared-projection/storage material. Those limits apply only to
+adoption, not to a legal version 3 runtime projection. A valid version 2 state
+outside those adoption limits reports `state_capacity_exhausted` before
+candidate cleanup or creation; supporting it requires a separately versioned
+streaming or paged adoption contract. A permanent anchor-lifecycle row owns the
+unique provider/anchor key. Complete teardown of any permanent operation
+history moves that row from active to immutable retired; every head insert must
+claim the same key, so both an explicit early
+`SET CONSTRAINTS ... IMMEDIATE` and a concurrent recreation are rejected.
+Every head deletion, including an empty
 head, retires the identity to prevent durable-anchor ABA.
 
 A prepared provision has not exposed a storage result. Its retry may adopt a

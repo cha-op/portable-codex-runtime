@@ -68,11 +68,16 @@ superseded_by:
   version 2 compatibility paths rather than silently changing their genesis.
 - Cold version 3 load computes compact domain-separated summaries for all local
   prepared records and attached-storage origins. In one serializable
-  transaction, PostgreSQL independently streams and fully normalizes the
-  complete prepared set and each named committed `attach` or `restore-attach`
-  origin through at most three data `SELECT` statements, without accumulating
-  operation payloads or issuing per-row or per-page SQL. It returns a receipt
-  only for an exact match under the exact head. The repository-pinned
+  transaction, PostgreSQL reads the exact head and independently streams and
+  fully normalizes the complete prepared set through one data `SELECT` whose
+  `LIMIT` comes from that head's structural bound. Attachment-origin input and
+  each named committed `attach` or `restore-attach` query result are validated
+  as independent fixed batches of at most 65,535 IDs. For `A` origins, the
+  projection phase therefore uses one prepared data `SELECT` plus
+  `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements, in
+  addition to the exact-head `SELECT`; SQL parameters and additional memory
+  remain bounded per batch. It returns a receipt only for an exact match under
+  the exact head. The repository-pinned
   `pg@8.22.0` portal fetches 1,024 rows at a time; the store accepts completion
   only after exact `SELECT` command, row-count, empty-result-accumulator, and
   transaction-identity checks. A server `ErrorResponse` sends one protocol
@@ -138,7 +143,10 @@ superseded_by:
   operation/prepared-projection/storage material. A valid version 2 state
   outside those operational limits fails with `state_capacity_exhausted`
   before candidate cleanup or creation. Supporting the wider version 2 format
-  range requires a future streaming or paged adoption contract.
+  range requires a future streaming or paged adoption contract. These limits
+  apply only to adoption version 1; a legal version 3 runtime projection is
+  instead bounded by its exact stored head and streamed attachment-origin
+  batches, not by the adoption envelope.
 - The filesystem candidate and `pending` marker are durable before the
   database cut. A definite unchanged outcome removes only that candidate and
   its marker; an uncertain outcome never guesses which generation is
@@ -172,4 +180,5 @@ superseded_by:
   `test/postgres-filesystem-image-provider-state-authority.test.mjs`,
   `test/filesystem-image-provider-state.test.mjs`,
   `test/ext4-podman-attachment-binding.test.mjs`
-- Real PostgreSQL coverage: `integration/postgres-session-authority.mjs`
+- Real-PostgreSQL integration fixture (requires a configured database):
+  `integration/postgres-session-authority.mjs`

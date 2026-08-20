@@ -529,12 +529,15 @@
   prepared recovery working set; committed history is no longer copied across
   rotation. The contract-version-3 runtime authority validates one compact
   projection request in a single serializable transaction: it independently
-  streams and fully normalizes the complete prepared set and committed
-  attachment origins without accumulating operation payloads or issuing
-  per-row or per-page SQL, and returns a domain-separated receipt only for an
-  exact match. The provider reuses that receipt only for the same authority
-  instance, exact head, and unchanged loaded generation; uncertain
-  acknowledgement and adoption paths require fresh validation.
+  streams and fully normalizes the complete prepared set through one data
+  `SELECT` whose `LIMIT` comes from the exact stored head's structural bound.
+  It validates `A` committed attachment origins in independent fixed 65,535-ID
+  input/query batches through `max(1, ceil(A / 65,535))` streamed origin data
+  `SELECT` statements, in addition to the exact-head `SELECT`. SQL parameters
+  and additional memory remain bounded per batch, and a domain-separated
+  receipt is returned only for an exact match. The provider reuses that receipt
+  only for the same authority instance, exact head, and unchanged loaded
+  generation; uncertain acknowledgement and adoption paths require fresh validation.
   A provider-locked version 2 adoption replays revisions `1..N`, proves storage
   lineage and final projection, durably writes the covering version 3 files,
   and then imports or verifies the complete PostgreSQL history in the same
@@ -557,16 +560,18 @@
   projection, so a complete canonical `storageStateBefore` mismatch rolls the
   head, marker, and history back together. Destroyed storage remains a durable
   tombstone. Version 3 `inspectCapacity()` counts only live prepared operations
-  as retained local operations. Full-array adoption is deliberately capped at
-  65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical
-  operation/prepared-projection/storage material; a valid version 2 state over
-  any limit fails with `state_capacity_exhausted` before candidate mutation and
-  needs a future streaming adoption contract. A permanent anchor-lifecycle row
-  serializes every head insert through the same unique key; full teardown of any operation
-  history moves that row from active to immutable retired, so neither an early
-  deferred-constraint check nor a concurrent transaction can recycle the same
-  provider/anchor identity. Every head deletion retires the row, including an
-  empty head, to prevent durable-anchor ABA. Producer
+  as retained local operations. Full-array adoption version 1 is deliberately
+  capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate
+  canonical operation/prepared-projection/storage material; those limits apply
+  only to adoption, not to legal version 3 runtime projection. A valid version
+  2 state over any adoption limit fails with `state_capacity_exhausted` before
+  candidate mutation and needs a future streaming adoption contract. A
+  permanent anchor-lifecycle row
+  serializes every head insert through the same unique key; full teardown of
+  any operation history moves that row from active to immutable retired, so
+  neither an early deferred-constraint check nor a concurrent transaction can
+  recycle the same provider/anchor identity. Every head deletion retires the
+  row, including an empty head, to prevent durable-anchor ABA. Producer
   outputs bind
   the archive mount-root and artifact-child tuples separately; on the consumer,
   the former makes the first remount verification-only and the latter
