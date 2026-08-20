@@ -15,8 +15,9 @@ plane.
 - Require one fresh-context local Codex review and one exact current-head
   `@codex review` request before merge. This repository does not require a
   Claude lane.
-- Treat a trusted GitHub Codex clean comment on the latest commit as the
-  GitHub lane pass when the pull request has no unresolved finding.
+- Evaluate the GitHub lane under the active trusted review-evidence policy.
+  Task-local evidence overrides belong to the delivery orchestration record;
+  they are not a permanent repository completion contract.
 - Resolve every pull-request conversation before merge.
 - Keep credentials, untracked private files, and unrelated repositories outside
   review and evidence artifacts.
@@ -547,31 +548,37 @@ long-lived private mount namespace, externally anchored provider state,
 distinct publication-control identities, and two-host clean detach, transfer,
 and remount verification plus a producer peer-namespace non-propagation gate.
 Their trusted persistent-identity bridge and same-process conformance evidence
-are complete. Migration 010 now adds the separate PostgreSQL provider-operation
-index authority foundation: an exact head CAS and prepared/committed record
-transition share one serializable durable cut. A nullable completeness marker
-leaves migrated version 2 heads explicitly unadopted, while genesis-created
-indexed heads advance the marker with every logical operation and retain it
-through rotation. Operation reads, paging, and exact-head appends fail closed
-on an unadopted head. The latest validated committed operation for a storage
-is its current PostgreSQL projection; every operation append compares the full
-canonical before-state, and destroyed state remains a committed tombstone.
-Existing version 2 heads retain their logical values and production serving
-remains unchanged. Migration 008
-already requires every non-null value in the three head-checksum columns to be
-an exact 64-byte lowercase-hex value; migration 010 normalizes those valid
-values to `varchar(64)` before version 3, and the permanent history table cannot
-be truncated.
-Migration 010 accepts only native committed suffixes with
-`indexed-frame-v1` and an exact frame checksum; it neither represents nor
-permits a null-checksum rotated-legacy suffix. The next slice's migration 011
-must atomically introduce the `unavailable-adopted-v2` provenance and write
-path with the complete v2 validator, revision coverage and uniqueness proof,
-imported rows, covering version 3 checkpoint head, and exact completeness
-marker. A transaction token or covering head alone is not write capability,
-and permanent operation history cannot be removed from local checkpoints
-before that complete cut. See `linux-ext4-physical-backend.md`. Later
-slices own
+are complete. Migrations 010 and 011 now provide the PostgreSQL permanent
+operation index and the provider-state version 3 cut. A provider-locked version
+2 reducer proves the complete revision sequence, storage lineage, pending set,
+final projection, and attachment origins before the filesystem publishes a
+covering version 3 candidate. PostgreSQL then imports or verifies every record
+and advances the head, completeness marker, and deterministic adoption receipt
+in one serializable transaction. A database-supplied transaction ID and
+deferred revision-coverage check prevent a copied receipt, partial row set, or
+head-only update from opening the legacy checksum exception. Commit
+acknowledgement loss is settled by exact head, marker, receipt, and full-row
+readback.
+An internal unique event-revision registry validates migrated indexed markers
+and maintains completeness inductively: ordinary writes append exactly one
+claimed revision or rotate without changing it, while adoption retains its
+full-range deferred proof. Raw head insertion or multi-revision jumps cannot
+assert a complete permanent index. Stored heads exclude revision zero and a
+database-managed progress transaction ID fences any same-transaction second
+head mutation after an early constraint check.
+
+Version 3 checkpoints retain current storage, destroyed tombstones, attachment
+origin IDs, and the live prepared recovery working set; committed operation
+history remains only in PostgreSQL and is available for arbitrary-age exact
+replay. Cold open proves the complete prepared set and each attached storage's
+committed origin against one exact head. Native writes continue to store
+`indexed-frame-v1`; the one adoption transaction alone may store
+`unavailable-adopted-v2`. The full-array adoption contract is operationally
+capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical
+operation/prepared-projection/storage material, and fails before candidate
+mutation; a future streaming contract is required for valid version 2 state
+outside those limits. See
+`linux-ext4-physical-backend.md`. Later slices own
 power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
 export/compression, content-addressed distribution, encryption, registry trust,
 remote transport, and broader operational hardening.

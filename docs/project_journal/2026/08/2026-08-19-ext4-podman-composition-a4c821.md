@@ -25,7 +25,11 @@ superseded_by:
 - `createExt4PodmanAttachmentBinding()` constructs the initialized backend and
   filesystem authority from the same driver and provider-state objects. The
   verifier reconstructs the exact attachment from its committed origin
-  operation and current storage state before admitting Podman.
+  operation and current storage state before admitting Podman. Its version 2
+  persistent-authority contract requires the provider view's
+  `currentAttachmentOriginOperationId` to equal that queried operation and
+  permits only a legal monotonic storage-revision increase between the origin
+  and current otherwise-equal canonical storage state.
 - The protected object identity has two explicit layers: the provider's
   committed persistent filesystem/file-handle identity and the driver's
   same-sample runtime `device`/`inode`. Podman compares the latter to its held
@@ -48,12 +52,12 @@ superseded_by:
   not a generic supervisor operation: a shared UID or engine cannot use it,
   and final quiescence still requires the native loop-detach receipt.
 
-## Next Steps
+## Follow-up
 
-- Complete the version 3 provider-state adoption and checkpoint cut on top of
-  migration 010's PostgreSQL operation-index authority. Permanent replay may
-  leave local checkpoints only after every current attachment's origin
-  operation remains exact and durable in that index.
+- Version 3 provider-state adoption now retains and validates every current
+  attachment's origin while PostgreSQL supplies permanent operation replay.
+  A future streaming adoption contract is still required for version 2 states
+  beyond the current 65,535-operation/storage full-array capacity.
 - Keep Git Summary deferred; it is not checkpoint or recovery authority.
 
 ## Evidence

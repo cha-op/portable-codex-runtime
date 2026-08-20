@@ -15,7 +15,7 @@ import {
   createExt4FilesystemImagePaths,
 } from "../src/ext4-filesystem-image-paths.mjs";
 import {
-  FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   FILESYSTEM_IMAGE_PROVIDER_STATE_LEDGER_NAME,
   FilesystemImageProviderState,
   normalizeFilesystemImageProviderStateHead,
@@ -159,7 +159,7 @@ function createLockProvider() {
 
 function createHeadAnchor() {
   let head = normalizeFilesystemImageProviderStateHead({
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
     anchorRevision: "0",
     generation: "0",
     stateRevision: "0",

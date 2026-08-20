@@ -28,6 +28,8 @@ import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
   FILESYSTEM_IMAGE_PROVIDER_STATE_LEDGER_NAME,
   FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   FilesystemImageProviderState,
   FilesystemImageProviderStateError,
   filesystemImageProviderStateCheckpointName,
@@ -193,6 +195,23 @@ function sameLedgerHead(left, right) {
 
 function genesisHead() {
   return normalizeFilesystemImageProviderStateHead({
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+    anchorRevision: "0",
+    generation: "0",
+    stateRevision: "0",
+    baseHeadChecksum: null,
+    checkpointStateRevision: "0",
+    checkpointFrameCount: 0,
+    checkpointChecksum: null,
+    checkpointBytes: 0,
+    frameCount: 0,
+    lastChecksum: null,
+    ledgerBytes: 0,
+  });
+}
+
+function v3GenesisHead() {
+  return normalizeFilesystemImageProviderStateHead({
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
     anchorRevision: "0",
     generation: "0",
@@ -249,6 +268,164 @@ function createFixedTrustedHeadAnchor(value) {
   });
 }
 
+function createExactStateAuthorities(options = {}) {
+  const tracker = options.tracker ?? {};
+  let head = normalizeFilesystemImageProviderStateHead(
+    options.head ?? v3GenesisHead(),
+  );
+  const operations = new Map();
+  for (const record of options.operations ?? []) {
+    operations.set(record.operationId, Object.freeze(record));
+  }
+  const requireHead = (expectedHead) => {
+    if (!sameLedgerHead(head, expectedHead)) {
+      throw new Error("exact head changed");
+    }
+  };
+  const readHead = Object.freeze(async function readHead() {
+    tracker.reads = (tracker.reads ?? 0) + 1;
+    if (tracker.failRead === true) throw new Error("authority unavailable");
+    return copyLedgerHead(head);
+  });
+  const readOperation = Object.freeze(async function readOperation({
+    expectedHead,
+    operationId,
+  }) {
+    requireHead(expectedHead);
+    tracker.operationReads = (tracker.operationReads ?? 0) + 1;
+    return operations.get(operationId) ?? null;
+  });
+  const readOperationsPage = Object.freeze(async function readOperationsPage({
+    expectedHead,
+    afterOperationId,
+    limit,
+  }) {
+    requireHead(expectedHead);
+    const records = [...operations.values()]
+      .filter(
+        (record) =>
+          afterOperationId === null || record.operationId > afterOperationId,
+      )
+      .sort((left, right) =>
+        left.operationId < right.operationId
+          ? -1
+          : left.operationId > right.operationId
+            ? 1
+            : 0,
+      );
+    const page = records.slice(0, limit);
+    return Object.freeze({
+      operations: Object.freeze(page),
+      nextAfterOperationId:
+        records.length > limit ? page[page.length - 1].operationId : null,
+    });
+  });
+  const readPreparedOperationsPage = Object.freeze(
+    async function readPreparedOperationsPage({
+      expectedHead,
+      afterStorageId,
+      limit,
+    }) {
+      requireHead(expectedHead);
+      tracker.preparedPageReads = (tracker.preparedPageReads ?? 0) + 1;
+      const records = [...operations.values()]
+        .filter(
+          (record) =>
+            record.state === "prepared" &&
+            (afterStorageId === null || record.storageId > afterStorageId),
+        )
+        .sort((left, right) =>
+          left.storageId < right.storageId
+            ? -1
+            : left.storageId > right.storageId
+              ? 1
+              : 0,
+        );
+      const page = records.slice(0, limit);
+      return Object.freeze({
+        operations: Object.freeze(page),
+        nextAfterStorageId:
+          records.length > limit ? page[page.length - 1].storageId : null,
+      });
+    },
+  );
+  const compareAndAdvance = Object.freeze(
+    async function compareAndAdvance({ expectedHead, nextHead, transition }) {
+      tracker.advances = (tracker.advances ?? 0) + 1;
+      if (!sameLedgerHead(head, expectedHead)) return false;
+      if (tracker.failAdvanceBeforeCommit === true) {
+        throw new Error("advance unavailable");
+      }
+      if (transition.type === "append-prepared-v1") {
+        assert.equal(transition.record.state, "prepared");
+        operations.set(
+          transition.record.operationId,
+          Object.freeze(transition.record),
+        );
+      } else if (transition.type === "append-committed-v1") {
+        assert.equal(transition.record.state, "committed");
+        operations.set(
+          transition.record.operationId,
+          Object.freeze(transition.record),
+        );
+      } else {
+        assert.equal(transition.type, "rotate-v1");
+      }
+      head = normalizeFilesystemImageProviderStateHead(nextHead);
+      tracker.head = copyLedgerHead(head);
+      if (tracker.loseNextAdvanceAcknowledgement === true) {
+        tracker.loseNextAdvanceAcknowledgement = false;
+        throw new Error("advance acknowledgement lost");
+      }
+      return true;
+    },
+  );
+  const compareAndAdopt = Object.freeze(
+    async function compareAndAdopt({
+      expectedHead,
+      nextHead,
+      operations: adoptedOperations,
+      storages,
+    }) {
+      tracker.adoptions = (tracker.adoptions ?? 0) + 1;
+      tracker.adoptionStorages = storages;
+      if (!sameLedgerHead(head, expectedHead)) return false;
+      if (tracker.returnFalseNextAdoption === true) {
+        tracker.returnFalseNextAdoption = false;
+        return false;
+      }
+      if (tracker.failAdoptionBeforeCommit === true) {
+        throw new Error("adoption outcome uncertain");
+      }
+      operations.clear();
+      for (const record of adoptedOperations) {
+        operations.set(record.operationId, Object.freeze(record));
+      }
+      head = normalizeFilesystemImageProviderStateHead(nextHead);
+      tracker.head = copyLedgerHead(head);
+      if (tracker.loseNextAdoptionAcknowledgement === true) {
+        tracker.loseNextAdoptionAcknowledgement = false;
+        throw new Error("adoption acknowledgement lost");
+      }
+      return true;
+    },
+  );
+  tracker.head = copyLedgerHead(head);
+  tracker.operations = operations;
+  return Object.freeze({
+    adoptionAuthority: Object.freeze({ contractVersion: 1, compareAndAdopt }),
+    stateAuthority: Object.freeze({
+      contractVersion: 2,
+      readHead,
+      readOperation,
+      readOperationsPage,
+      readPreparedOperationsPage,
+      compareAndAdvance,
+    }),
+    tracker,
+  });
+}
+
 function corruptPreviousChecksumWithValidEnvelope(ledger, frameStart) {
   const payloadLength = ledger.readUInt32BE(frameStart + 8);
   const sequence = ledger.readUInt32BE(frameStart + 12);
@@ -264,6 +441,38 @@ function corruptPreviousChecksumWithValidEnvelope(ledger, frameStart) {
   const checksumMetadata = Buffer.allocUnsafe(8);
   checksumMetadata.writeUInt32BE(payloadLength, 0);
   checksumMetadata.writeUInt32BE(sequence, 4);
+  const checksum = createHash("sha256")
+    .update(
+      Buffer.from(
+        "portable-codex/filesystem-image-provider-state/frame/v2\0",
+        "utf8",
+      ),
+    )
+    .update(checksumMetadata)
+    .update(ledger.subarray(payloadStart, footerStart))
+    .digest();
+  checksum.copy(ledger, frameStart + 16);
+  checksum.copy(ledger, footerStart + 16);
+}
+
+function rewritePayloadSequenceWithValidEnvelope(
+  ledger,
+  frameStart,
+  replacementSequence,
+) {
+  const payloadLength = ledger.readUInt32BE(frameStart + 8);
+  const envelopeSequence = ledger.readUInt32BE(frameStart + 12);
+  const payloadStart = frameStart + 48;
+  const footerStart = payloadStart + payloadLength;
+  const marker = Buffer.from(`"sequence":${envelopeSequence}`, "utf8");
+  const replacement = Buffer.from(`"sequence":${replacementSequence}`, "utf8");
+  assert.equal(replacement.length, marker.length);
+  const markerOffset = ledger.indexOf(marker, payloadStart);
+  assert(markerOffset >= payloadStart && markerOffset < footerStart);
+  replacement.copy(ledger, markerOffset);
+  const checksumMetadata = Buffer.allocUnsafe(8);
+  checksumMetadata.writeUInt32BE(payloadLength, 0);
+  checksumMetadata.writeUInt32BE(envelopeSequence, 4);
   const checksum = createHash("sha256")
     .update(
       Buffer.from(
@@ -307,6 +516,38 @@ async function createFixture(t, options = {}) {
     root,
     state: createState(),
     tracker,
+  };
+}
+
+async function createExactFixture(t, options = {}) {
+  const root = await mkdtemp(
+    join(tmpdir(), "filesystem-image-provider-state-v3-test-"),
+  );
+  const directory = join(root, "state");
+  await mkdir(directory, { mode: 0o700 });
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const lockTracker = {};
+  const acquireLock =
+    options.acquireLock ?? createSerializedLockProvider(lockTracker);
+  const authorities = createExactStateAuthorities(options);
+  const createState = (overrides = {}) =>
+    new FilesystemImageProviderState({
+      acquireLock,
+      adoptionAuthority: authorities.adoptionAuthority,
+      directory,
+      stateAuthority: authorities.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+      ...overrides,
+    });
+  return {
+    ...authorities,
+    acquireLock,
+    createState,
+    directory,
+    ledgerPath: join(directory, FILESYSTEM_IMAGE_PROVIDER_STATE_LEDGER_NAME),
+    lockPath: join(directory, FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME),
+    root,
+    state: createState(),
   };
 }
 
@@ -510,6 +751,96 @@ test("state directory admission reserves the longest generated pathname", () => 
   }
 });
 
+test("v2 and v3 head and frame hash domains remain fixed", async (t) => {
+  assert.equal(
+    filesystemImageProviderStateHeadChecksum(genesisHead()),
+    "7bece1a12f8c03f4caf77f9c74e8f839dfeef2e7a1c5beb85ec69a27971d1bb2",
+  );
+  assert.equal(
+    filesystemImageProviderStateHeadChecksum(v3GenesisHead()),
+    "0285b2f1d44ca9e82ae36333f4b79e395895f21895a265e6d64adf4dc42bd119",
+  );
+  const request = operationRequest("provision");
+  const legacy = await createFixture(t);
+  const exact = await createExactFixture(t);
+  for (const state of [legacy.state, exact.state]) {
+    await state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-domain-vector-001",
+      request,
+      storageId: "storage-001",
+    });
+  }
+  const checksums = [];
+  for (const [ledgerPath, version] of [
+    [legacy.ledgerPath, 2],
+    [exact.ledgerPath, 3],
+  ]) {
+    const ledger = await readFile(ledgerPath);
+    const payloadLength = ledger.readUInt32BE(8);
+    const sequence = ledger.readUInt32BE(12);
+    const payload = ledger.subarray(48, 48 + payloadLength);
+    const metadata = Buffer.allocUnsafe(8);
+    metadata.writeUInt32BE(payloadLength, 0);
+    metadata.writeUInt32BE(sequence, 4);
+    const calculated = createHash("sha256")
+      .update(
+        Buffer.from(
+          `portable-codex/filesystem-image-provider-state/frame/v${version}\0`,
+          "utf8",
+        ),
+      )
+      .update(metadata)
+      .update(payload)
+      .digest("hex");
+    assert.equal(ledger.subarray(16, 48).toString("hex"), calculated);
+    checksums.push(calculated);
+  }
+  assert.deepEqual(checksums, [
+    "f1e8d479e1e59c274ad91af5d126297d06b37aa27b21d8a9e3fe7d6b1a8f5667",
+    "40051f4f728439e6049d7c815877f451e1b27333289c58e40753e3f99b3e5930",
+  ]);
+});
+
+test("production authority mode is exact, frozen, and cannot mix with a legacy anchor", async (t) => {
+  const fixture = await createExactFixture(t);
+  const base = {
+    acquireLock: fixture.acquireLock,
+    adoptionAuthority: fixture.adoptionAuthority,
+    directory: fixture.directory,
+    stateAuthority: fixture.stateAuthority,
+    ...TRUSTED_ACL_INSPECTORS,
+  };
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        headAnchor: createTrustedHeadAnchor(),
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        stateAuthority: { ...fixture.stateAuthority },
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: {
+          contractVersion: 1,
+          compareAndAdopt: fixture.adoptionAuthority.compareAndAdopt,
+        },
+      }),
+    stateError("invalid_request"),
+  );
+  assert.doesNotThrow(() => new FilesystemImageProviderState(base));
+});
+
 test("rotates a prepared operation into a checkpoint before its commit", async (t) => {
   const fixture = await createFixture(t);
   const state = fixture.createState({
@@ -572,6 +903,451 @@ test("rotates a prepared operation into a checkpoint before its commit", async (
   });
   assert.equal(replayed.state, "committed");
   assert.deepEqual(replayed.result, committed.result);
+});
+
+test("v3 exact authority keeps only live recovery state and replays history from the index", async (t) => {
+  const fixture = await createExactFixture(t);
+  const state = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+  });
+  const provisionRequest = operationRequest("provision");
+  const prepared = await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-v3-provision-001",
+    request: provisionRequest,
+    storageId: "storage-001",
+  });
+  assert.equal(prepared.currentAttachmentOriginOperationId, null);
+  const provisioned = storageState();
+  await state.commitOperation({
+    operationId: "operation-v3-provision-001",
+    request: provisionRequest,
+    result: { status: "provisioned" },
+    storageState: provisioned,
+  });
+
+  const fixedMount = provisioned.mount;
+  const fixedAttachment = attachment(fixedMount);
+  const attached = storageState({
+    attachment: fixedAttachment,
+    lifecycle: "attached",
+    mount: fixedMount,
+    revision: "2",
+    writerEpoch: "1",
+  });
+  const attachRequest = operationRequest("attach");
+  await state.prepareOperation({
+    kind: "attach",
+    operationId: "operation-v3-attach-001",
+    request: attachRequest,
+    storageId: "storage-001",
+  });
+  const attachedView = await state.commitOperation({
+    operationId: "operation-v3-attach-001",
+    request: attachRequest,
+    result: { status: "attached" },
+    storageState: attached,
+  });
+  assert.equal(
+    attachedView.currentAttachmentOriginOperationId,
+    "operation-v3-attach-001",
+  );
+
+  const restarted = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+  });
+  const historical = await restarted.readOperation({
+    operationId: "operation-v3-provision-001",
+    request: provisionRequest,
+  });
+  assert.equal(historical.state, "committed");
+  assert.equal(
+    historical.currentAttachmentOriginOperationId,
+    "operation-v3-attach-001",
+  );
+  const snapshot = await restarted.snapshot();
+  assert.deepEqual(snapshot, {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "4",
+    storages: [attached],
+  });
+  const capacity = await restarted.inspectCapacity();
+  assert.equal(capacity.retainedOperationCount, 0);
+  assert.equal(capacity.preparedOperationCount, 0);
+  assert.equal(fixture.tracker.operations.size, 2);
+  assert(fixture.tracker.operationReads >= 3);
+
+  const checkpointRequest = operationRequest("checkpoint");
+  await restarted.prepareOperation({
+    kind: "checkpoint",
+    operationId: "operation-v3-checkpoint-001",
+    request: checkpointRequest,
+    storageId: "storage-001",
+  });
+  const checkpointed = { ...attached, revision: "3" };
+  const checkpointedView = await restarted.commitOperation({
+    operationId: "operation-v3-checkpoint-001",
+    request: checkpointRequest,
+    result: { status: "checkpointed" },
+    storageState: checkpointed,
+  });
+  assert.equal(
+    checkpointedView.currentAttachmentOriginOperationId,
+    "operation-v3-attach-001",
+  );
+
+  const detached = storageState({
+    dataRoot: checkpointed.dataRoot,
+    lifecycle: "detached",
+    mount: fixedMount,
+    revision: "4",
+    writerAuthority: checkpointed.writerAuthority,
+    writerEpoch: "1",
+  });
+  const detachRequest = operationRequest("detach");
+  await restarted.prepareOperation({
+    kind: "detach",
+    operationId: "operation-v3-detach-001",
+    request: detachRequest,
+    storageId: "storage-001",
+  });
+  const detachedView = await restarted.commitOperation({
+    operationId: "operation-v3-detach-001",
+    request: detachRequest,
+    result: { status: "detached" },
+    storageState: detached,
+  });
+  assert.equal(detachedView.currentAttachmentOriginOperationId, null);
+  const destroyed = storageState({
+    lifecycle: "destroyed",
+    revision: "5",
+    writerAuthority: detached.writerAuthority,
+    writerEpoch: "1",
+  });
+  const destroyRequest = operationRequest("destroy");
+  await restarted.prepareOperation({
+    kind: "destroy",
+    operationId: "operation-v3-destroy-001",
+    request: destroyRequest,
+    storageId: "storage-001",
+  });
+  const destroyedView = await restarted.commitOperation({
+    operationId: "operation-v3-destroy-001",
+    request: destroyRequest,
+    result: { status: "destroyed" },
+    storageState: destroyed,
+  });
+  assert.equal(destroyedView.currentAttachmentOriginOperationId, null);
+  assert.deepEqual(await fixture.createState().snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "10",
+    storages: [destroyed],
+  });
+});
+
+test("v2 adoption materializes a v3 recovery generation before switching authority", async (t) => {
+  await t.test("generation-zero bootstrap", async (t) => {
+    const fixture = await createExactFixture(t, { head: genesisHead() });
+    const snapshot = await fixture.state.snapshot();
+    assert.deepEqual(snapshot, {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "0",
+      storages: [],
+    });
+    assert.equal(fixture.tracker.adoptions, 1);
+    assert.equal(fixture.tracker.head.contractVersion, 3);
+    assert.equal(fixture.tracker.head.generation, "1");
+    assert.equal(
+      fixture.tracker.head.baseHeadChecksum,
+      filesystemImageProviderStateHeadChecksum(genesisHead()),
+    );
+  });
+
+  await t.test("rotated source with a live prepared operation", async (t) => {
+    const legacy = await createFixture(t);
+    const legacyState = legacy.createState({
+      rotationPolicy: {
+        activeLedgerBytesWatermark: 64 * 1024 * 1024,
+        activeFrameCountWatermark: 1,
+      },
+    });
+    await prepareAndCommit(legacyState, {
+      operationId: "operation-adopt-provision-001",
+      request: operationRequest("provision"),
+      storage: storageState(),
+    });
+    const pendingRequest = operationRequest("checkpoint");
+    await legacyState.prepareOperation({
+      kind: "checkpoint",
+      operationId: "operation-adopt-pending-001",
+      request: pendingRequest,
+      storageId: "storage-001",
+    });
+    const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+    assert(sourceHead.generation !== "0");
+    const sourceLedgerPath = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName(sourceHead.generation),
+    );
+    const sourceCheckpointPath = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName(sourceHead.generation),
+    );
+    const expiredGeneration = String(BigInt(sourceHead.generation) - 1n);
+    const expiredLedgerPath = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName(expiredGeneration),
+    );
+    const expiredCheckpointPath = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName(expiredGeneration),
+    );
+    await writeFile(expiredLedgerPath, "", { mode: 0o600 });
+    await writeFile(expiredCheckpointPath, "", { mode: 0o600 });
+    const exact = createExactStateAuthorities({ head: sourceHead });
+    const adopted = new FilesystemImageProviderState({
+      acquireLock: legacy.acquireLock,
+      adoptionAuthority: exact.adoptionAuthority,
+      directory: legacy.directory,
+      stateAuthority: exact.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+    });
+    const snapshot = await adopted.snapshot();
+    assert.deepEqual(snapshot, {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "3",
+      storages: [storageState()],
+    });
+    assert.equal(exact.tracker.adoptions, 1);
+    assert.equal(exact.tracker.operations.size, 2);
+    assert.equal(exact.tracker.head.contractVersion, 3);
+    assert.equal(
+      exact.tracker.head.baseHeadChecksum,
+      filesystemImageProviderStateHeadChecksum(sourceHead),
+    );
+    assert.deepEqual(exact.tracker.adoptionStorages, [
+      {
+        currentAttachmentOriginOperationId: null,
+        storage: storageState(),
+      },
+    ]);
+    await assert.rejects(
+      lstat(sourceLedgerPath),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(sourceCheckpointPath),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(expiredLedgerPath),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(expiredCheckpointPath),
+      (error) => error.code === "ENOENT",
+    );
+
+    const restartedAdopted = new FilesystemImageProviderState({
+      acquireLock: legacy.acquireLock,
+      adoptionAuthority: exact.adoptionAuthority,
+      directory: legacy.directory,
+      stateAuthority: exact.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+    });
+    const committed = await restartedAdopted.commitOperation({
+      operationId: "operation-adopt-pending-001",
+      request: pendingRequest,
+      result: { status: "checkpointed" },
+      storageState: storageState({ revision: "2" }),
+    });
+    assert.equal(committed.state, "committed");
+    const historical = await restartedAdopted.readOperation({
+      operationId: "operation-adopt-provision-001",
+    });
+    assert.equal(historical.state, "committed");
+  });
+
+  await t.test(
+    "aggregate material over the adoption budget does not touch the candidate generation",
+    async (t) => {
+      const legacy = await createFixture(t);
+      const payload = "x".repeat(700 * 1024);
+      for (let index = 0; index < 32; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        const storageId = `storage-adoption-capacity-${suffix}`;
+        await prepareAndCommit(legacy.state, {
+          operationId: `operation-adoption-capacity-${suffix}`,
+          request: operationRequest("provision", storageId, { payload }),
+          result: { payload },
+          storage: storageState({ storageId }),
+        });
+      }
+      const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+      assert(sourceHead.ledgerBytes < 64 * 1024 * 1024);
+      const candidateGeneration = String(BigInt(sourceHead.generation) + 1n);
+      const candidateCheckpoint = join(
+        legacy.directory,
+        filesystemImageProviderStateCheckpointName(candidateGeneration),
+      );
+      const candidateLedger = join(
+        legacy.directory,
+        filesystemImageProviderStateLedgerName(candidateGeneration),
+      );
+      const checkpointSentinel = Buffer.from("candidate-checkpoint", "utf8");
+      const ledgerSentinel = Buffer.from("candidate-ledger", "utf8");
+      await writeFile(candidateCheckpoint, checkpointSentinel, { mode: 0o600 });
+      await writeFile(candidateLedger, ledgerSentinel, { mode: 0o600 });
+
+      const exact = createExactStateAuthorities({ head: sourceHead });
+      const adopted = new FilesystemImageProviderState({
+        acquireLock: legacy.acquireLock,
+        adoptionAuthority: exact.adoptionAuthority,
+        directory: legacy.directory,
+        stateAuthority: exact.stateAuthority,
+        ...TRUSTED_ACL_INSPECTORS,
+      });
+      await assert.rejects(
+        adopted.snapshot(),
+        stateError("state_capacity_exhausted"),
+      );
+      assert.equal(exact.tracker.adoptions ?? 0, 0);
+      assert.deepEqual(exact.tracker.head, sourceHead);
+      assert.deepEqual(await readFile(candidateCheckpoint), checkpointSentinel);
+      assert.deepEqual(await readFile(candidateLedger), ledgerSentinel);
+    },
+  );
+});
+
+test("v3 cold load rejects prepared-index and attachment-origin divergence", async (t) => {
+  await t.test("missing prepared operation", async (t) => {
+    const fixture = await createExactFixture(t);
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-v3-missing-prepared-001",
+      request: operationRequest("provision"),
+      storageId: "storage-001",
+    });
+    fixture.tracker.operations.delete("operation-v3-missing-prepared-001");
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+
+  await t.test("extra prepared operation", async (t) => {
+    const fixture = await createExactFixture(t);
+    fixture.tracker.operations.set(
+      "operation-v3-extra-prepared-001",
+      Object.freeze({
+        kind: "provision",
+        operationId: "operation-v3-extra-prepared-001",
+        preparedChecksum: "a".repeat(64),
+        preparedStateRevision: "1",
+        request: operationRequest("provision", "storage-extra"),
+        state: "prepared",
+        storageId: "storage-extra",
+        storageStateBefore: null,
+      }),
+    );
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+
+  await t.test("missing attachment origin operation", async (t) => {
+    const fixture = await createExactFixture(t);
+    await prepareAndCommit(fixture.state, {
+      operationId: "operation-v3-origin-provision-001",
+      request: operationRequest("provision"),
+      storage: storageState(),
+    });
+    const fixedMount = mount();
+    const fixedAttachment = attachment(fixedMount);
+    const attachRequest = operationRequest("attach");
+    await fixture.state.prepareOperation({
+      kind: "attach",
+      operationId: "operation-v3-origin-attach-001",
+      request: attachRequest,
+      storageId: "storage-001",
+    });
+    await fixture.state.commitOperation({
+      operationId: "operation-v3-origin-attach-001",
+      request: attachRequest,
+      result: { status: "attached" },
+      storageState: storageState({
+        attachment: fixedAttachment,
+        lifecycle: "attached",
+        mount: fixedMount,
+        revision: "2",
+        writerEpoch: "1",
+      }),
+    });
+    fixture.tracker.operations.delete("operation-v3-origin-attach-001");
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+});
+
+test("v2 adoption preserves target files across an uncertain acknowledgement", async (t) => {
+  const tracker = { loseNextAdoptionAcknowledgement: true };
+  const fixture = await createExactFixture(t, { head: genesisHead(), tracker });
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  const targetCheckpoint = join(
+    fixture.directory,
+    filesystemImageProviderStateCheckpointName("1"),
+  );
+  const targetLedger = join(
+    fixture.directory,
+    filesystemImageProviderStateLedgerName("1"),
+  );
+  assert.equal((await lstat(targetCheckpoint)).isFile(), true);
+  assert.equal((await lstat(targetLedger)).isFile(), true);
+  assert.equal(fixture.tracker.head.contractVersion, 3);
+  const recovered = await fixture.createState().snapshot();
+  assert.deepEqual(recovered, {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "0",
+    storages: [],
+  });
+  assert.equal(fixture.tracker.adoptions, 1);
+});
+
+test("v2 adoption removes an inert target generation after a definite stale result", async (t) => {
+  const tracker = { returnFalseNextAdoption: true };
+  const fixture = await createExactFixture(t, { head: genesisHead(), tracker });
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("maintenance_failed"),
+  );
+  await assert.rejects(
+    lstat(
+      join(
+        fixture.directory,
+        filesystemImageProviderStateCheckpointName("1"),
+      ),
+    ),
+    (error) => error.code === "ENOENT",
+  );
+  await assert.rejects(
+    lstat(
+      join(fixture.directory, filesystemImageProviderStateLedgerName("1")),
+    ),
+    (error) => error.code === "ENOENT",
+  );
+  assert.equal(fixture.tracker.head.contractVersion, 2);
 });
 
 test("repeated rotation preserves committed evidence, tombstones, and prepared ambiguity", async (t) => {
@@ -675,7 +1451,7 @@ test("capacity inspection reports exact soft and hard boundaries", async (t) => 
   const initial = await initialPromise;
   assert.equal(Object.isFrozen(initial), true);
   assert.deepEqual(initial, {
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
     anchorRevision: "0",
     generation: "0",
     stateRevision: "0",
@@ -1686,7 +2462,10 @@ test("replays committed operations and complete mount state after restart", asyn
   const snapshotPromise = restarted.snapshot();
   assert.equal(snapshotPromise instanceof Promise, true);
   const snapshot = await snapshotPromise;
-  assert.equal(snapshot.contractVersion, FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION);
+  assert.equal(
+    snapshot.contractVersion,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
+  );
   assert.equal(snapshot.sequence, 2);
   assert.equal(snapshot.operations.length, 1);
   assert.equal(snapshot.storages.length, 1);
@@ -2426,6 +3205,35 @@ test("checksum corruption and non-frame garbage fail closed without truncation",
   });
 });
 
+test("checkpoint and delta payload sequence must equal the binary envelope sequence", async (t) => {
+  await t.test("delta", async (t) => {
+    const fixture = await createFixture(t);
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-payload-sequence-001",
+      request: operationRequest("provision"),
+      storageId: "storage-001",
+    });
+    const ledger = await readFile(fixture.ledgerPath);
+    rewritePayloadSequenceWithValidEnvelope(ledger, 0, 2);
+    await writeFile(fixture.ledgerPath, ledger);
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+  await t.test("checkpoint", async (t) => {
+    const rotated = await createRotatedFixture(t);
+    const checkpoint = await readFile(rotated.checkpointPath);
+    rewritePayloadSequenceWithValidEnvelope(checkpoint, 0, 2);
+    await writeFile(rotated.checkpointPath, checkpoint);
+    await assert.rejects(
+      rotated.fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+});
+
 test("directory fsync failure before genesis CAS reports failed cleanup without commit", async (t) => {
   const fixture = await createFixture(t);
   await fixture.state.snapshot();
@@ -2544,6 +3352,14 @@ test("trusted head collaborators and values are exact, receiver-safe, and promis
   );
   assert.throws(
     () => filesystemImageProviderStateLedgerName("01"),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      normalizeFilesystemImageProviderStateHead({
+        ...canonical,
+        stateRevision: "9".repeat(100_000),
+      }),
     stateError("invalid_request"),
   );
   const generationZeroActive = normalizeFilesystemImageProviderStateHead({

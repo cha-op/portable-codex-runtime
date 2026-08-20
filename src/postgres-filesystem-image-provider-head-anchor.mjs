@@ -1,7 +1,7 @@
 import { types as utilTypes } from "node:util";
 
 import {
-  FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   filesystemImageProviderStateHeadChecksum,
   normalizeFilesystemImageProviderStateHead,
 } from "./filesystem-image-provider-state.mjs";
@@ -278,7 +278,7 @@ function canonicalHeadChecksum(value, code) {
 function genesisHead() {
   return canonicalHead(
     {
-      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
       anchorRevision: "0",
       generation: "0",
       stateRevision: "0",
@@ -441,7 +441,12 @@ function normalizeHeadRow(value, expectedIdentity, code) {
     },
     code,
   );
-  ensure(!headEqual(head, genesisHead()), code);
+  ensure(
+    head.contractVersion ===
+      FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION &&
+      !headEqual(head, genesisHead()),
+    code,
+  );
   return head;
 }
 
@@ -605,8 +610,12 @@ export function createPostgresFilesystemImageProviderHeadAnchor(...args) {
     const expectedHead = canonicalHead(request.expectedHead, requestCode);
     const nextHead = canonicalHead(request.nextHead, requestCode);
     ensure(
-      isNormalAppend(expectedHead, nextHead) ||
-        isPureRotation(expectedHead, nextHead, requestCode),
+      expectedHead.contractVersion ===
+        FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION &&
+        nextHead.contractVersion ===
+          FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION &&
+        (isNormalAppend(expectedHead, nextHead) ||
+          isPureRotation(expectedHead, nextHead, requestCode)),
       requestCode,
     );
     return await compareAndAdvanceDurableHead(

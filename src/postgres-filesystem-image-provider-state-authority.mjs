@@ -5,15 +5,21 @@ import { types as utilTypes } from "node:util";
 
 import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   filesystemImageProviderStateHeadChecksum,
   normalizeFilesystemImageProviderStateHead,
 } from "./filesystem-image-provider-state.mjs";
 import {
+  PostgresSerializableStoreError,
   PostgresSerializableStore,
   isPostgresSerializableStore,
 } from "./postgres-serializable-store.mjs";
 
 export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_AUTHORITY_CONTRACT_VERSION =
+  1;
+export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT_VERSION =
+  2;
+export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION =
   1;
 
 const MAX_CANONICAL_BYTES = 768 * 1024;
@@ -30,6 +36,17 @@ const MAX_UINT64 = 18_446_744_073_709_551_615n;
 // A row may carry a 4 MiB prepared record and a 4 MiB committed record. Keep
 // limit-plus-one materialization bounded to at most five such rows.
 const MAX_PAGE_SIZE = 4;
+// The frozen adoption ABI supplies complete arrays, so this is an explicit
+// operational capacity rather than the uint32 checkpoint format limit. States
+// beyond it require a future versioned streaming adoption capability.
+const MAX_ADOPTION_OPERATIONS = 65_535;
+const MAX_ADOPTION_STORAGES = 65_535;
+const MAX_ADOPTION_INSERT_BATCH_SIZE = 64;
+// The complete-array ABI also has one shared canonical-material budget. The
+// budget counts every stored operation material (prepared and, when present,
+// committed) plus every projected storage wrapper. Larger states need a
+// future versioned streaming adoption capability.
+const MAX_ADOPTION_CANONICAL_BYTES = MAX_LEDGER_BYTES;
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const DECIMAL_PATTERN = /^(?:0|[1-9][0-9]*)$/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
@@ -52,6 +69,10 @@ const OPERATION_RECORD_DOMAIN = Buffer.from(
   "portable-codex/filesystem-image-provider-state/operation-record/v1\0",
   "utf8",
 );
+const ADOPTION_MANIFEST_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/adoption-manifest/v1\0",
+  "utf8",
+);
 
 const OPTION_KEYS = Object.freeze(["store", "providerId", "anchorId"]);
 const READ_OPERATION_KEYS = Object.freeze(["expectedHead", "operationId"]);
@@ -59,6 +80,21 @@ const READ_PAGE_KEYS = Object.freeze([
   "afterOperationId",
   "expectedHead",
   "limit",
+]);
+const READ_PREPARED_PAGE_KEYS = Object.freeze([
+  "afterStorageId",
+  "expectedHead",
+  "limit",
+]);
+const ADOPTION_KEYS = Object.freeze([
+  "expectedHead",
+  "nextHead",
+  "operations",
+  "storages",
+]);
+const ADOPTION_STORAGE_KEYS = Object.freeze([
+  "currentAttachmentOriginOperationId",
+  "storage",
 ]);
 const ADVANCE_KEYS = Object.freeze([
   "expectedHead",
@@ -105,6 +141,8 @@ const HEAD_ROW_KEYS = Object.freeze([
   "last_checksum",
   "ledger_bytes",
   "operation_index_state_revision",
+  "operation_index_adoption_id",
+  "operation_index_adoption_xid",
 ]);
 const OPERATION_ROW_KEYS = Object.freeze([
   "provider_id",
@@ -123,6 +161,7 @@ const OPERATION_ROW_KEYS = Object.freeze([
   "committed_checksum",
   "committed_record_bytes",
   "committed_record_sha256",
+  "adoption_id",
 ]);
 const ERROR_MESSAGES = Object.freeze({
   invalid_postgres_filesystem_image_provider_state_authority_options:
@@ -131,6 +170,8 @@ const ERROR_MESSAGES = Object.freeze({
     "PostgreSQL filesystem image provider state authority request is invalid",
   postgres_filesystem_image_provider_state_authority_state_invalid:
     "PostgreSQL filesystem image provider state authority state is invalid",
+  postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain:
+    "PostgreSQL filesystem image provider state adoption commit outcome is uncertain",
 });
 
 const HEAD_COLUMNS = [
@@ -149,6 +190,8 @@ const HEAD_COLUMNS = [
   "last_checksum",
   "ledger_bytes::pg_catalog.text AS ledger_bytes",
   "operation_index_state_revision::pg_catalog.text AS operation_index_state_revision",
+  "operation_index_adoption_id",
+  "operation_index_adoption_xid::pg_catalog.text AS operation_index_adoption_xid",
 ].join(", ");
 const OPERATION_COLUMNS = [
   "provider_id",
@@ -167,12 +210,14 @@ const OPERATION_COLUMNS = [
   "committed_checksum",
   "committed_record_bytes",
   "committed_record_sha256",
+  "adoption_id",
 ].join(", ");
 const READ_HEAD_QUERY = [
   `SELECT ${HEAD_COLUMNS}`,
   "FROM session_authority.filesystem_image_provider_heads",
   "WHERE provider_id = $1 AND anchor_id = $2",
 ].join(" ");
+const READ_HEAD_FOR_UPDATE_QUERY = `${READ_HEAD_QUERY} FOR UPDATE`;
 const INSERT_HEAD_QUERY = [
   "INSERT INTO session_authority.filesystem_image_provider_heads",
   "(provider_id, anchor_id, contract_version, anchor_revision, generation,",
@@ -231,6 +276,21 @@ const READ_OPERATIONS_PAGE_AFTER_QUERY = [
   'ORDER BY operation_id COLLATE pg_catalog."C"',
   "LIMIT $4::pg_catalog.int4",
 ].join(" ");
+const READ_PREPARED_PAGE_FIRST_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.filesystem_image_provider_operations",
+  "WHERE provider_id = $1 AND anchor_id = $2 AND state = 'prepared'",
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $3::pg_catalog.int4",
+].join(" ");
+const READ_PREPARED_PAGE_AFTER_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.filesystem_image_provider_operations",
+  "WHERE provider_id = $1 AND anchor_id = $2 AND state = 'prepared'",
+  'AND storage_id COLLATE pg_catalog."C" > $3 COLLATE pg_catalog."C"',
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $4::pg_catalog.int4",
+].join(" ");
 const READ_LATEST_COMMITTED_STORAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.filesystem_image_provider_operations",
@@ -267,6 +327,41 @@ const UPDATE_COMMITTED_QUERY = [
   "AND committed_record_bytes IS NULL AND committed_record_sha256 IS NULL",
   `RETURNING ${OPERATION_COLUMNS}`,
 ].join(" ");
+const ADOPT_HEAD_QUERY = [
+  "UPDATE session_authority.filesystem_image_provider_heads",
+  "SET contract_version = $3, anchor_revision = $4::pg_catalog.numeric,",
+  "generation = $5::pg_catalog.numeric, state_revision = $6::pg_catalog.numeric,",
+  "base_head_checksum = $7, checkpoint_state_revision = $8::pg_catalog.numeric,",
+  "checkpoint_frame_count = $9::pg_catalog.int8, checkpoint_checksum = $10,",
+  "checkpoint_bytes = $11::pg_catalog.int8, frame_count = $12::pg_catalog.int4,",
+  "last_checksum = $13, ledger_bytes = $14::pg_catalog.int8,",
+  "operation_index_state_revision = $15::pg_catalog.numeric,",
+  "operation_index_adoption_id = $16",
+  "WHERE provider_id = $1 AND anchor_id = $2",
+  "AND contract_version = $17 AND anchor_revision = $18::pg_catalog.numeric",
+  "AND generation = $19::pg_catalog.numeric",
+  "AND state_revision = $20::pg_catalog.numeric",
+  "AND base_head_checksum IS NOT DISTINCT FROM $21",
+  "AND checkpoint_state_revision = $22::pg_catalog.numeric",
+  "AND checkpoint_frame_count = $23::pg_catalog.int8",
+  "AND checkpoint_checksum IS NOT DISTINCT FROM $24",
+  "AND checkpoint_bytes = $25::pg_catalog.int8",
+  "AND frame_count = $26::pg_catalog.int4",
+  "AND last_checksum IS NOT DISTINCT FROM $27",
+  "AND ledger_bytes = $28::pg_catalog.int8",
+  "AND operation_index_state_revision IS NOT DISTINCT FROM $29::pg_catalog.numeric",
+  "AND operation_index_adoption_id IS NULL",
+  "AND operation_index_adoption_xid IS NULL",
+  `RETURNING ${HEAD_COLUMNS}`,
+].join(" ");
+const INSERT_ADOPTED_OPERATION_PREFIX = [
+  "INSERT INTO session_authority.filesystem_image_provider_operations",
+  "(provider_id, anchor_id, operation_id, record_contract_version, state, kind,",
+  "storage_id, prepared_state_revision, prepared_checksum,",
+  "prepared_record_bytes, prepared_record_sha256, committed_state_revision,",
+  "committed_checksum_provenance, committed_checksum, committed_record_bytes,",
+  "committed_record_sha256, adoption_id)",
+].join(" ");
 
 const reflectApplyIntrinsic = Reflect.apply;
 const reflectOwnKeysIntrinsic = Reflect.ownKeys;
@@ -293,6 +388,12 @@ const isProxyValue = utilTypes.isProxy;
 const jsonParseIntrinsic = JSON.parse;
 const jsonStringifyIntrinsic = JSON.stringify;
 const mathMaxIntrinsic = Math.max;
+const mathMinIntrinsic = Math.min;
+const mapGetIntrinsic = Map.prototype.get;
+const mapHasIntrinsic = Map.prototype.has;
+const mapSetIntrinsic = Map.prototype.set;
+const mapDeleteIntrinsic = Map.prototype.delete;
+const MapConstructor = Map;
 const numberIsFiniteIntrinsic = Number.isFinite;
 const numberIsSafeIntegerIntrinsic = Number.isSafeInteger;
 const NumberConstructor = Number;
@@ -303,6 +404,10 @@ const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectHasOwnIntrinsic = Object.hasOwn;
 const objectIsIntrinsic = Object.is;
+const mapSizeGetterIntrinsic = Object.getOwnPropertyDescriptor(
+  Map.prototype,
+  "size",
+).get;
 const objectPrototype = Object.prototype;
 const ObjectConstructor = Object;
 const pathBasenameIntrinsic = basename;
@@ -365,6 +470,26 @@ function bufferIsBuffer(value) {
 
 function bufferToString(value, encoding) {
   return callIntrinsic(bufferToStringIntrinsic, value, [encoding]);
+}
+
+function mapGet(value, key) {
+  return callIntrinsic(mapGetIntrinsic, value, [key]);
+}
+
+function mapHas(value, key) {
+  return callIntrinsic(mapHasIntrinsic, value, [key]);
+}
+
+function mapSet(value, key, entry) {
+  return callIntrinsic(mapSetIntrinsic, value, [key, entry]);
+}
+
+function mapDelete(value, key) {
+  return callIntrinsic(mapDeleteIntrinsic, value, [key]);
+}
+
+function mapSize(value) {
+  return callIntrinsic(mapSizeGetterIntrinsic, value, []);
 }
 
 function objectCreate(prototype) {
@@ -488,6 +613,47 @@ function exactDataObjectFromKeys(value, keys, expectedKeys, code) {
 function exactDataObject(value, expectedKeys, code) {
   const keys = inspectPlainObject(value, expectedKeys.length, code);
   return exactDataObjectFromKeys(value, keys, expectedKeys, code);
+}
+
+function denseDataArray(value, maximumLength, code) {
+  ensure(
+    !isProxyValue(value) &&
+      arrayIsArray(value) &&
+      objectGetPrototypeOf(value) === arrayPrototype &&
+      numberIsSafeIntegerIntrinsic(value.length) &&
+      value.length <= maximumLength,
+    code,
+  );
+  let keys;
+  try {
+    keys = reflectOwnKeys(value);
+  } catch {
+    fail(code);
+  }
+  ensure(keys.length === value.length + 1, code);
+  const normalized = [];
+  for (let index = 0; index < value.length; index += 1) {
+    const descriptor = objectGetOwnPropertyDescriptor(
+      value,
+      StringConstructor(index),
+    );
+    ensure(
+      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
+      code,
+    );
+    arrayPush(normalized, descriptor.value);
+  }
+  return normalized;
+}
+
+function consumeAdoptionCanonicalBytes(budget, bytes, code) {
+  ensure(
+    numberIsSafeIntegerIntrinsic(bytes) &&
+      bytes >= 0 &&
+      budget.bytes <= MAX_ADOPTION_CANONICAL_BYTES - bytes,
+    code,
+  );
+  budget.bytes += bytes;
 }
 
 function consumeBudget(state, bytes, code) {
@@ -729,7 +895,12 @@ function canonicalChecksum(value, code) {
 }
 
 function canonicalUint64(value, code, { positive = false } = {}) {
-  ensure(typeof value === "string" && regexpTest(DECIMAL_PATTERN, value), code);
+  ensure(
+    typeof value === "string" &&
+      value.length <= 20 &&
+      regexpTest(DECIMAL_PATTERN, value),
+    code,
+  );
   let parsed;
   try {
     parsed = BigIntConstructor(value);
@@ -1257,10 +1428,12 @@ function canonicalHeadChecksum(value, code) {
   }
 }
 
-function genesisHead() {
+function genesisHead(
+  contractVersion = FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+) {
   return canonicalHead(
     {
-      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+      contractVersion,
       anchorRevision: "0",
       generation: "0",
       stateRevision: "0",
@@ -1295,7 +1468,12 @@ function headEqual(left, right) {
 }
 
 function canonicalStoredNumber(value, maximum, code) {
-  ensure(typeof value === "string" && regexpTest(DECIMAL_PATTERN, value), code);
+  ensure(
+    typeof value === "string" &&
+      value.length <= 20 &&
+      regexpTest(DECIMAL_PATTERN, value),
+    code,
+  );
   let parsed;
   try {
     parsed = BigIntConstructor(value);
@@ -1414,14 +1592,30 @@ function normalizeHeadRow(value, identity, code) {
     },
     code,
   );
-  ensure(!headEqual(head, genesisHead()), code);
+  ensure(!headEqual(head, genesisHead(head.contractVersion)), code);
   const operationIndexStateRevision =
     row.operation_index_state_revision === null
       ? null
       : canonicalUint64(row.operation_index_state_revision, code).value;
+  const operationIndexAdoptionId =
+    row.operation_index_adoption_id === null
+      ? null
+      : canonicalChecksum(row.operation_index_adoption_id, code);
+  const operationIndexAdoptionXid =
+    row.operation_index_adoption_xid === null
+      ? null
+      : canonicalUint64(row.operation_index_adoption_xid, code).value;
+  ensure(
+    (operationIndexAdoptionId === null) ===
+      (operationIndexAdoptionXid === null) &&
+      (operationIndexAdoptionId === null || head.contractVersion === 3),
+    code,
+  );
   return objectFreeze({
     exists: true,
     head,
+    operationIndexAdoptionId,
+    operationIndexAdoptionXid,
     operationIndexStateRevision,
   });
 }
@@ -1437,6 +1631,10 @@ function normalizeOperationRow(value, identity, code) {
     code,
   );
   const operationId = canonicalOpaqueId(row.operation_id, code);
+  const adoptionId =
+    row.adoption_id === null
+      ? null
+      : canonicalChecksum(row.adoption_id, code);
   const kind = canonicalOpaqueId(row.kind, code);
   const storageId = canonicalOpaqueId(row.storage_id, code);
   const preparedStateRevision = canonicalUint64(
@@ -1469,7 +1667,7 @@ function normalizeOperationRow(value, identity, code) {
         row.committed_record_sha256 === null,
       code,
     );
-    return preparedMaterial;
+    return objectFreeze({ ...preparedMaterial, adoptionId });
   }
   const committedStateRevision = canonicalUint64(
     row.committed_state_revision,
@@ -1512,19 +1710,26 @@ function normalizeOperationRow(value, identity, code) {
   );
   return objectFreeze({
     ...committedMaterial,
+    adoptionId,
     committedChecksum,
     committedChecksumProvenance,
     preparedMaterial,
   });
 }
 
-function assertOperationVisibleAtHead(material, head, code) {
+function assertOperationVisibleAtHead(material, snapshot, code) {
+  const head = snapshot.head;
   const record = material.record;
   const headRevision = BigIntConstructor(head.stateRevision);
   const preparedRevision = BigIntConstructor(record.preparedStateRevision);
   const headEndsInOperationFrame =
     head.generation === "0" || head.frameCount > 0;
   ensure(preparedRevision <= headRevision, code);
+  ensure(
+    material.adoptionId === null ||
+      material.adoptionId === snapshot.operationIndexAdoptionId,
+    code,
+  );
   if (preparedRevision === headRevision && headEndsInOperationFrame) {
     ensure(record.preparedChecksum === head.lastChecksum, code);
   }
@@ -1536,6 +1741,8 @@ function assertOperationVisibleAtHead(material, head, code) {
     ) {
       ensure(
         head.contractVersion === 3 &&
+          material.adoptionId !== null &&
+          material.adoptionId === snapshot.operationIndexAdoptionId &&
           committedRevision <=
             BigIntConstructor(head.checkpointStateRevision),
         code,
@@ -1583,7 +1790,9 @@ function headValues(identity, head) {
 
 function expectedHeadValues(identity, expectedHead, nextHead) {
   const nextValues = headValues(identity, nextHead);
-  if (headEqual(expectedHead, genesisHead())) return nextValues;
+  if (headEqual(expectedHead, genesisHead(expectedHead.contractVersion))) {
+    return nextValues;
+  }
   return [
     ...nextValues,
     expectedHead.contractVersion,
@@ -1601,28 +1810,43 @@ function expectedHeadValues(identity, expectedHead, nextHead) {
   ];
 }
 
-async function readHeadInTransaction(transaction, identity, code) {
+async function readHeadInTransaction(
+  transaction,
+  identity,
+  code,
+  genesisContractVersion,
+) {
   const snapshot = await readHeadSnapshotInTransaction(
     transaction,
     identity,
     code,
+    false,
+    genesisContractVersion,
   );
   return snapshot.head;
 }
 
-async function readHeadSnapshotInTransaction(transaction, identity, code) {
+async function readHeadSnapshotInTransaction(
+  transaction,
+  identity,
+  code,
+  forUpdate = false,
+  genesisContractVersion = FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+) {
   const result = await queryTransaction(
     transaction,
-    READ_HEAD_QUERY,
+    forUpdate ? READ_HEAD_FOR_UPDATE_QUERY : READ_HEAD_QUERY,
     [identity.providerId, identity.anchorId],
     code,
   );
   const rows = rowsFromResult(result, "SELECT", 1, code);
   if (rows.length !== 0) return normalizeHeadRow(rows[0], identity, code);
-  const head = genesisHead();
+  const head = genesisHead(genesisContractVersion);
   return objectFreeze({
     exists: false,
     head,
+    operationIndexAdoptionId: null,
+    operationIndexAdoptionXid: null,
     operationIndexStateRevision: head.stateRevision,
   });
 }
@@ -1632,6 +1856,8 @@ async function requireExpectedHead(transaction, identity, expectedHead, code) {
     transaction,
     identity,
     code,
+    false,
+    expectedHead.contractVersion,
   );
   ensure(headEqual(observed.head, expectedHead), code);
   return observed;
@@ -1674,7 +1900,7 @@ async function readOperationInTransaction(
   transaction,
   identity,
   operationId,
-  expectedHead,
+  expectedSnapshot,
   code,
 ) {
   const result = await queryTransaction(
@@ -1686,7 +1912,7 @@ async function readOperationInTransaction(
   const rows = rowsFromResult(result, "SELECT", 1, code);
   if (rows.length === 0) return null;
   const material = normalizeOperationRow(rows[0], identity, code);
-  assertOperationVisibleAtHead(material, expectedHead, code);
+  assertOperationVisibleAtHead(material, expectedSnapshot, code);
   return material.record;
 }
 
@@ -1716,7 +1942,7 @@ async function readOperationsPageInTransaction(
   let previousOperationId = input.afterOperationId;
   for (let index = 0; index < rows.length; index += 1) {
     const material = normalizeOperationRow(rows[index], identity, code);
-    assertOperationVisibleAtHead(material, input.expectedHead, code);
+    assertOperationVisibleAtHead(material, input.expectedSnapshot, code);
     const record = material.record;
     ensure(
       previousOperationId === null || record.operationId > previousOperationId,
@@ -1740,11 +1966,62 @@ async function readOperationsPageInTransaction(
   });
 }
 
+async function readPreparedOperationsPageInTransaction(
+  transaction,
+  identity,
+  input,
+  code,
+) {
+  const maximumRows = input.limit + 1;
+  const first = input.afterStorageId === null;
+  const result = await queryTransaction(
+    transaction,
+    first ? READ_PREPARED_PAGE_FIRST_QUERY : READ_PREPARED_PAGE_AFTER_QUERY,
+    first
+      ? [identity.providerId, identity.anchorId, StringConstructor(maximumRows)]
+      : [
+          identity.providerId,
+          identity.anchorId,
+          input.afterStorageId,
+          StringConstructor(maximumRows),
+        ],
+    code,
+  );
+  const rows = rowsFromResult(result, "SELECT", maximumRows, code);
+  const normalized = [];
+  let previousStorageId = input.afterStorageId;
+  for (let index = 0; index < rows.length; index += 1) {
+    const material = normalizeOperationRow(rows[index], identity, code);
+    assertOperationVisibleAtHead(material, input.expectedSnapshot, code);
+    const record = material.record;
+    ensure(
+      record.state === "prepared" &&
+        (previousStorageId === null || record.storageId > previousStorageId),
+      code,
+    );
+    previousStorageId = record.storageId;
+    arrayPush(normalized, record);
+  }
+  const hasMore = normalized.length > input.limit;
+  const operations = callIntrinsic(arraySliceIntrinsic, normalized, [
+    0,
+    input.limit,
+  ]);
+  objectFreeze(operations);
+  return objectFreeze({
+    operations,
+    nextAfterStorageId:
+      hasMore && operations.length > 0
+        ? operations[operations.length - 1].storageId
+        : null,
+  });
+}
+
 async function readLatestCommittedStorageStateInTransaction(
   transaction,
   identity,
   storageId,
-  expectedHead,
+  expectedSnapshot,
   code,
 ) {
   const result = await queryTransaction(
@@ -1761,7 +2038,7 @@ async function readLatestCommittedStorageStateInTransaction(
       material.record.storageId === storageId,
     code,
   );
-  assertOperationVisibleAtHead(material, expectedHead, code);
+  assertOperationVisibleAtHead(material, expectedSnapshot, code);
   return material.record.storageState;
 }
 
@@ -1917,6 +2194,694 @@ function normalizeTransition(value, expectedHead, nextHead, code) {
   });
 }
 
+function isAdoptionRotation(expectedHead, nextHead, code) {
+  return (
+    expectedHead.contractVersion ===
+      FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION &&
+    expectedHead.stateRevision !== "0" &&
+    nextHead.contractVersion ===
+      FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION &&
+    decimalSuccessor(expectedHead.anchorRevision, nextHead.anchorRevision) &&
+    decimalSuccessor(expectedHead.generation, nextHead.generation) &&
+    nextHead.stateRevision === expectedHead.stateRevision &&
+    nextHead.checkpointStateRevision === expectedHead.stateRevision &&
+    nextHead.checkpointFrameCount >= 2 &&
+    nextHead.checkpointFrameCount <= MAX_CHECKPOINT_FRAME_COUNT &&
+    nextHead.checkpointChecksum !== null &&
+    nextHead.checkpointBytes >= 1 &&
+    nextHead.checkpointBytes <= MAX_CHECKPOINT_BYTES &&
+    nextHead.frameCount === 0 &&
+    nextHead.lastChecksum === nextHead.checkpointChecksum &&
+    nextHead.ledgerBytes === 0 &&
+    nextHead.baseHeadChecksum === canonicalHeadChecksum(expectedHead, code)
+  );
+}
+
+function canonicalAdoptionStorages(value, budget, code) {
+  const source = denseDataArray(value, MAX_ADOPTION_STORAGES, code);
+  const storages = [];
+  let previousStorageId = null;
+  for (let index = 0; index < source.length; index += 1) {
+    const wrapper = exactDataObject(
+      source[index],
+      ADOPTION_STORAGE_KEYS,
+      code,
+    );
+    const storage = canonicalStorageState(wrapper.storage, code);
+    const currentAttachmentOriginOperationId =
+      wrapper.currentAttachmentOriginOperationId === null
+        ? null
+        : canonicalOpaqueId(
+            wrapper.currentAttachmentOriginOperationId,
+            code,
+          );
+    ensure(
+      (storage.lifecycle === "attached") ===
+        (currentAttachmentOriginOperationId !== null) &&
+        (previousStorageId === null || storage.storageId > previousStorageId),
+      code,
+    );
+    previousStorageId = storage.storageId;
+    const normalized = objectFreeze({
+      currentAttachmentOriginOperationId,
+      storage,
+    });
+    consumeAdoptionCanonicalBytes(
+      budget,
+      bufferByteLength(canonicalString(normalized), "utf8"),
+      code,
+    );
+    arrayPush(storages, normalized);
+  }
+  return objectFreeze(storages);
+}
+
+function canonicalAdoptionOperations(value, budget, code) {
+  const source = denseDataArray(value, MAX_ADOPTION_OPERATIONS, code);
+  const materials = [];
+  let previousOperationId = null;
+  for (let index = 0; index < source.length; index += 1) {
+    const material = recordMaterial(source[index], code);
+    consumeAdoptionCanonicalBytes(budget, material.bytes.length, code);
+    if (material.record.state === "committed") {
+      consumeAdoptionCanonicalBytes(
+        budget,
+        preparedMaterialFromCommitted(material, code).bytes.length,
+        code,
+      );
+    }
+    ensure(
+      previousOperationId === null ||
+        material.record.operationId > previousOperationId,
+      code,
+    );
+    previousOperationId = material.record.operationId;
+    arrayPush(materials, material);
+  }
+  return objectFreeze(materials);
+}
+
+function validateAdoptionReplay(materials, storages, expectedHead, code) {
+  const maximumEvents = BigIntConstructor(MAX_ADOPTION_OPERATIONS * 2);
+  const stateRevision = BigIntConstructor(expectedHead.stateRevision);
+  ensure(stateRevision <= maximumEvents, code);
+  const events = new MapConstructor();
+  for (let index = 0; index < materials.length; index += 1) {
+    const record = materials[index].record;
+    ensure(!mapHas(events, record.preparedStateRevision), code);
+    mapSet(events, record.preparedStateRevision, {
+      material: materials[index],
+      type: "prepared",
+    });
+    if (record.state === "committed") {
+      ensure(!mapHas(events, record.committedStateRevision), code);
+      mapSet(events, record.committedStateRevision, {
+        material: materials[index],
+        type: "committed",
+      });
+    }
+  }
+  ensure(BigIntConstructor(mapSize(events)) === stateRevision, code);
+
+  const currentStorages = new MapConstructor();
+  const origins = new MapConstructor();
+  const pendingStorages = new MapConstructor();
+  for (let revision = 1n; revision <= stateRevision; revision += 1n) {
+    const event = mapGet(events, StringConstructor(revision));
+    ensure(event !== undefined, code);
+    const record = event.material.record;
+    if (event.type === "prepared") {
+      const current = mapHas(currentStorages, record.storageId)
+        ? mapGet(currentStorages, record.storageId)
+        : null;
+      ensure(
+        !mapHas(pendingStorages, record.storageId) &&
+          canonicalEqual(current, record.storageStateBefore),
+        code,
+      );
+      assertPreparePrecondition(current, record.kind, code);
+      mapSet(pendingStorages, record.storageId, record.operationId);
+      continue;
+    }
+    ensure(
+      mapGet(pendingStorages, record.storageId) === record.operationId,
+      code,
+    );
+    mapDelete(pendingStorages, record.storageId);
+    const previousStorage = mapHas(currentStorages, record.storageId)
+      ? mapGet(currentStorages, record.storageId)
+      : null;
+    assertStorageTransition(
+      previousStorage,
+      record.storageState,
+      record.kind,
+      code,
+    );
+    const previousOrigin = mapHas(origins, record.storageId)
+      ? mapGet(origins, record.storageId)
+      : null;
+    let nextOrigin = previousOrigin;
+    if (record.storageState.lifecycle !== "attached") {
+      nextOrigin = null;
+    } else if (
+      record.kind === "attach" ||
+      record.kind === "restore-attach"
+    ) {
+      nextOrigin = record.operationId;
+    }
+    ensure(nextOrigin !== null || record.storageState.lifecycle !== "attached", code);
+    mapSet(currentStorages, record.storageId, record.storageState);
+    mapSet(origins, record.storageId, nextOrigin);
+  }
+
+  ensure(mapSize(currentStorages) === storages.length, code);
+  for (let index = 0; index < storages.length; index += 1) {
+    const wrapper = storages[index];
+    ensure(
+      mapHas(currentStorages, wrapper.storage.storageId) &&
+        canonicalEqual(
+          mapGet(currentStorages, wrapper.storage.storageId),
+          wrapper.storage,
+        ) &&
+        mapGet(origins, wrapper.storage.storageId) ===
+          wrapper.currentAttachmentOriginOperationId,
+      code,
+    );
+  }
+}
+
+function adoptionManifest(
+  identity,
+  provenance,
+  expectedHead,
+  nextHead,
+  materials,
+  storages,
+) {
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [ADOPTION_MANIFEST_DOMAIN]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    `header\0${canonicalString({
+      anchorId: identity.anchorId,
+      expectedHead,
+      nextHead,
+      provenance,
+      providerId: identity.providerId,
+    })}\0`,
+    "utf8",
+  ]);
+  for (let index = 0; index < materials.length; index += 1) {
+    callIntrinsic(hashUpdateIntrinsic, hash, ["operation\0", "utf8"]);
+    callIntrinsic(hashUpdateIntrinsic, hash, [
+      `${materials[index].sha256}\0`,
+      "utf8",
+    ]);
+    callIntrinsic(hashUpdateIntrinsic, hash, [materials[index].bytes]);
+    callIntrinsic(hashUpdateIntrinsic, hash, ["\0", "utf8"]);
+  }
+  for (let index = 0; index < storages.length; index += 1) {
+    callIntrinsic(hashUpdateIntrinsic, hash, [
+      `storage\0${canonicalString(storages[index])}\0`,
+      "utf8",
+    ]);
+  }
+  return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+}
+
+function normalizeAdoptionRequest(value, identity, code) {
+  const input = exactDataObject(value, ADOPTION_KEYS, code);
+  const expectedHead = canonicalHead(input.expectedHead, code);
+  const nextHead = canonicalHead(input.nextHead, code);
+  ensure(isAdoptionRotation(expectedHead, nextHead, code), code);
+  const budget = { bytes: 0 };
+  const materials = canonicalAdoptionOperations(input.operations, budget, code);
+  const storages = canonicalAdoptionStorages(input.storages, budget, code);
+  validateAdoptionReplay(materials, storages, expectedHead, code);
+  return objectFreeze({
+    expectedHead,
+    manifestIds: objectFreeze({
+      indexed: adoptionManifest(
+        identity,
+        "indexed-frame-v1-retained",
+        expectedHead,
+        nextHead,
+        materials,
+        storages,
+      ),
+      legacy: adoptionManifest(
+        identity,
+        "unavailable-adopted-v2",
+        expectedHead,
+        nextHead,
+        materials,
+        storages,
+      ),
+    }),
+    materials,
+    nextHead,
+    storages,
+  });
+}
+
+function selectAdoptionManifest(input, mode) {
+  return objectFreeze({
+    ...input,
+    manifestId: input.manifestIds[mode],
+    sourceMode: mode,
+  });
+}
+
+function adoptionHeadValues(identity, input, sourceMarker) {
+  return [
+    ...headValues(identity, input.nextHead),
+    input.manifestId,
+    input.expectedHead.contractVersion,
+    input.expectedHead.anchorRevision,
+    input.expectedHead.generation,
+    input.expectedHead.stateRevision,
+    input.expectedHead.baseHeadChecksum,
+    input.expectedHead.checkpointStateRevision,
+    StringConstructor(input.expectedHead.checkpointFrameCount),
+    input.expectedHead.checkpointChecksum,
+    StringConstructor(input.expectedHead.checkpointBytes),
+    StringConstructor(input.expectedHead.frameCount),
+    input.expectedHead.lastChecksum,
+    StringConstructor(input.expectedHead.ledgerBytes),
+    sourceMarker,
+  ];
+}
+
+async function readAllOperationMaterialsInTransaction(
+  transaction,
+  identity,
+  snapshot,
+  code,
+) {
+  const materials = [];
+  const budget = { bytes: 0 };
+  let afterOperationId = null;
+  while (true) {
+    const first = afterOperationId === null;
+    const maximumRows = MAX_PAGE_SIZE + 1;
+    const result = await queryTransaction(
+      transaction,
+      first
+        ? READ_OPERATIONS_PAGE_FIRST_QUERY
+        : READ_OPERATIONS_PAGE_AFTER_QUERY,
+      first
+        ? [identity.providerId, identity.anchorId, StringConstructor(maximumRows)]
+        : [
+            identity.providerId,
+            identity.anchorId,
+            afterOperationId,
+            StringConstructor(maximumRows),
+          ],
+      code,
+    );
+    const rows = rowsFromResult(result, "SELECT", maximumRows, code);
+    for (let index = 0; index < rows.length; index += 1) {
+      const material = normalizeOperationRow(rows[index], identity, code);
+      consumeAdoptionCanonicalBytes(budget, material.bytes.length, code);
+      if (material.record.state === "committed") {
+        consumeAdoptionCanonicalBytes(
+          budget,
+          material.preparedMaterial.bytes.length,
+          code,
+        );
+      }
+      assertOperationVisibleAtHead(material, snapshot, code);
+      ensure(
+        afterOperationId === null ||
+          material.record.operationId > afterOperationId,
+        code,
+      );
+      afterOperationId = material.record.operationId;
+      arrayPush(materials, material);
+      ensure(materials.length <= MAX_ADOPTION_OPERATIONS, code);
+    }
+    if (rows.length < maximumRows) break;
+  }
+  return objectFreeze(materials);
+}
+
+function operationMaterialsEqual(left, right) {
+  return (
+    left.record.operationId === right.record.operationId &&
+    left.sha256 === right.sha256 &&
+    bufferEquals(left.bytes, right.bytes)
+  );
+}
+
+function verifyAdoptionRows(input, storedMaterials, code) {
+  ensure(storedMaterials.length === input.materials.length, code);
+  let observedMode = null;
+  for (let index = 0; index < storedMaterials.length; index += 1) {
+    const stored = storedMaterials[index];
+    const expected = input.materials[index];
+    ensure(operationMaterialsEqual(stored, expected), code);
+    const rowMode = stored.adoptionId === input.manifestId
+      ? "legacy"
+      : stored.adoptionId === null
+        ? "indexed"
+        : null;
+    ensure(rowMode !== null, code);
+    if (stored.record.state === "committed") {
+      ensure(
+        rowMode === "legacy"
+          ? stored.committedChecksumProvenance === "unavailable-adopted-v2" &&
+              stored.committedChecksum === null
+          : stored.committedChecksumProvenance === "indexed-frame-v1" &&
+              stored.committedChecksum !== null,
+        code,
+      );
+    }
+    observedMode ??= rowMode;
+    ensure(observedMode === rowMode, code);
+  }
+  return observedMode ?? "empty";
+}
+
+function preparedMaterialFromCommitted(material, code) {
+  const record = material.record;
+  return recordMaterial(
+    objectFreeze({
+      kind: record.kind,
+      operationId: record.operationId,
+      preparedChecksum: record.preparedChecksum,
+      preparedStateRevision: record.preparedStateRevision,
+      request: record.request,
+      state: "prepared",
+      storageId: record.storageId,
+      storageStateBefore: record.storageStateBefore,
+    }),
+    code,
+  );
+}
+
+function adoptedOperationValues(identity, material, manifestId, code) {
+  const record = material.record;
+  const preparedMaterial =
+    record.state === "prepared"
+      ? material
+      : preparedMaterialFromCommitted(material, code);
+  return [
+    identity.providerId,
+    identity.anchorId,
+    record.operationId,
+    POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_AUTHORITY_CONTRACT_VERSION,
+    record.state,
+    record.kind,
+    record.storageId,
+    record.preparedStateRevision,
+    record.preparedChecksum,
+    bufferToString(preparedMaterial.bytes, "hex"),
+    preparedMaterial.sha256,
+    record.state === "committed" ? record.committedStateRevision : null,
+    record.state === "committed" ? "unavailable-adopted-v2" : null,
+    null,
+    record.state === "committed" ? bufferToString(material.bytes, "hex") : null,
+    record.state === "committed" ? material.sha256 : null,
+    manifestId,
+  ];
+}
+
+function adoptedOperationBatchQuery(batchSize) {
+  let tuples = "";
+  for (let index = 0; index < batchSize; index += 1) {
+    const offset = index * 17;
+    if (index !== 0) tuples += ", ";
+    tuples += callIntrinsic(
+      arrayJoinIntrinsic,
+      [
+        `($${offset + 1}, $${offset + 2}, $${offset + 3},`,
+        `$${offset + 4}, $${offset + 5}, $${offset + 6}, $${offset + 7},`,
+        `$${offset + 8}::pg_catalog.numeric, $${offset + 9},`,
+        `pg_catalog.decode($${offset + 10}, 'hex'), $${offset + 11},`,
+        `$${offset + 12}::pg_catalog.numeric, $${offset + 13},`,
+        `$${offset + 14}, CASE WHEN $${offset + 15}::pg_catalog.text IS NULL`,
+        `THEN NULL ELSE pg_catalog.decode($${offset + 15}, 'hex') END,`,
+        `$${offset + 16}, $${offset + 17})`,
+      ],
+      [" "],
+    );
+  }
+  return callIntrinsic(
+    arrayJoinIntrinsic,
+    [
+      INSERT_ADOPTED_OPERATION_PREFIX,
+      `VALUES ${tuples}`,
+      "ON CONFLICT DO NOTHING",
+      `RETURNING ${OPERATION_COLUMNS}`,
+    ],
+    [" "],
+  );
+}
+
+async function insertAdoptedOperationsInTransaction(
+  transaction,
+  identity,
+  input,
+  code,
+) {
+  for (
+    let batchStart = 0;
+    batchStart < input.materials.length;
+    batchStart += MAX_ADOPTION_INSERT_BATCH_SIZE
+  ) {
+    const batchSize = mathMinIntrinsic(
+      MAX_ADOPTION_INSERT_BATCH_SIZE,
+      input.materials.length - batchStart,
+    );
+    const values = [];
+    for (let index = 0; index < batchSize; index += 1) {
+      const material = input.materials[batchStart + index];
+      const rowValues = adoptedOperationValues(
+        identity,
+        material,
+        input.manifestId,
+        code,
+      );
+      for (let valueIndex = 0; valueIndex < rowValues.length; valueIndex += 1) {
+        arrayPush(values, rowValues[valueIndex]);
+      }
+    }
+    const result = await queryTransaction(
+      transaction,
+      adoptedOperationBatchQuery(batchSize),
+      values,
+      code,
+    );
+    const rows = rowsFromResult(result, "INSERT", batchSize, code);
+    ensure(rows.length === batchSize, code);
+    const returned = new MapConstructor();
+    for (let index = 0; index < rows.length; index += 1) {
+      const stored = normalizeOperationRow(rows[index], identity, code);
+      ensure(!mapHas(returned, stored.record.operationId), code);
+      mapSet(returned, stored.record.operationId, stored);
+    }
+    for (let index = 0; index < batchSize; index += 1) {
+      const material = input.materials[batchStart + index];
+      const stored = mapGet(returned, material.record.operationId);
+      ensure(
+        stored !== undefined &&
+          operationMaterialsEqual(stored, material) &&
+          stored.adoptionId === input.manifestId &&
+          (stored.record.state !== "committed" ||
+            (stored.committedChecksumProvenance ===
+              "unavailable-adopted-v2" &&
+              stored.committedChecksum === null)),
+        code,
+      );
+    }
+  }
+}
+
+function targetAdoptionSnapshotMatches(snapshot, input) {
+  return (
+    snapshot.exists &&
+    headEqual(snapshot.head, input.nextHead) &&
+    snapshot.operationIndexStateRevision === input.nextHead.stateRevision &&
+    snapshot.operationIndexAdoptionId === input.manifestId &&
+    snapshot.operationIndexAdoptionXid !== null
+  );
+}
+
+function selectedAdoptionForTarget(snapshot, input) {
+  if (!snapshot.exists || !headEqual(snapshot.head, input.nextHead)) return null;
+  const legacy = selectAdoptionManifest(input, "legacy");
+  if (targetAdoptionSnapshotMatches(snapshot, legacy)) return legacy;
+  const indexed = selectAdoptionManifest(input, "indexed");
+  if (targetAdoptionSnapshotMatches(snapshot, indexed)) return indexed;
+  return null;
+}
+
+async function verifyTargetAdoptionInTransaction(
+  transaction,
+  identity,
+  snapshot,
+  input,
+  code,
+) {
+  ensure(targetAdoptionSnapshotMatches(snapshot, input), code);
+  const storedMaterials = await readAllOperationMaterialsInTransaction(
+    transaction,
+    identity,
+    snapshot,
+    code,
+  );
+  const observedMode = verifyAdoptionRows(input, storedMaterials, code);
+  ensure(
+    observedMode === "empty" || observedMode === input.sourceMode,
+    code,
+  );
+}
+
+async function sourceAdoptionModeInTransaction(
+  transaction,
+  identity,
+  snapshot,
+  input,
+  code,
+) {
+  ensure(
+    snapshot.exists &&
+      headEqual(snapshot.head, input.expectedHead) &&
+      snapshot.operationIndexAdoptionId === null &&
+      snapshot.operationIndexAdoptionXid === null,
+    code,
+  );
+  const storedMaterials = await readAllOperationMaterialsInTransaction(
+    transaction,
+    identity,
+    snapshot,
+    code,
+  );
+  if (snapshot.operationIndexStateRevision === null) {
+    ensure(storedMaterials.length === 0, code);
+    return "legacy";
+  }
+  ensure(
+    snapshot.operationIndexStateRevision === input.expectedHead.stateRevision &&
+      verifyAdoptionRows(input, storedMaterials, code) !== "legacy",
+    code,
+  );
+  return "indexed";
+}
+
+async function compareAndAdoptInTransaction(
+  transaction,
+  identity,
+  input,
+  code,
+) {
+  const observed = await readHeadSnapshotInTransaction(
+    transaction,
+    identity,
+    code,
+    true,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+  );
+  const idempotentInput = selectedAdoptionForTarget(observed, input);
+  if (idempotentInput !== null) {
+    await verifyTargetAdoptionInTransaction(
+      transaction,
+      identity,
+      observed,
+      idempotentInput,
+      code,
+    );
+    return true;
+  }
+  if (!observed.exists || !headEqual(observed.head, input.expectedHead)) {
+    return false;
+  }
+  const sourceMode = await sourceAdoptionModeInTransaction(
+    transaction,
+    identity,
+    observed,
+    input,
+    code,
+  );
+  const selectedInput = selectAdoptionManifest(input, sourceMode);
+  const update = await queryTransaction(
+    transaction,
+    ADOPT_HEAD_QUERY,
+    adoptionHeadValues(
+      identity,
+      selectedInput,
+      observed.operationIndexStateRevision,
+    ),
+    code,
+  );
+  const rows = rowsFromResult(update, "UPDATE", 1, code);
+  if (rows.length === 0) return false;
+  const adopted = normalizeHeadRow(rows[0], identity, code);
+  ensure(targetAdoptionSnapshotMatches(adopted, selectedInput), code);
+  if (sourceMode === "legacy") {
+    await insertAdoptedOperationsInTransaction(
+      transaction,
+      identity,
+      selectedInput,
+      code,
+    );
+  }
+  await verifyTargetAdoptionInTransaction(
+    transaction,
+    identity,
+    adopted,
+    selectedInput,
+    code,
+  );
+  return true;
+}
+
+async function resolveAdoptionCommitOutcome(store, identity, input, code) {
+  try {
+    return await runSerializable(store, async (transaction) => {
+      const observed = await readHeadSnapshotInTransaction(
+        transaction,
+        identity,
+        code,
+        false,
+        FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+      );
+      const selectedInput = selectedAdoptionForTarget(observed, input);
+      if (selectedInput !== null) {
+        await verifyTargetAdoptionInTransaction(
+          transaction,
+          identity,
+          observed,
+          selectedInput,
+          code,
+        );
+        return true;
+      }
+      if (
+        observed.exists &&
+        headEqual(observed.head, input.expectedHead) &&
+        observed.operationIndexAdoptionId === null &&
+        observed.operationIndexAdoptionXid === null
+      ) {
+        await sourceAdoptionModeInTransaction(
+          transaction,
+          identity,
+          observed,
+          input,
+          code,
+        );
+        return false;
+      }
+      fail(
+        "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
+      );
+    });
+  } catch {
+    fail(
+      "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
+    );
+  }
+}
+
 export class PostgresFilesystemImageProviderStateAuthorityError extends Error {
   constructor(code) {
     if (typeof code !== "string" || !objectHasOwn(ERROR_MESSAGES, code)) {
@@ -1938,7 +2903,7 @@ export class PostgresFilesystemImageProviderStateAuthorityError extends Error {
   }
 }
 
-export function createPostgresFilesystemImageProviderStateAuthority(...args) {
+function createAuthoritySurface(args, runtimeOnly) {
   const optionCode =
     "invalid_postgres_filesystem_image_provider_state_authority_options";
   ensure(args.length === 1, optionCode);
@@ -1960,9 +2925,23 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
 
   const readHead = async function readHead(...readArgs) {
     ensure(readArgs.length === 0, requestCode);
-    return await runSerializable(store, async (transaction) =>
-      await readHeadInTransaction(transaction, identity, stateCode),
-    );
+    return await runSerializable(store, async (transaction) => {
+      const head = await readHeadInTransaction(
+        transaction,
+        identity,
+        stateCode,
+        runtimeOnly
+          ? FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION
+          : FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+      );
+      ensure(
+        runtimeOnly ||
+          head.contractVersion ===
+            FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+        stateCode,
+      );
+      return head;
+    });
   };
 
   const readOperation = async function readOperation(...readArgs) {
@@ -1977,13 +2956,20 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
         expectedHead,
         stateCode,
       );
+      ensure(
+        expectedHead.contractVersion ===
+          (runtimeOnly
+            ? FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION
+            : FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION),
+        stateCode,
+      );
       requireExpectedOperationIndex(observedHead, expectedHead, stateCode);
       if (!observedHead.exists) return null;
       return await readOperationInTransaction(
         transaction,
         identity,
         operationId,
-        expectedHead,
+        observedHead,
         stateCode,
       );
     });
@@ -2015,6 +3001,13 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
         expectedHead,
         stateCode,
       );
+      ensure(
+        expectedHead.contractVersion ===
+          (runtimeOnly
+            ? FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION
+            : FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION),
+        stateCode,
+      );
       requireExpectedOperationIndex(observedHead, expectedHead, stateCode);
       if (!observedHead.exists) {
         const operations = [];
@@ -2024,7 +3017,57 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
       return await readOperationsPageInTransaction(
         transaction,
         identity,
-        normalizedInput,
+        objectFreeze({
+          ...normalizedInput,
+          expectedSnapshot: observedHead,
+        }),
+        stateCode,
+      );
+    });
+  };
+
+  const readPreparedOperationsPage = async function readPreparedOperationsPage(
+    ...pageArgs
+  ) {
+    ensure(pageArgs.length === 1, requestCode);
+    const input = exactDataObject(
+      pageArgs[0],
+      READ_PREPARED_PAGE_KEYS,
+      requestCode,
+    );
+    const expectedHead = canonicalHead(input.expectedHead, requestCode);
+    const afterStorageId =
+      input.afterStorageId === null
+        ? null
+        : canonicalOpaqueId(input.afterStorageId, requestCode);
+    ensure(
+      numberIsSafeIntegerIntrinsic(input.limit) &&
+        input.limit >= 1 &&
+        input.limit <= MAX_PAGE_SIZE,
+      requestCode,
+    );
+    return await runSerializable(store, async (transaction) => {
+      const observedHead = await requireExpectedHead(
+        transaction,
+        identity,
+        expectedHead,
+        stateCode,
+      );
+      ensure(expectedHead.contractVersion === 3, stateCode);
+      requireExpectedOperationIndex(observedHead, expectedHead, stateCode);
+      if (!observedHead.exists) {
+        const operations = [];
+        objectFreeze(operations);
+        return objectFreeze({ operations, nextAfterStorageId: null });
+      }
+      return await readPreparedOperationsPageInTransaction(
+        transaction,
+        identity,
+        objectFreeze({
+          afterStorageId,
+          expectedSnapshot: observedHead,
+          limit: input.limit,
+        }),
         stateCode,
       );
     });
@@ -2046,8 +3089,18 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
         transaction,
         identity,
         stateCode,
+        false,
+        expectedHead.contractVersion,
       );
       if (!headEqual(observedHead.head, expectedHead)) return false;
+      const operationalContractVersion = runtimeOnly
+        ? FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION
+        : FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION;
+      ensure(
+        expectedHead.contractVersion === operationalContractVersion &&
+          nextHead.contractVersion === operationalContractVersion,
+        stateCode,
+      );
       requireExpectedOperationIndex(observedHead, expectedHead, stateCode);
       const advanced = await compareHeadInTransaction(
         transaction,
@@ -2064,7 +3117,7 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
             transaction,
             identity,
             transition.material.record.storageId,
-            expectedHead,
+            observedHead,
             stateCode,
           );
         ensure(
@@ -2098,17 +3151,103 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
   objectFreeze(readHead);
   objectFreeze(readOperation);
   objectFreeze(readOperationsPage);
+  objectFreeze(readPreparedOperationsPage);
   objectFreeze(compareAndAdvance);
+  return runtimeOnly
+    ? objectFreeze({
+        contractVersion:
+          POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT_VERSION,
+        readHead,
+        readOperation,
+        readOperationsPage,
+        readPreparedOperationsPage,
+        compareAndAdvance,
+      })
+    : objectFreeze({
+        contractVersion:
+          POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_AUTHORITY_CONTRACT_VERSION,
+        readHead,
+        readOperation,
+        readOperationsPage,
+        compareAndAdvance,
+      });
+}
+
+export function createPostgresFilesystemImageProviderStateAuthority(...args) {
+  return createAuthoritySurface(args, false);
+}
+
+export function createPostgresFilesystemImageProviderStateRuntimeAuthority(
+  ...args
+) {
+  return createAuthoritySurface(args, true);
+}
+
+export function createPostgresFilesystemImageProviderStateAdoptionAuthority(
+  ...args
+) {
+  const optionCode =
+    "invalid_postgres_filesystem_image_provider_state_authority_options";
+  ensure(args.length === 1, optionCode);
+  const options = exactDataObject(args[0], OPTION_KEYS, optionCode);
+  ensure(
+    callIntrinsic(isPostgresSerializableStore, undefined, [options.store]) ===
+      true,
+    optionCode,
+  );
+  const store = options.store;
+  const identity = objectFreeze({
+    providerId: canonicalOpaqueId(options.providerId, optionCode),
+    anchorId: canonicalOpaqueId(options.anchorId, optionCode),
+  });
+  const requestCode =
+    "invalid_postgres_filesystem_image_provider_state_authority_request";
+  const stateCode =
+    "postgres_filesystem_image_provider_state_authority_state_invalid";
+
+  const compareAndAdopt = async function compareAndAdopt(...adoptionArgs) {
+    ensure(adoptionArgs.length === 1, requestCode);
+    const input = normalizeAdoptionRequest(
+      adoptionArgs[0],
+      identity,
+      requestCode,
+    );
+    try {
+      return await runSerializable(store, async (transaction) =>
+        await compareAndAdoptInTransaction(
+          transaction,
+          identity,
+          input,
+          stateCode,
+        ),
+      );
+    } catch (error) {
+      if (
+        error instanceof PostgresSerializableStoreError &&
+        error.code === "transaction_commit_outcome_uncertain" &&
+        error.commitState === "uncertain"
+      ) {
+        return await resolveAdoptionCommitOutcome(
+          store,
+          identity,
+          input,
+          stateCode,
+        );
+      }
+      throw error;
+    }
+  };
+
+  objectFreeze(compareAndAdopt);
   return objectFreeze({
     contractVersion:
-      POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_AUTHORITY_CONTRACT_VERSION,
-    readHead,
-    readOperation,
-    readOperationsPage,
-    compareAndAdvance,
+      POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION,
+    compareAndAdopt,
   });
 }
 
 objectFreeze(PostgresFilesystemImageProviderStateAuthorityError.prototype);
 objectFreeze(PostgresFilesystemImageProviderStateAuthorityError);
 objectFreeze(createPostgresFilesystemImageProviderStateAuthority);
+objectFreeze(createPostgresFilesystemImageProviderStateRuntimeAuthority);
+objectFreeze(createPostgresFilesystemImageProviderStateAdoptionAuthority);

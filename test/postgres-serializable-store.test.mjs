@@ -76,6 +76,10 @@ const AUTHORITY_MIGRATION_URLS = Object.freeze([
     "../migrations/authority/010-filesystem-image-provider-operations.sql",
     import.meta.url,
   ),
+  new URL(
+    "../migrations/authority/011-filesystem-image-provider-state-v3-adoption.sql",
+    import.meta.url,
+  ),
 ]);
 
 class FakeClient {
@@ -2424,6 +2428,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   const stablePlanMigration = migrations[6];
   const imageProviderMigration = migrations[7];
   const stateGcMigration = migrations[8];
+  const operationIndexMigration = migrations[9];
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
     {},
@@ -2431,6 +2436,8 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
@@ -2526,12 +2533,17 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
     [9, stateGcMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[24], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[24], [operationIndexMigration.sql]);
   assert.deepEqual(migrationQueries[25], [
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
-    [10, latestMigration.checksum],
+    [10, operationIndexMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[26], ["COMMIT"]);
+  assert.deepEqual(migrationQueries[26], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[27], [
+    "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+    [11, latestMigration.checksum],
+  ]);
+  assert.deepEqual(migrationQueries[28], ["COMMIT"]);
   assert.deepEqual(client.queries.at(0), ["DISCARD ALL"]);
   assert.deepEqual(client.queries.at(-1), ["DISCARD ALL"]);
   assert.deepEqual(client.releaseCalls, [[]]);
@@ -2817,6 +2829,8 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.doesNotMatch(imageProviderMigration.sql, /\bsequence\b/u);
   assert.doesNotMatch(imageProviderMigration.sql, /jsonb/u);
+  {
+    const latestMigration = operationIndexMigration;
   for (const checksumColumn of [
     "base_head_checksum",
     "checkpoint_checksum",
@@ -3053,6 +3067,179 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     /CREATE TRIGGER filesystem_image_provider_operations_truncate_guard[\s\S]+BEFORE TRUNCATE ON session_authority\.filesystem_image_provider_operations[\s\S]+FOR EACH STATEMENT[\s\S]+EXECUTE FUNCTION session_authority\.reject_filesystem_image_provider_operation_truncate/u,
   );
   assert.doesNotMatch(latestMigration.sql, /\bjsonb\b|pgcrypto|\bdigest\s*\(/u);
+  }
+  assert.match(
+    latestMigration.sql,
+    /ADD COLUMN operation_index_adoption_id[\s\S]+ADD COLUMN operation_index_adoption_xid xid8/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /ADD COLUMN adoption_id character varying\(64\) COLLATE pg_catalog\."C"/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TABLE session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+retired_xid xid8,[\s\S]+PRIMARY KEY \(provider_id, anchor_id\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /INSERT INTO session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+SELECT provider_id, anchor_id, NULL[\s\S]+FROM session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_fs_image_anchor_lifecycle[\s\S]+TG_OP = 'INSERT'[\s\S]+NEW\.retired_xid IS NULL[\s\S]+pg_trigger_depth\(\) = 2[\s\S]+TG_OP = 'UPDATE'[\s\S]+OLD\.retired_xid IS NULL[\s\S]+NEW\.retired_xid = pg_current_xact_id\(\)[\s\S]+filesystem_image_provider_heads[\s\S]+filesystem_image_provider_operations[\s\S]+fs_image_anchor_lifecycle_immutable[\s\S]+BEFORE INSERT OR UPDATE OR DELETE[\s\S]+BEFORE TRUNCATE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_filesystem_image_provider_operation_delete[\s\S]+filesystem_image_provider_operations AS operation[\s\S]+UPDATE session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+SET retired_xid = pg_current_xact_id\(\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /claim_fs_image_anchor_lifecycle[\s\S]+INSERT INTO session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+ON CONFLICT \(provider_id, anchor_id\) DO UPDATE[\s\S]+RETURNING retired_xid INTO lifecycle_retired_xid[\s\S]+fs_image_head_retired[\s\S]+CREATE TRIGGER fs_image_heads_lifecycle_claim[\s\S]+AFTER INSERT ON session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.provider_id IS DISTINCT FROM OLD\.provider_id[\s\S]+NEW\.anchor_id IS DISTINCT FROM OLD\.anchor_id[\s\S]+fs_image_head_identity_immutable/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /retire_fs_image_anchor[\s\S]+SET retired_xid = pg_current_xact_id\(\)[\s\S]+CREATE TRIGGER fs_image_heads_retirement_guard[\s\S]+AFTER DELETE ON session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /reject_fs_image_head_truncate[\s\S]+fs_image_heads_truncate_forbidden[\s\S]+CREATE TRIGGER fs_image_heads_truncate_guard[\s\S]+BEFORE TRUNCATE ON session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /IF NOT FOUND THEN[\s\S]+filesystem_image_provider_anchor_lifecycle AS lifecycle[\s\S]+lifecycle\.retired_xid = pg_current_xact_id\(\)[\s\S]+fs_image_adoption_teardown/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /committed_checksum_provenance = 'unavailable-adopted-v2'[\s\S]+committed_checksum IS NULL[\s\S]+adoption_id IS NOT NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /head\.operation_index_adoption_xid = pg_current_xact_id\(\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE UNIQUE INDEX fs_image_operations_prepared_revision_uniq[\s\S]+prepared_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE UNIQUE INDEX fs_image_operations_committed_revision_uniq[\s\S]+committed_state_revision[\s\S]+WHERE state = 'committed'/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /fs_image_operations_revision_cross_unique[\s\S]+operation\.committed_state_revision = NEW\.prepared_state_revision[\s\S]+operation\.prepared_state_revision = NEW\.committed_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TABLE session_authority\.filesystem_image_provider_operation_events[\s\S]+PRIMARY KEY \(provider_id, anchor_id, event_revision\)[\s\S]+UNIQUE \(provider_id, anchor_id, operation_id, phase\)[\s\S]+FOREIGN KEY \(provider_id, anchor_id, operation_id\)[\s\S]+ON DELETE CASCADE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /INSERT INTO session_authority\.filesystem_image_provider_operation_events[\s\S]+SELECT provider_id, anchor_id, operation_id, 'prepared', prepared_state_revision[\s\S]+UNION ALL[\s\S]+SELECT provider_id, anchor_id, operation_id, 'committed', committed_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /validate_fs_image_existing_event_cover[\s\S]+coalesce\(sum\(1::numeric\), 0\)[\s\S]+operation_index_state_revision IS NOT NULL[\s\S]+operation_index_state_revision = 0[\s\S]+first_revision <> 1[\s\S]+last_revision <> head\.operation_index_state_revision[\s\S]+fs_image_operation_events_existing_cover/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_fs_image_operation_event[\s\S]+TG_OP = 'INSERT'[\s\S]+pg_trigger_depth\(\) = 2[\s\S]+NEW\.phase = 'prepared'[\s\S]+NEW\.phase = 'committed'[\s\S]+TG_OP = 'DELETE'[\s\S]+NOT EXISTS[\s\S]+fs_image_operation_events_immutable[\s\S]+BEFORE INSERT OR UPDATE OR DELETE[\s\S]+BEFORE TRUNCATE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /claim_fs_image_operation_events[\s\S]+TG_OP = 'INSERT'[\s\S]+NEW\.prepared_state_revision[\s\S]+NEW\.state = 'committed'[\s\S]+NEW\.committed_state_revision[\s\S]+CREATE TRIGGER fs_image_operations_event_claim[\s\S]+AFTER INSERT OR UPDATE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.prepared_state_revision <= head\.state_revision[\s\S]+NEW\.committed_state_revision <= head\.checkpoint_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /OLD\.contract_version = 2[\s\S]+NEW\.contract_version = 3[\s\S]+NEW\.checkpoint_state_revision = OLD\.state_revision[\s\S]+NEW\.operation_index_state_revision = OLD\.state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT fs_image_heads_stored_non_genesis[\s\S]+state_revision BETWEEN 1 AND 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.state_revision = 0[\s\S]+fs_image_head_initial_progress[\s\S]+OLD\.state_revision > 0[\s\S]+NEW\.state_revision > 0/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /OLD\.operation_index_adoption_xid = pg_current_xact_id\(\)[\s\S]+fs_image_head_adoption_same_xact_update/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /ADD COLUMN operation_index_progress_xid xid8[\s\S]+NEW\.operation_index_progress_xid IS NOT NULL[\s\S]+NEW\.operation_index_progress_xid := pg_current_xact_id\(\)[\s\S]+OLD\.operation_index_progress_xid = pg_current_xact_id\(\)[\s\S]+fs_image_head_same_xact_update[\s\S]+NEW\.operation_index_progress_xid IS DISTINCT FROM OLD\.operation_index_progress_xid[\s\S]+fs_image_head_progress_xid_managed/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.operation_index_state_revision IS NOT NULL[\s\S]+NEW\.anchor_revision = 1[\s\S]+NEW\.state_revision = 1[\s\S]+fs_image_head_initial_progress/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /OLD\.operation_index_state_revision IS NULL[\s\S]+fs_image_head_index_activation[\s\S]+NEW\.state_revision = OLD\.state_revision \+ 1[\s\S]+NEW\.frame_count = OLD\.frame_count \+ 1[\s\S]+NEW\.ledger_bytes > OLD\.ledger_bytes[\s\S]+NEW\.generation = OLD\.generation \+ 1[\s\S]+fs_image_head_incremental_progress/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE CONSTRAINT TRIGGER fs_image_heads_adoption_complete[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /validate_fs_image_head_progress[\s\S]+stored_head\.provider_id IS DISTINCT FROM NEW\.provider_id[\s\S]+stored_head\.operation_index_adoption_xid IS DISTINCT FROM NEW\.operation_index_adoption_xid[\s\S]+fs_image_head_progress_final[\s\S]+event\.event_revision = NEW\.state_revision[\s\S]+event\.phase = 'prepared'[\s\S]+operation\.prepared_checksum = NEW\.last_checksum[\s\S]+event\.phase = 'committed'[\s\S]+operation\.committed_checksum = NEW\.last_checksum[\s\S]+fs_image_head_append_event[\s\S]+CREATE CONSTRAINT TRIGGER fs_image_heads_progress_complete[\s\S]+AFTER INSERT OR UPDATE[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /coalesce\(sum\(1::numeric\), 0\)[\s\S]+GROUP BY revision[\s\S]+HAVING sum\(1::numeric\) <> 1/u,
+  );
+  assert.doesNotMatch(latestMigration.sql, /count\(\*\)/u);
+  assert.match(
+    latestMigration.sql,
+    /selected_mode = 1[\s\S]+operation\.adoption_id IS DISTINCT FROM selected_adoption_id[\s\S]+selected_mode = 0[\s\S]+operation\.adoption_id IS NOT NULL[\s\S]+committed_checksum_provenance[\s\S]+indexed-frame-v1/u,
+  );
+  for (const column of [
+    "provider_id",
+    "anchor_id",
+    "contract_version",
+    "anchor_revision",
+    "generation",
+    "state_revision",
+    "base_head_checksum",
+    "checkpoint_state_revision",
+    "checkpoint_frame_count",
+    "checkpoint_checksum",
+    "checkpoint_bytes",
+    "frame_count",
+    "last_checksum",
+    "ledger_bytes",
+    "operation_index_state_revision",
+    "operation_index_adoption_id",
+    "operation_index_adoption_xid",
+    "operation_index_progress_xid",
+  ]) {
+    assert.match(
+      latestMigration.sql,
+      new RegExp(
+        `stored_head\\.${column} IS DISTINCT FROM NEW\\.${column}`,
+        "u",
+      ),
+    );
+  }
+  const adoptionDdlIdentifiers = [
+    ...latestMigration.sql.matchAll(
+      /\b(?:(?:ADD|ALTER)\s+COLUMN|(?:(?:ADD|DROP)\s+)?CONSTRAINT|CREATE\s+(?:UNIQUE\s+)?INDEX|CREATE\s+(?:CONSTRAINT\s+)?TRIGGER|CREATE\s+(?:TABLE|FUNCTION))\s+(?:session_authority\.)?([A-Za-z_][A-Za-z0-9_]*)/gu,
+    ),
+  ].map((match) => match[1]);
+  for (const identifier of adoptionDdlIdentifiers) {
+    assert.ok(
+      Buffer.byteLength(identifier, "utf8") <= 63,
+      `PostgreSQL DDL identifier exceeds 63 bytes: ${identifier}`,
+    );
+  }
   assert.match(
     stateGcMigration.sql,
     /LOCK TABLE session_authority\.sessions IN EXCLUSIVE MODE;[\s\S]+LOCK TABLE session_authority\.operation_claims IN ACCESS EXCLUSIVE MODE;[\s\S]+writer_supervisor_state_owner_migration[\s\S]+launch\.kind = 'writer-launch-attempt-v1'[\s\S]+launch\.state IN \('starting', 'uncertain'\)[\s\S]+FROM session_authority\.sessions AS session[\s\S]+session\.document #> '\{launch\}' IS NOT NULL[\s\S]+session\.document #> '\{launch\}' <> 'null'::jsonb[\s\S]+writer_supervisor_state_owners_require_quiescent_launches[\s\S]+CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
@@ -3228,6 +3415,8 @@ test("migrate destroys a client when its post-COMMIT reset fails", async () => {
       {},
       {},
       {},
+      {},
+      {},
       COMMIT_RESULT,
     ],
     { resetSteps: [DISCARD_RESULT, resetFailure] },
@@ -3284,7 +3473,7 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v1 ledger through v10", async () => {
+test("migrate upgrades an exact v1 ledger through v11", async () => {
   const migrations = await readAuthorityMigrations();
   const firstMigration = migrations[0];
   const latestMigration = migrations.at(-1);
@@ -3301,6 +3490,8 @@ test("migrate upgrades an exact v1 ledger through v10", async () => {
         },
       ],
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -3371,6 +3562,11 @@ test("migrate upgrades an exact v1 ledger through v10", async () => {
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[8].version, migrations[8].checksum],
     ],
+    [migrations[9].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[9].version, migrations[9].checksum],
+    ],
     [latestMigration.sql],
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
@@ -3382,7 +3578,7 @@ test("migrate upgrades an exact v1 ledger through v10", async () => {
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v2 ledger through v10", async () => {
+test("migrate upgrades an exact v2 ledger through v11", async () => {
   const migrations = await readAuthorityMigrations();
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
@@ -3396,6 +3592,8 @@ test("migrate upgrades an exact v2 ledger through v10", async () => {
         version,
       })),
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -3458,6 +3656,11 @@ test("migrate upgrades an exact v2 ledger through v10", async () => {
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[8].version, migrations[8].checksum],
+    ],
+    [migrations[9].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[9].version, migrations[9].checksum],
     ],
     [latestMigration.sql],
     [
@@ -3628,7 +3831,7 @@ test("migrate rejects a future-only migration ledger", async () => {
     {},
     {},
     {},
-    { rows: [{ checksum: "0".repeat(64), version: 11 }] },
+    { rows: [{ checksum: "0".repeat(64), version: 12 }] },
     {},
   ]);
   const store = new PostgresSerializableStore({
@@ -3654,7 +3857,7 @@ test("migrate rejects an exact latest prefix accompanied by an extra version", a
     {
       rows: [
         ...migrations.map(({ checksum, version }) => ({ checksum, version })),
-        { checksum: "0".repeat(64), version: 11 },
+        { checksum: "0".repeat(64), version: 12 },
       ],
     },
     {},
@@ -3797,6 +4000,8 @@ test("migrate rejects a COMMIT acknowledgement that reports ROLLBACK", async () 
     {},
     {},
     {},
+    {},
+    {},
     { command: "ROLLBACK" },
   ]);
   const store = new PostgresSerializableStore({
@@ -3820,6 +4025,8 @@ test("migrate treats a failed COMMIT as uncertain and never reapplies", async ()
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
