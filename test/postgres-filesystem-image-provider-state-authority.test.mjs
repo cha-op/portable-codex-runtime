@@ -1107,6 +1107,59 @@ test("rejects hostile request objects and noncanonical operation records", async
   assert.equal(database.queries.length, 0);
 });
 
+test("rejects non-object operation payload roots before SQL", async () => {
+  const { authority, database } = createFixture();
+  const preparedChecksum = "a".repeat(64);
+  const preparedHead = appendHead(GENESIS, preparedChecksum, 128);
+  for (const request of [[], "primitive-request", null]) {
+    await assert.rejects(
+      authority.compareAndAdvance({
+        expectedHead: GENESIS,
+        nextHead: preparedHead,
+        transition: {
+          contractVersion: 1,
+          type: "append-prepared-v1",
+          frameChecksum: preparedChecksum,
+          record: {
+            ...preparedRecord({ checksum: preparedChecksum }),
+            request,
+          },
+        },
+      }),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+  }
+
+  const prepared = preparedRecord({ checksum: preparedChecksum });
+  const committedChecksum = "b".repeat(64);
+  const committedHead = appendHead(preparedHead, committedChecksum, 320);
+  for (const result of [null, []]) {
+    await assert.rejects(
+      authority.compareAndAdvance({
+        expectedHead: preparedHead,
+        nextHead: committedHead,
+        transition: {
+          contractVersion: 1,
+          type: "append-committed-v1",
+          frameChecksum: committedChecksum,
+          record: {
+            ...committedRecord(prepared, committedHead.stateRevision),
+            result,
+          },
+        },
+      }),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+  }
+  assert.equal(database.queries.length, 0);
+  assert.equal(database.heads.size, 0);
+  assert.equal(database.operations.size, 0);
+});
+
 test(
   "bounds dense array precursors before own-key enumeration",
   { concurrency: false },

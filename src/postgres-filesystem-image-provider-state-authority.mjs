@@ -403,11 +403,7 @@ function ensure(condition, code) {
   if (!condition) fail(code);
 }
 
-function inspectPlainObject(value, maximumKeys, code) {
-  ensure(
-    numberIsSafeIntegerIntrinsic(maximumKeys) && maximumKeys >= 0,
-    code,
-  );
+function assertPlainObjectShape(value, code) {
   ensure(
     value !== null &&
       typeof value === "object" &&
@@ -422,6 +418,14 @@ function inspectPlainObject(value, maximumKeys, code) {
     fail(code);
   }
   ensure(prototype === objectPrototype || prototype === null, code);
+}
+
+function inspectPlainObject(value, maximumKeys, code) {
+  ensure(
+    numberIsSafeIntegerIntrinsic(maximumKeys) && maximumKeys >= 0,
+    code,
+  );
+  assertPlainObjectShape(value, code);
   let keys;
   try {
     keys = reflectOwnKeys(value);
@@ -656,6 +660,10 @@ function canonicalize(
 }
 
 function canonicalObject(value, code) {
+  // The provider v2 ABI requires an object root. This constant-work shape
+  // check intentionally does not enumerate keys; canonicalize performs the
+  // sole bounded Reflect.ownKeys pass in its ordinary-object branch.
+  assertPlainObjectShape(value, code);
   return canonicalize(value, code);
 }
 
