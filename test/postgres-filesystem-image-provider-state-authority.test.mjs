@@ -607,8 +607,10 @@ class FakeAuthorityDatabase {
     this.forceOperationMutationMissOnce = false;
     this.attachmentOriginReadOverride = null;
     this.operationReadOverride = null;
+    this.operationStreamOverride = null;
     this.queries = [];
     this.releaseCalls = [];
+    this.streamRowsEmitted = 0;
   }
 
   createPool() {
@@ -624,12 +626,19 @@ class FakeAuthorityDatabase {
 class FakeAuthorityClient {
   constructor(database) {
     this.connection = new EventEmitter();
+    this.connection.sync = () => {};
     this.database = database;
     this.heads = null;
     this.operations = null;
   }
 
-  async query(...args) {
+  query(...args) {
+    const streamQuery =
+      typeof args[0] === "object" &&
+      args[0] !== null &&
+      args[0].queryMode === "extended" &&
+      args[0].rows === 1024 &&
+      typeof args[0].submit === "function";
     const text = typeof args[0] === "string" ? args[0] : args[0].text;
     const values = typeof args[0] === "string" ? args[1] : args[0].values;
     this.database.queries.push([text, values]);
@@ -688,7 +697,42 @@ class FakeAuthorityClient {
     if (
       text.includes("session_authority.filesystem_image_provider_operations")
     ) {
-      return this.#operationQuery(text, values);
+      if (streamQuery && this.database.operationStreamOverride !== null) {
+        const emitOverride = this.database.operationStreamOverride;
+        this.database.operationStreamOverride = null;
+        args[0].handleRowDescription({ fields: [] });
+        queueMicrotask(() => {
+          let rowCount = 0;
+          emitOverride((row) => {
+            rowCount += 1;
+            this.database.streamRowsEmitted += 1;
+            args[0].emit("row", row, args[0]._result);
+          });
+          args[0].handleCommandComplete(
+            { text: `SELECT ${rowCount}` },
+            this.connection,
+          );
+          args[0].handleReadyForQuery(this.connection);
+        });
+        return args[0];
+      }
+      const response = this.#operationQuery(text, values);
+      if (streamQuery) {
+        args[0].handleRowDescription({ fields: [] });
+        queueMicrotask(() => {
+          for (let index = 0; index < response.rows.length; index += 1) {
+            this.database.streamRowsEmitted += 1;
+            args[0].emit("row", response.rows[index], args[0]._result);
+          }
+          args[0].handleCommandComplete(
+            { text: `SELECT ${response.rows.length}` },
+            this.connection,
+          );
+          args[0].handleReadyForQuery(this.connection);
+        });
+        return args[0];
+      }
+      return response;
     }
     throw new Error(`unexpected fake query: ${text}`);
   }
@@ -846,6 +890,14 @@ class FakeAuthorityClient {
               row.anchor_id === values[1] &&
               operationIds.has(row.operation_id),
           )
+          .sort((left, right) =>
+            left.operation_id < right.operation_id
+              ? -1
+              : left.operation_id > right.operation_id
+                ? 1
+                : 0,
+          )
+          .slice(0, Number(values[3]))
           .map(copyOperationRow);
         return result("SELECT", rows);
       }
@@ -1738,6 +1790,146 @@ test("runtime projection keeps corrupt head markers and rows state-invalid", asy
     );
   });
 
+  await t.test("prepared limit-plus-one sentinel is state-invalid", async () => {
+    const fixture = createFixture();
+    const expectedHead = Object.freeze({
+      ...V3_GENESIS,
+      anchorRevision: "65535",
+      stateRevision: "65535",
+      frameCount: 65_535,
+      lastChecksum: "a".repeat(64),
+      ledgerBytes: 65_535,
+    });
+    fixture.database.heads.set(
+      identityKey("filesystem-image-ext4", "host-primary"),
+      headRow(expectedHead),
+    );
+    fixture.database.operationStreamOverride = (emitRow) => {
+      for (let index = 0; index <= 65_535; index += 1) {
+        const ordinal = String(index).padStart(5, "0");
+        emitRow(
+          storedPreparedOperationRow(
+            preparedRecord({
+              checksum: "b".repeat(64),
+              operationId: `operation-${ordinal}`,
+              revision: "1",
+              storageId: `storage-${ordinal}`,
+            }),
+          ),
+        );
+      }
+    };
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection({
+        attachmentOrigins: Object.freeze([]),
+        expectedHead,
+        preparedOperationCount: 0,
+        preparedProjectionChecksum: countedProjectionChecksum(
+          PREPARED_PROJECTION_DOMAIN,
+          [],
+        ),
+      }),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+    assert.equal(fixture.database.streamRowsEmitted, 65_536);
+    const query = fixture.database.queries.find(([text]) =>
+      text.includes("state = 'prepared'"),
+    );
+    assert.equal(query[1][2], "65536");
+  });
+
+  await t.test("prepared stream drains after a corrupt first row", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 5 });
+    const first = fixture.preparedOperations[0];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        first.operationId,
+      ),
+    ).prepared_record_sha256 = "f".repeat(64);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection(fixture.request),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+    assert.equal(fixture.database.streamRowsEmitted, 5);
+  });
+
+  await t.test("a later corrupt row outranks prepared mismatch", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 2 });
+    const later = fixture.preparedOperations[1];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        later.operationId,
+      ),
+    ).prepared_record_sha256 = "f".repeat(64);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        preparedProjectionChecksum: "e".repeat(64),
+      }),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+    assert.equal(fixture.database.streamRowsEmitted, 2);
+  });
+
+  await t.test("origin corruption outranks prepared checksum mismatch", async () => {
+    const fixture = projectionFixture();
+    const origin = fixture.attachmentOrigins[0];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        origin.operationId,
+      ),
+    ).committed_record_sha256 = "f".repeat(64);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        preparedProjectionChecksum: "e".repeat(64),
+      }),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+    assert.equal(
+      fixture.database.queries.filter(([text]) =>
+        text.includes("filesystem_image_provider_operations"),
+      ).length,
+      2,
+    );
+  });
+
+  await t.test("a streamed record above 4 MiB is state-invalid", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 1 });
+    const record = fixture.preparedOperations[0];
+    const row = copyOperationRow(
+      fixture.database.operations.get(
+        operationKey(
+          "filesystem-image-ext4",
+          "host-primary",
+          record.operationId,
+        ),
+      ),
+    );
+    row.prepared_record_bytes = Buffer.alloc(4 * 1024 * 1024 + 1, 0x20);
+    fixture.database.operationReadOverride = result("SELECT", [row]);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection(fixture.request),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+  });
+
   await t.test("later-batch corruption outranks an earlier mismatch", async () => {
     const fixture = projectionFixture({ originCount: 5, preparedCount: 0 });
     const laterOrigin = fixture.attachmentOrigins[4];
@@ -1818,13 +2010,15 @@ test("runtime projection trusts only the exact stored head for array bounds", as
     stateRevision: "65535",
     frameCount: 65_535,
   };
-  assert.equal(
-    await fixture.runtimeAuthority.compareProjection({
+  await assert.rejects(
+    fixture.runtimeAuthority.compareProjection({
       ...fixture.request,
       attachmentOrigins: hostileOrigins,
       expectedHead: forgedHead,
     }),
-    null,
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
   );
   assert.equal(proxyTrapCalls, 0);
   assert.equal(
@@ -1835,7 +2029,7 @@ test("runtime projection trusts only the exact stored head for array bounds", as
   );
 });
 
-test("runtime projection batches prepared and origin reads in one transaction", async () => {
+test("runtime projection streams prepared and origin reads once in one transaction", async () => {
   const fixture = projectionFixture({ originCount: 9, preparedCount: 9 });
   fixture.database.queries.length = 0;
   const receipt = await fixture.runtimeAuthority.compareProjection(
@@ -1857,18 +2051,67 @@ test("runtime projection batches prepared and origin reads in one transaction", 
         text.includes("state = 'prepared'") &&
         text.includes('ORDER BY storage_id COLLATE pg_catalog."C"'),
     ).length,
-    Math.ceil(fixture.preparedOperations.length / 4),
+    1,
   );
   const originQueries = fixture.database.queries.filter(([text]) =>
     text.includes("operation_id = ANY($3::text[])"),
   );
+  assert.equal(originQueries.length, 1);
+  assert.equal(originQueries[0][1][3], "10");
   assert.equal(
-    originQueries.length,
-    Math.ceil(fixture.attachmentOrigins.length / 4),
+    fixture.database.queries.filter(([text]) =>
+      text.startsWith("SELECT ") &&
+      (text.includes("filesystem_image_provider_heads") ||
+        text.includes("filesystem_image_provider_operations")),
+    ).length,
+    3,
   );
-  for (const [, values] of originQueries) {
-    assert.ok(values[2].slice(1, -1).split(",").length <= 4);
+});
+
+test("runtime projection holds SQL count fixed at 65,535 lightweight origins", async () => {
+  const fixture = createFixture();
+  const count = 65_535;
+  const expectedHead = Object.freeze({
+    ...V3_GENESIS,
+    anchorRevision: String(count),
+    stateRevision: String(count),
+    frameCount: count,
+    lastChecksum: "a".repeat(64),
+    ledgerBytes: count,
+  });
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(expectedHead),
+  );
+  const attachmentOrigins = new Array(count);
+  for (let index = 0; index < count; index += 1) {
+    const ordinal = String(index).padStart(5, "0");
+    attachmentOrigins[index] = Object.freeze({
+      currentStorageRevision: "1",
+      operationId: `operation-${ordinal}`,
+      stableStorageChecksum: "b".repeat(64),
+      storageId: `storage-${ordinal}`,
+    });
   }
+  Object.freeze(attachmentOrigins);
+  assert.equal(
+    await fixture.runtimeAuthority.compareProjection({
+      attachmentOrigins,
+      expectedHead,
+      preparedOperationCount: 0,
+      preparedProjectionChecksum: countedProjectionChecksum(
+        PREPARED_PROJECTION_DOMAIN,
+        [],
+      ),
+    }),
+    null,
+  );
+  const operationQueries = fixture.database.queries.filter(([text]) =>
+    text.includes("filesystem_image_provider_operations"),
+  );
+  assert.equal(operationQueries.length, 2);
+  assert.equal(operationQueries[0][1][2], "65536");
+  assert.equal(operationQueries[1][1][3], "65536");
 });
 
 test("runtime projection performs one prepared query for an empty set", async () => {
@@ -2058,6 +2301,17 @@ test("adoption bounds canonical material while rereading all database rows", asy
     ),
   );
   assert.notEqual(fixture.database.queries.length, 0);
+  assert.equal(
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes("filesystem_image_provider_operations") &&
+        text.includes('ORDER BY operation_id COLLATE pg_catalog."C"') &&
+        !text.includes("operation_id = ANY") &&
+        !text.includes("state = 'prepared'"),
+    ).length,
+    1,
+  );
+  assert.equal(fixture.database.streamRowsEmitted, fixture.operations.length);
 });
 
 test("atomically adopts complete legacy history and is idempotent", async () => {
@@ -2065,6 +2319,19 @@ test("atomically adopts complete legacy history and is idempotent", async () => 
   assert.equal(
     await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
     true,
+  );
+  const adoptionScans = () =>
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes("filesystem_image_provider_operations") &&
+        text.includes('ORDER BY operation_id COLLATE pg_catalog."C"') &&
+        !text.includes("operation_id = ANY") &&
+        !text.includes("state = 'prepared'"),
+    );
+  assert.equal(adoptionScans().length, 2);
+  assert.deepEqual(
+    adoptionScans().map(([, values]) => values[2]),
+    ["65536", "65536"],
   );
   const storedHead = fixture.database.heads.get(
     identityKey("filesystem-image-ext4", "host-primary"),
@@ -2092,6 +2359,7 @@ test("atomically adopts complete legacy history and is idempotent", async () => 
     await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
     true,
   );
+  assert.equal(adoptionScans().length, 3);
   assert.deepEqual(
     await fixture.runtimeAuthority.readOperation({
       expectedHead: fixture.nextHead,
@@ -2196,6 +2464,88 @@ test("adoption imports fixed-size batches and rejects a cross-batch revision hol
   assert.equal(invalid.database.queries.length, 0);
 });
 
+test("adoption source stream drains semantic mismatch through later corruption", async () => {
+  const fixture = preparedBatchAdoptionFixture(2);
+  for (let index = 0; index < fixture.operations.length; index += 1) {
+    const record = fixture.operations[index];
+    fixture.database.operations.set(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        record.operationId,
+      ),
+      storedPreparedOperationRow(record),
+    );
+  }
+  fixture.database.operations.get(
+    operationKey(
+      "filesystem-image-ext4",
+      "host-primary",
+      fixture.operations[1].operationId,
+    ),
+  ).prepared_record_sha256 = "f".repeat(64);
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.equal(fixture.database.streamRowsEmitted, 2);
+  assert.equal(
+    fixture.database.queries.filter(([text]) =>
+      text.includes("filesystem_image_provider_operations") &&
+      text.includes('ORDER BY operation_id COLLATE pg_catalog."C"'),
+    ).length,
+    1,
+  );
+});
+
+test("adoption target stream compares input directly and drains later corruption", async () => {
+  const fixture = preparedBatchAdoptionFixture();
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    true,
+  );
+  fixture.database.queries.length = 0;
+  fixture.database.streamRowsEmitted = 0;
+  const firstKey = operationKey(
+    "filesystem-image-ext4",
+    "host-primary",
+    fixture.operations[0].operationId,
+  );
+  const first = fixture.database.operations.get(firstKey);
+  const mismatched = storedPreparedOperationRow(
+    preparedRecord({
+      operationId: "operation-000",
+      revision: "1",
+      storageId: fixture.operations[0].storageId,
+    }),
+  );
+  mismatched.adoption_id = first.adoption_id;
+  fixture.database.operations.set(firstKey, mismatched);
+  fixture.database.operations.get(
+    operationKey(
+      "filesystem-image-ext4",
+      "host-primary",
+      fixture.operations[fixture.operations.length - 1].operationId,
+    ),
+  ).prepared_record_sha256 = "f".repeat(64);
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.equal(fixture.database.streamRowsEmitted, fixture.operations.length);
+  assert.equal(
+    fixture.database.queries.filter(([text]) =>
+      text.includes("filesystem_image_provider_operations") &&
+      text.includes('ORDER BY operation_id COLLATE pg_catalog."C"'),
+    ).length,
+    1,
+  );
+});
+
 test("adopts an already indexed v2 source without rewriting rows", async () => {
   const fixture = createFixture();
   const prepared = await appendPrepared(fixture.authority, GENESIS);
@@ -2229,6 +2579,16 @@ test("adopts an already indexed v2 source without rewriting rows", async () => {
       operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
     ),
     before,
+  );
+  assert.equal(
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes("filesystem_image_provider_operations") &&
+        text.includes('ORDER BY operation_id COLLATE pg_catalog."C"') &&
+        !text.includes("operation_id = ANY") &&
+        !text.includes("state = 'prepared'"),
+    ).length,
+    2,
   );
 });
 

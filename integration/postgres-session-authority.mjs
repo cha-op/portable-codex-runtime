@@ -637,6 +637,8 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     `operation-index-revision-race-${randomUUID()}`;
   const progressValidationAnchorId =
     `operation-index-progress-validation-${randomUUID()}`;
+  const streamingAdoptionAnchorId =
+    `operation-index-streaming-adoption-${randomUUID()}`;
   const createHeadAnchor = (selectedStore, selectedAnchorId) =>
     createPostgresFilesystemImageProviderHeadAnchor({
       store: selectedStore,
@@ -2820,8 +2822,9 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     }),
     { operations: [], nextAfterStorageId: null },
   );
-  const projectionOriginOperationId =
-    `provider-operation-projection-origin-${randomUUID()}`;
+  // Exercise the quoted text[] representation; unquoted NULL is an array
+  // null sentinel in PostgreSQL rather than this legal opaque operation ID.
+  const projectionOriginOperationId = "NULL";
   const projectionOriginPreparedHead = appendHead(
     indexedCutHead,
     "1".repeat(64),
@@ -2982,6 +2985,89 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   assert.deepEqual(
     await readProviderAnchorSnapshot(anchorId),
     projectionSnapshot,
+  );
+
+  // Cross the store's 1,024-row portal fetch boundary with small records.
+  const streamingOperationCount = 1_025;
+  const streamingOperations = [];
+  for (let index = 0; index < streamingOperationCount; index += 1) {
+    const ordinal = String(index + 1).padStart(4, "0");
+    streamingOperations.push(
+      preparedRecord({
+        checksum: "6".repeat(64),
+        operationId: `provider-operation-streaming-${ordinal}`,
+        revision: String(index + 1),
+        storageId: `provider-storage-streaming-${ordinal}`,
+      }),
+    );
+  }
+  const streamingExpectedHead = {
+    ...genesis,
+    anchorRevision: String(streamingOperationCount),
+    stateRevision: String(streamingOperationCount),
+    frameCount: streamingOperationCount,
+    lastChecksum: "6".repeat(64),
+    ledgerBytes: streamingOperationCount,
+  };
+  assert.equal(
+    (
+      await pool.query(
+        rawHeadInsertQuery,
+        rawHeadInsertValues(
+          streamingAdoptionAnchorId,
+          streamingExpectedHead,
+          null,
+        ),
+      )
+    ).rowCount,
+    1,
+  );
+  const streamingCutHead = {
+    ...rotationHead(streamingExpectedHead),
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    checkpointBytes: streamingOperationCount * 256,
+    checkpointFrameCount: streamingOperationCount + 2,
+  };
+  assert.equal(
+    await createAdoptionAuthority(
+      store,
+      streamingAdoptionAnchorId,
+    ).compareAndAdopt({
+      expectedHead: streamingExpectedHead,
+      nextHead: streamingCutHead,
+      operations: streamingOperations,
+      storages: [],
+    }),
+    true,
+  );
+  const streamingProjectionRequest = {
+    attachmentOrigins: Object.freeze([]),
+    expectedHead: streamingCutHead,
+    preparedOperationCount: streamingOperationCount,
+    preparedProjectionChecksum: projectionChecksum(
+      "portable-codex/filesystem-image-provider-state/prepared-projection/v1\0",
+      streamingOperations,
+    ),
+  };
+  assert.deepEqual(
+    await createRuntimeAuthority(
+      store,
+      streamingAdoptionAnchorId,
+    ).compareProjection(streamingProjectionRequest),
+    projectionReceipt(streamingProjectionRequest),
+  );
+  assert.equal(
+    (
+      await pool.query(
+        [
+          "SELECT pg_catalog.count(*)::pg_catalog.int4 AS operation_count",
+          "FROM session_authority.filesystem_image_provider_operations",
+          "WHERE provider_id = $1 AND anchor_id = $2",
+        ].join(" "),
+        [providerId, streamingAdoptionAnchorId],
+      )
+    ).rows[0].operation_count,
+    streamingOperationCount,
   );
 
   const concurrentAuthority = createAuthority(
@@ -4528,7 +4614,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     await cleanup.query(
       [
         "DELETE FROM session_authority.filesystem_image_provider_operations",
-        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
       ].join(" "),
       [
         providerId,
@@ -4541,12 +4627,13 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
         concurrentAdoptionAnchorId,
         lifecycleRaceAnchorId,
         revisionRaceAnchorId,
+        streamingAdoptionAnchorId,
       ],
     );
     await cleanup.query(
       [
         "DELETE FROM session_authority.filesystem_image_provider_heads",
-        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
       ].join(" "),
       [
         providerId,
@@ -4559,6 +4646,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
         concurrentAdoptionAnchorId,
         lifecycleRaceAnchorId,
         revisionRaceAnchorId,
+        streamingAdoptionAnchorId,
       ],
     );
     await cleanup.query("COMMIT");

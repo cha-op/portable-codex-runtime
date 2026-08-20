@@ -1,5 +1,7 @@
 import { EventEmitter } from "node:events";
 
+import PinnedPgQuery from "pg/lib/query.js";
+
 const PromiseConstructor = Promise;
 const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApply = Reflect.apply;
@@ -50,6 +52,7 @@ const state = {
 };
 
 export class DatabaseError extends Error {}
+export { PinnedPgQuery as Query };
 
 function textOf(query) {
   return typeof query === "string" ? query : query?.text;
@@ -164,6 +167,9 @@ export class Client extends EventEmitter {
   constructor(pool) {
     super();
     this.connection = new EventEmitter();
+    this.connection.execute = () => undefined;
+    this.connection.flush = () => undefined;
+    this.connection.sync = () => undefined;
     this.doneCalls = [];
     this.pool = pool;
     this.probeLockKeys = [];
@@ -174,6 +180,16 @@ export class Client extends EventEmitter {
   }
 
   query(query, values, callback) {
+    if (
+      query !== null &&
+      typeof query === "object" &&
+      query.queryMode === "extended" &&
+      query.rows === 1024 &&
+      typeof query.submit === "function" &&
+      typeof query.callback !== "function"
+    ) {
+      return this.#queryRows(query);
+    }
     if (
       typeof query === "object" &&
       query !== null &&
@@ -225,6 +241,40 @@ export class Client extends EventEmitter {
     if (positionalCallback === null) return PromiseConstructor.resolve(marked);
     positionalCallback(null, marked);
     return undefined;
+  }
+
+  #queryRows(query) {
+    const finish = (result) => {
+      const rows = Array.isArray(result?.rows) ? result.rows : [];
+      query.handleRowDescription({ fields: [] });
+      for (let index = 0; index < rows.length; index += 1) {
+        query.emit("row", rows[index], query._result);
+      }
+      query.handleCommandComplete(
+        { text: `SELECT ${rows.length}` },
+        this.connection,
+      );
+      query.handleReadyForQuery(this.connection);
+    };
+    const fail = (error) => {
+      if (error instanceof DatabaseError) {
+        this.connection.emit("errorMessage", error);
+      }
+      query.handleError(error, this.connection);
+    };
+    let result;
+    try {
+      result = this.#queryResult(query.text, query.values);
+    } catch (error) {
+      fail(error);
+      return query;
+    }
+    if (result instanceof PromiseConstructor) {
+      reflectApply(promiseThenIntrinsic, result, [finish, fail]);
+    } else {
+      finish(result);
+    }
+    return query;
   }
 
   #queryCallback(query) {

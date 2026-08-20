@@ -472,9 +472,10 @@ the same transaction.
 
 Cold version 3 load builds a compact projection summary from the complete local
 prepared set and every attached storage origin. The contract-version-3 runtime
-authority verifies the exact head and completeness marker, independently pages
-and normalizes every PostgreSQL prepared row, and batches committed origin
-reads in one serializable transaction. Every origin must be a committed
+authority verifies the exact head and completeness marker, then independently
+streams and fully normalizes every PostgreSQL prepared row and committed origin
+in one serializable transaction. It accumulates no operation payloads and does
+not issue per-row or per-page SQL. Every origin must be a committed
 `attach` or `restore-attach` whose storage state equals the current state after
 normalizing only the legal monotonic revision increase. It returns a
 domain-separated receipt only when both projections match. The provider reuses

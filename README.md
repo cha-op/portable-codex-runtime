@@ -652,10 +652,11 @@ storage record, destroyed tombstones, and the live prepared recovery working
 set, but no committed history. Arbitrary-age committed replay comes from the
 index. Cold open sends a compact, domain-separated projection summary to the
 runtime authority. In one serializable snapshot, that authority independently
-pages every prepared row, batches attached-storage origin reads, and returns a
-receipt only when both PostgreSQL projections exactly match. The provider
-caches that receipt only for the same authority instance, exact head, and
-unchanged loaded generation; an acknowledgement-loss readback or adoption
+streams and fully normalizes every prepared row and attached-storage origin,
+without accumulating operation payloads or issuing per-row or per-page SQL,
+and returns a receipt only when both PostgreSQL projections exactly match. The
+provider caches that receipt only for the same authority instance, exact head,
+and unchanged loaded generation; an acknowledgement-loss readback or adoption
 requires a fresh comparison. Each operation append
 compares the complete canonical `storageStateBefore` with the latest committed
 PostgreSQL projection in the same serializable transaction. Native commits use

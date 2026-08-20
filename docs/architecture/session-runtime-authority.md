@@ -2588,7 +2588,9 @@ only that transaction may import tagged rows or write
 stored head with that exact rotation and proves that the union of prepared and
 committed revisions contains every integer from one through the checkpoint
 boundary exactly once. Head-only, partial, duplicate, extra, cross-manifest,
-or later-transaction writes roll back.
+or later-transaction writes roll back. Already-indexed source and target
+history are each revalidated with one ordered row stream; only the legacy
+history import retains fixed 64-row write batches.
 
 The version 3 runtime authority has the exact frozen surface
 `{ contractVersion: 3, readHead, readOperation, readOperationsPage,
@@ -2596,12 +2598,13 @@ readPreparedOperationsPage, compareProjection, compareAndAdvance }`.
 `compareProjection()` accepts the exact head, the count and domain-separated
 digest of all locally loaded prepared records, and storage-sorted attachment
 origin summaries. In one serializable transaction it validates the exact head
-and completeness marker, independently scans and fully normalizes every
-prepared row in bounded four-record pages, and reads attached origin operations
-in batches of at most four. Each origin must be a committed `attach` or
+and completeness marker, then independently streams and fully normalizes every
+prepared row and named attached-origin operation through bounded one-row
+processing. It accumulates no operation payloads and issues no per-row or
+per-page SQL. Each origin must be a committed `attach` or
 `restore-attach` for the named storage; its complete canonical storage state
 must equal the current state after normalizing only a legal monotonic revision
-increase. The prepared scan and origin batch use separate length-prefixed
+increase. The prepared and origin streams use separate length-prefixed
 projection digests, and the authority returns a domain-separated receipt only
 when both equal the caller's projection under that exact head. A mismatch
 returns no receipt; corrupt authority material remains state-invalid.
@@ -2611,9 +2614,19 @@ for the exact unchanged loaded generation and head. A definite normal append
 or rotation obtains the receipt for its new head before publishing the next
 cache. A cold parse, version 2 adoption, or acknowledgement-loss readback does
 not infer the receipt and must run a new comparison. Thus projection validation
-uses one serializable transaction rather than one transaction per prepared
-page or attachment, while the SQL statement count remains bounded by the
-working-set page and batch counts. Normal version 3 appends keep
+uses one serializable transaction and at most three data `SELECT` statements:
+one exact-head read, one prepared-row stream, and one attached-origin stream.
+The store rechecks transaction identity once after each statement. Streaming
+keeps database operation material bounded to one fully validated row at a time,
+and statement count is independent of prepared and attachment working-set
+cardinality. This path is bound to the repository-pinned `pg@8.22.0` extended
+query portal with 1,024-row fetches. Completion requires one `RowDescription`,
+one `SELECT` command completion, an exact streamed row count, no accumulated
+`Result.rows`, and the transaction-identity recheck. A server `ErrorResponse`
+on that portal sends exactly one protocol `Sync`, waits for `ReadyForQuery`,
+and only then permits the queued rollback. A client-side query timeout or a
+failed protocol sync destroys the dedicated connection instead of queueing a
+rollback behind an unrecoverable active query. Normal version 3 appends keep
 `indexed-frame-v1`; arbitrary-age reads come from the permanent index. An
 adopted prepared row may later acquire a native indexed suffix.
 

@@ -529,11 +529,12 @@
   prepared recovery working set; committed history is no longer copied across
   rotation. The contract-version-3 runtime authority validates one compact
   projection request in a single serializable transaction: it independently
-  pages the complete prepared set, batches committed attachment-origin reads,
-  and returns a domain-separated receipt only for an exact match. The provider
-  reuses that receipt only for the same authority instance, exact head, and
-  unchanged loaded generation; uncertain acknowledgement and adoption paths
-  require fresh validation.
+  streams and fully normalizes the complete prepared set and committed
+  attachment origins without accumulating operation payloads or issuing
+  per-row or per-page SQL, and returns a domain-separated receipt only for an
+  exact match. The provider reuses that receipt only for the same authority
+  instance, exact head, and unchanged loaded generation; uncertain
+  acknowledgement and adoption paths require fresh validation.
   A provider-locked version 2 adoption replays revisions `1..N`, proves storage
   lineage and final projection, durably writes the covering version 3 files,
   and then imports or verifies the complete PostgreSQL history in the same
@@ -777,8 +778,8 @@
   registry trust. Terminal supervisor-state GC safety after PostgreSQL terminal
   commit is complete for both healthy-session callback quiescence and exact
   same-authorization session-loss overlap. The provider operation-index
-  authority foundation is complete; the next independent slice switches the
-  provider to version 3 by atomically importing the complete version 2 history
-  and setting the covering head's completeness marker. It must preserve every
-  current attachment's origin operation while removing permanent operation
-  history from local checkpoints.
+  authority, atomic version 2-to-3 adoption, current attachment-origin binding,
+  and committed-history removal from local checkpoints are complete. The next
+  provider-state capacity slice is a streaming or paged adoption contract for
+  otherwise-valid version 2 state beyond the current 65,535-operation,
+  65,535-storage, or 64 MiB full-array adoption limits.

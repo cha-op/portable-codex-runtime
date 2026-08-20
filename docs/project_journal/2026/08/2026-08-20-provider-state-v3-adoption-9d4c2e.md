@@ -56,20 +56,29 @@ superseded_by:
 - Legacy null-marker adoption requires an initially empty operation index and
   imports every row in fixed 64-row batches. An already-indexed version 2 head
   requires the complete existing rows to equal the validated candidate and
-  changes only the head contract. Native version 3 writes continue to use
-  `indexed-frame-v1`; an adopted prepared prefix may later receive that native
-  committed suffix.
+  changes only the head contract; its source and target history are each
+  revalidated through one ordered row stream. Native version 3 writes continue
+  to use `indexed-frame-v1`; an adopted prepared prefix may later receive that
+  native committed suffix.
 - `createPostgresFilesystemImageProviderStateRuntimeAuthority()` has the exact
-  contract-version-3 surface needed for version 3 reads, bounded complete
+  contract-version-3 surface needed for version 3 reads, bounded diagnostic
   prepared paging, compact projection comparison, and normal
   head-plus-operation transitions. The older
   contract-version-1 authority and two-method head anchor remain explicit
   version 2 compatibility paths rather than silently changing their genesis.
 - Cold version 3 load computes compact domain-separated summaries for all local
   prepared records and attached-storage origins. In one serializable
-  transaction, PostgreSQL independently pages and normalizes the complete
-  prepared set, batches each named committed `attach` or `restore-attach`
-  origin, and returns a receipt only for an exact match under the exact head.
+  transaction, PostgreSQL independently streams and fully normalizes the
+  complete prepared set and each named committed `attach` or `restore-attach`
+  origin through at most three data `SELECT` statements, without accumulating
+  operation payloads or issuing per-row or per-page SQL. It returns a receipt
+  only for an exact match under the exact head. The repository-pinned
+  `pg@8.22.0` portal fetches 1,024 rows at a time; the store accepts completion
+  only after exact `SELECT` command, row-count, empty-result-accumulator, and
+  transaction-identity checks. A server `ErrorResponse` sends one protocol
+  `Sync` before rollback waits for `ReadyForQuery`; a client-side query timeout
+  or failed sync instead destroys the dedicated connection so rollback cannot
+  remain queued behind an unrecoverable active query.
   The provider caches that receipt only for the same authority instance, head,
   and unchanged loaded generation; cold reparsing, adoption, and uncertain
   acknowledgement readback revalidate it. Arbitrary-age `readOperation()`

@@ -3,6 +3,10 @@ import { spawn } from "node:child_process";
 import { once } from "node:events";
 import test from "node:test";
 
+import { Query as PinnedPgQuery } from "pg";
+
+import { Query as FixturePgQuery } from "./fixtures/postgres-deployment/fake-pg.mjs";
+
 const REGISTER = new URL(
   "./fixtures/postgres-deployment/register-pg-hook.mjs",
   import.meta.url,
@@ -48,6 +52,20 @@ const SCENARIOS = Object.freeze([
   "verify-full-tls-configuration",
 ]);
 const MAX_OUTPUT_BYTES = 64 * 1024;
+
+test("PostgreSQL deployment fixture exports the pinned pg Query", () => {
+  assert.equal(FixturePgQuery, PinnedPgQuery);
+  const query = new FixturePgQuery({
+    queryMode: "extended",
+    rows: 1024,
+    text: "SELECT 1",
+    values: [],
+  });
+  assert.equal(query.queryMode, "extended");
+  assert.equal(query.rows, 1024);
+  assert.equal(typeof query.handleReadyForQuery, "function");
+  assert.equal(typeof query.submit, "function");
+});
 
 function childLoaderArguments() {
   const [major, minor] = process.versions.node

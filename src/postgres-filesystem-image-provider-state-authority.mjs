@@ -12,6 +12,7 @@ import {
 import {
   PostgresSerializableStoreError,
   PostgresSerializableStore,
+  consumePostgresSerializableTransactionRows,
   isPostgresSerializableStore,
 } from "./postgres-serializable-store.mjs";
 
@@ -319,11 +320,27 @@ const READ_PREPARED_PAGE_AFTER_QUERY = [
   'ORDER BY storage_id COLLATE pg_catalog."C"',
   "LIMIT $4::pg_catalog.int4",
 ].join(" ");
+const READ_ALL_PREPARED_OPERATIONS_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.filesystem_image_provider_operations",
+  "WHERE provider_id = $1 AND anchor_id = $2 AND state = 'prepared'",
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $3::pg_catalog.int4",
+].join(" ");
 const READ_ATTACHMENT_ORIGINS_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
   "FROM session_authority.filesystem_image_provider_operations",
   "WHERE provider_id = $1 AND anchor_id = $2",
   "AND operation_id = ANY($3::text[])",
+  'ORDER BY operation_id COLLATE pg_catalog."C"',
+  "LIMIT $4::pg_catalog.int4",
+].join(" ");
+const READ_ALL_OPERATIONS_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.filesystem_image_provider_operations",
+  "WHERE provider_id = $1 AND anchor_id = $2",
+  'ORDER BY operation_id COLLATE pg_catalog."C"',
+  "LIMIT $3::pg_catalog.int4",
 ].join(" ");
 const READ_LATEST_COMMITTED_STORAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
@@ -962,6 +979,7 @@ function postgresTextArrayLiteral(values) {
   // canonicalOpaqueId excludes every PostgreSQL array delimiter and escape
   // character. Quote each value so the otherwise-valid ID "NULL" remains
   // text instead of PostgreSQL array syntax's unquoted SQL NULL sentinel.
+  if (values.length === 0) return "{}";
   return `{"${callIntrinsic(arrayJoinIntrinsic, values, ['","'])}"}`;
 }
 
@@ -2154,31 +2172,34 @@ async function comparePreparedProjectionInTransaction(
     PREPARED_PROJECTION_DOMAIN,
     expectedCount,
   );
-  let afterStorageId = null;
   let observedCount = 0;
-  for (;;) {
-    const page = await readPreparedOperationsPageInTransaction(
-      transaction,
-      identity,
-      objectFreeze({
-        afterStorageId,
-        expectedSnapshot,
-        limit: MAX_PAGE_SIZE,
-      }),
-      code,
-    );
-    for (let index = 0; index < page.operations.length; index += 1) {
+  let previousStorageId = null;
+  await consumePostgresSerializableTransactionRows(
+    transaction,
+    READ_ALL_PREPARED_OPERATIONS_QUERY,
+    [
+      identity.providerId,
+      identity.anchorId,
+      StringConstructor(MAX_ADOPTION_OPERATIONS + 1),
+    ],
+    (row) => {
+      const material = normalizeOperationRow(row, identity, code);
+      assertOperationVisibleAtHead(material, expectedSnapshot, code);
+      const record = material.record;
       observedCount += 1;
-      ensure(observedCount <= structuralBound, code);
-      const bytes = bufferFrom(
-        canonicalString(page.operations[index]),
-        "utf8",
+      ensure(
+        record.state === "prepared" &&
+          observedCount <= MAX_ADOPTION_OPERATIONS &&
+          observedCount <= structuralBound &&
+          (previousStorageId === null ||
+            record.storageId > previousStorageId),
+        code,
       );
+      previousStorageId = record.storageId;
+      const bytes = bufferFrom(canonicalString(record), "utf8");
       updateLengthPrefixedBytes(hash, bytes);
-    }
-    if (page.nextAfterStorageId === null) break;
-    afterStorageId = page.nextAfterStorageId;
-  }
+    },
+  );
   const checksum = callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
   if (observedCount !== expectedCount || checksum !== expectedChecksum) {
     return null;
@@ -2203,88 +2224,85 @@ function normalizeAttachmentOrigin(value, code) {
   });
 }
 
+function normalizeAttachmentOrigins(value, code) {
+  const count = frozenDenseDataArrayLength(
+    value,
+    MAX_ADOPTION_OPERATIONS,
+    code,
+  );
+  const hash = beginCountedProjectionHash(
+    ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
+    count,
+  );
+  const byOperationId = new MapConstructor();
+  const operationIds = [];
+  let previousStorageId = null;
+  for (let index = 0; index < count; index += 1) {
+    const origin = normalizeAttachmentOrigin(
+      ownDataValue(value, StringConstructor(index), code),
+      code,
+    );
+    ensure(
+      (previousStorageId === null || origin.storageId > previousStorageId) &&
+        !mapHas(byOperationId, origin.operationId),
+      code,
+    );
+    previousStorageId = origin.storageId;
+    mapSet(byOperationId, origin.operationId, origin);
+    arrayPush(operationIds, origin.operationId);
+    updateLengthPrefixedBytes(
+      hash,
+      bufferFrom(canonicalString(origin), "utf8"),
+    );
+  }
+  objectFreeze(operationIds);
+  return objectFreeze({
+    byOperationId,
+    checksum: callIntrinsic(hashDigestIntrinsic, hash, ["hex"]),
+    count,
+    postgresOperationIds: postgresTextArrayLiteral(operationIds),
+  });
+}
+
 async function compareAttachmentOriginsInTransaction(
   transaction,
   identity,
   expectedSnapshot,
   origins,
-  originCount,
-  requestCode,
   stateCode,
 ) {
-  const hash = beginCountedProjectionHash(
-    ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
-    originCount,
-  );
-  const operationIds = new SetConstructor();
-  let previousStorageId = null;
+  let observedCount = 0;
+  let previousOperationId = null;
   let projectionMismatch = false;
-  for (let offset = 0; offset < originCount; offset += MAX_PAGE_SIZE) {
-    const batch = [];
-    const batchOperationIds = [];
-    const batchEnd = mathMinIntrinsic(offset + MAX_PAGE_SIZE, originCount);
-    for (let index = offset; index < batchEnd; index += 1) {
-      const origin = normalizeAttachmentOrigin(
-        ownDataValue(origins, StringConstructor(index), requestCode),
-        requestCode,
-      );
-      ensure(
-        (previousStorageId === null ||
-          origin.storageId > previousStorageId) &&
-          !callIntrinsic(setHasIntrinsic, operationIds, [origin.operationId]),
-        requestCode,
-      );
-      previousStorageId = origin.storageId;
-      callIntrinsic(setAddIntrinsic, operationIds, [origin.operationId]);
-      arrayPush(batch, origin);
-      arrayPush(batchOperationIds, origin.operationId);
-    }
-    const result = await queryTransaction(
-      transaction,
-      READ_ATTACHMENT_ORIGINS_QUERY,
-      [
-        identity.providerId,
-        identity.anchorId,
-        postgresTextArrayLiteral(batchOperationIds),
-      ],
-      stateCode,
-    );
-    const rows = rowsFromResult(
-      result,
-      "SELECT",
-      MAX_PAGE_SIZE,
-      stateCode,
-    );
-    const materials = new MapConstructor();
-    let mismatch = rows.length !== batch.length;
-    for (let index = 0; index < rows.length; index += 1) {
-      const material = normalizeOperationRow(
-        rows[index],
-        identity,
-        stateCode,
-      );
+  await consumePostgresSerializableTransactionRows(
+    transaction,
+    READ_ATTACHMENT_ORIGINS_QUERY,
+    [
+      identity.providerId,
+      identity.anchorId,
+      origins.postgresOperationIds,
+      StringConstructor(origins.count + 1),
+    ],
+    (row) => {
+      const material = normalizeOperationRow(row, identity, stateCode);
       assertOperationVisibleAtHead(material, expectedSnapshot, stateCode);
       const operationId = material.record.operationId;
+      observedCount += 1;
       if (
-        !arrayIncludes(batchOperationIds, operationId) ||
-        mapHas(materials, operationId)
+        previousOperationId !== null && operationId <= previousOperationId
       ) {
-        mismatch = true;
-      } else {
-        mapSet(materials, operationId, material);
+        projectionMismatch = true;
       }
-    }
-    for (let index = 0; index < batch.length; index += 1) {
-      const origin = batch[index];
-      const material = mapGet(materials, origin.operationId);
-      if (material === undefined) {
-        mismatch = true;
-        continue;
+      previousOperationId = operationId;
+      const origin = mapGet(origins.byOperationId, operationId);
+      if (origin === undefined) {
+        projectionMismatch = true;
+        return;
       }
       const record = material.record;
       if (
         record.state !== "committed" ||
-        !arrayIncludes(["attach", "restore-attach"], record.kind) ||
+        (record.kind !== "attach" && record.kind !== "restore-attach") ||
         record.operationId !== origin.operationId ||
         record.storageId !== origin.storageId ||
         BigIntConstructor(record.storageState.revision) >
@@ -2292,16 +2310,13 @@ async function compareAttachmentOriginsInTransaction(
         stableStorageProjectionChecksum(record.storageState, stateCode) !==
           origin.stableStorageChecksum
       ) {
-        mismatch = true;
-        continue;
+        projectionMismatch = true;
       }
-      const bytes = bufferFrom(canonicalString(origin), "utf8");
-      updateLengthPrefixedBytes(hash, bytes);
-    }
-    if (mismatch) projectionMismatch = true;
-  }
+    },
+  );
+  if (observedCount !== origins.count) projectionMismatch = true;
   if (projectionMismatch) return null;
-  return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+  return origins.checksum;
 }
 
 async function readLatestCommittedStorageStateInTransaction(
@@ -2758,36 +2773,38 @@ function adoptionHeadValues(identity, input, sourceMarker) {
   ];
 }
 
-async function readAllOperationMaterialsInTransaction(
+function operationMaterialsEqual(left, right) {
+  return (
+    left.record.operationId === right.record.operationId &&
+    left.sha256 === right.sha256 &&
+    bufferEquals(left.bytes, right.bytes)
+  );
+}
+
+async function verifyAdoptionRowsInTransaction(
   transaction,
   identity,
   snapshot,
+  input,
+  compareInput,
   code,
 ) {
-  const materials = [];
   const budget = { bytes: 0 };
-  let afterOperationId = null;
-  while (true) {
-    const first = afterOperationId === null;
-    const maximumRows = MAX_PAGE_SIZE + 1;
-    const result = await queryTransaction(
-      transaction,
-      first
-        ? READ_OPERATIONS_PAGE_FIRST_QUERY
-        : READ_OPERATIONS_PAGE_AFTER_QUERY,
-      first
-        ? [identity.providerId, identity.anchorId, StringConstructor(maximumRows)]
-        : [
-            identity.providerId,
-            identity.anchorId,
-            afterOperationId,
-            StringConstructor(maximumRows),
-          ],
-      code,
-    );
-    const rows = rowsFromResult(result, "SELECT", maximumRows, code);
-    for (let index = 0; index < rows.length; index += 1) {
-      const material = normalizeOperationRow(rows[index], identity, code);
+  const expectedLength = compareInput ? input.materials.length : 0;
+  let observedCount = 0;
+  let observedMode = null;
+  let previousOperationId = null;
+  let semanticMismatch = false;
+  await consumePostgresSerializableTransactionRows(
+    transaction,
+    READ_ALL_OPERATIONS_QUERY,
+    [
+      identity.providerId,
+      identity.anchorId,
+      StringConstructor(MAX_ADOPTION_OPERATIONS + 1),
+    ],
+    (row) => {
+      const material = normalizeOperationRow(row, identity, code);
       consumeAdoptionCanonicalBytes(budget, material.bytes.length, code);
       if (material.record.state === "committed") {
         consumeAdoptionCanonicalBytes(
@@ -2797,54 +2814,46 @@ async function readAllOperationMaterialsInTransaction(
         );
       }
       assertOperationVisibleAtHead(material, snapshot, code);
+      observedCount += 1;
       ensure(
-        afterOperationId === null ||
-          material.record.operationId > afterOperationId,
+        observedCount <= MAX_ADOPTION_OPERATIONS &&
+          (previousOperationId === null ||
+            material.record.operationId > previousOperationId),
         code,
       );
-      afterOperationId = material.record.operationId;
-      arrayPush(materials, material);
-      ensure(materials.length <= MAX_ADOPTION_OPERATIONS, code);
-    }
-    if (rows.length < maximumRows) break;
-  }
-  return objectFreeze(materials);
-}
-
-function operationMaterialsEqual(left, right) {
-  return (
-    left.record.operationId === right.record.operationId &&
-    left.sha256 === right.sha256 &&
-    bufferEquals(left.bytes, right.bytes)
+      previousOperationId = material.record.operationId;
+      const expected = compareInput
+        ? input.materials[observedCount - 1]
+        : undefined;
+      if (
+        expected === undefined ||
+        !operationMaterialsEqual(material, expected)
+      ) {
+        semanticMismatch = true;
+      }
+      const rowMode =
+        material.adoptionId === null
+          ? "indexed"
+          : input.manifestId !== undefined &&
+              material.adoptionId === input.manifestId
+            ? "legacy"
+            : null;
+      ensure(rowMode !== null, code);
+      if (material.record.state === "committed") {
+        ensure(
+          rowMode === "legacy"
+            ? material.committedChecksumProvenance ===
+                "unavailable-adopted-v2" && material.committedChecksum === null
+            : material.committedChecksumProvenance === "indexed-frame-v1" &&
+                material.committedChecksum !== null,
+          code,
+        );
+      }
+      observedMode ??= rowMode;
+      ensure(observedMode === rowMode, code);
+    },
   );
-}
-
-function verifyAdoptionRows(input, storedMaterials, code) {
-  ensure(storedMaterials.length === input.materials.length, code);
-  let observedMode = null;
-  for (let index = 0; index < storedMaterials.length; index += 1) {
-    const stored = storedMaterials[index];
-    const expected = input.materials[index];
-    ensure(operationMaterialsEqual(stored, expected), code);
-    const rowMode = stored.adoptionId === input.manifestId
-      ? "legacy"
-      : stored.adoptionId === null
-        ? "indexed"
-        : null;
-    ensure(rowMode !== null, code);
-    if (stored.record.state === "committed") {
-      ensure(
-        rowMode === "legacy"
-          ? stored.committedChecksumProvenance === "unavailable-adopted-v2" &&
-              stored.committedChecksum === null
-          : stored.committedChecksumProvenance === "indexed-frame-v1" &&
-              stored.committedChecksum !== null,
-        code,
-      );
-    }
-    observedMode ??= rowMode;
-    ensure(observedMode === rowMode, code);
-  }
+  ensure(observedCount === expectedLength && !semanticMismatch, code);
   return observedMode ?? "empty";
 }
 
@@ -3010,13 +3019,14 @@ async function verifyTargetAdoptionInTransaction(
   code,
 ) {
   ensure(targetAdoptionSnapshotMatches(snapshot, input), code);
-  const storedMaterials = await readAllOperationMaterialsInTransaction(
+  const observedMode = await verifyAdoptionRowsInTransaction(
     transaction,
     identity,
     snapshot,
+    input,
+    true,
     code,
   );
-  const observedMode = verifyAdoptionRows(input, storedMaterials, code);
   ensure(
     observedMode === "empty" || observedMode === input.sourceMode,
     code,
@@ -3037,19 +3047,29 @@ async function sourceAdoptionModeInTransaction(
       snapshot.operationIndexAdoptionXid === null,
     code,
   );
-  const storedMaterials = await readAllOperationMaterialsInTransaction(
+  if (snapshot.operationIndexStateRevision === null) {
+    const observedMode = await verifyAdoptionRowsInTransaction(
+      transaction,
+      identity,
+      snapshot,
+      input,
+      false,
+      code,
+    );
+    ensure(observedMode === "empty", code);
+    return "legacy";
+  }
+  const observedMode = await verifyAdoptionRowsInTransaction(
     transaction,
     identity,
     snapshot,
+    input,
+    true,
     code,
   );
-  if (snapshot.operationIndexStateRevision === null) {
-    ensure(storedMaterials.length === 0, code);
-    return "legacy";
-  }
   ensure(
     snapshot.operationIndexStateRevision === input.expectedHead.stateRevision &&
-      verifyAdoptionRows(input, storedMaterials, code) !== "legacy",
+      observedMode !== "legacy",
     code,
   );
   return "indexed";
@@ -3197,14 +3217,20 @@ function normalizeProjectionRequestOuter(value, code) {
       input.preparedOperationCount >= 0,
     code,
   );
+  const expectedHead = canonicalHead(input.expectedHead, code);
+  const preparedProjectionChecksum = canonicalChecksum(
+    input.preparedProjectionChecksum,
+    code,
+  );
+  const attachmentOrigins = normalizeAttachmentOrigins(
+    input.attachmentOrigins,
+    code,
+  );
   return objectFreeze({
-    attachmentOrigins: input.attachmentOrigins,
-    expectedHead: canonicalHead(input.expectedHead, code),
+    attachmentOrigins,
+    expectedHead,
     preparedOperationCount: input.preparedOperationCount,
-    preparedProjectionChecksum: canonicalChecksum(
-      input.preparedProjectionChecksum,
-      code,
-    ),
+    preparedProjectionChecksum,
   });
 }
 
@@ -3407,11 +3433,7 @@ function createAuthoritySurface(args, runtimeOnly) {
         input.preparedOperationCount <= structuralBound,
         requestCode,
       );
-      const attachmentOriginCount = frozenDenseDataArrayLength(
-        input.attachmentOrigins,
-        structuralBound,
-        requestCode,
-      );
+      ensure(input.attachmentOrigins.count <= structuralBound, requestCode);
       const prepared = await comparePreparedProjectionInTransaction(
         transaction,
         identity,
@@ -3421,20 +3443,17 @@ function createAuthoritySurface(args, runtimeOnly) {
         structuralBound,
         stateCode,
       );
-      if (prepared === null) return null;
       const attachmentOriginsChecksum =
         await compareAttachmentOriginsInTransaction(
           transaction,
           identity,
           observedHead,
           input.attachmentOrigins,
-          attachmentOriginCount,
-          requestCode,
           stateCode,
         );
-      if (attachmentOriginsChecksum === null) return null;
+      if (prepared === null || attachmentOriginsChecksum === null) return null;
       const receipt = objectFreeze({
-        attachmentOriginCount,
+        attachmentOriginCount: input.attachmentOrigins.count,
         attachmentOriginsChecksum,
         expectedHeadChecksum: canonicalHeadChecksum(
           observedHead.head,

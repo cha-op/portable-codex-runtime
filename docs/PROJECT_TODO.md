@@ -258,10 +258,10 @@
   checkpoints retain current storage, destroyed tombstones, attachment-origin
   IDs, and the live prepared recovery working set, but no committed history.
   Arbitrary-age exact replay comes from the permanent PostgreSQL index. The
-  contract-version-3 runtime authority compares the complete prepared and
-  attachment-origin projections in one serializable transaction and returns a
-  domain-separated receipt; the provider caches it only for the same exact
-  loaded head and authority instance.
+  contract-version-3 runtime authority streams the complete prepared and
+  attachment-origin projections through at most three data `SELECT` statements
+  in one serializable transaction and returns a domain-separated receipt; the
+  provider caches it only for the same exact loaded head and authority instance.
 - [pending] Add a streaming or paged adoption contract for otherwise-valid
   version 2 state containing more than 65,535 operations, 65,535 storages, or
   64 MiB of aggregate canonical operation/prepared-projection/storage
