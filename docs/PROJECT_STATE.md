@@ -536,9 +536,12 @@
   record digests share one serializable durable cut with the external head.
   Native commits retain `indexed-frame-v1` plus the exact checksum; the schema
   reserves `unavailable-adopted-v2` with a null checksum for rotated legacy
-  history. All seven head/operation checksum and digest columns use exact-length
-  `varchar(64)` storage; migration fails on a short blank-padded legacy head
-  value. Version 2 reads quarantine that legacy suffix, and bounded paging
+  history. Migration 008 already requires every non-null value in the three
+  external-head checksum columns to be an exact 64-byte lowercase-hex value;
+  migration 010 normalizes those valid values to `varchar(64)` before version 3
+  and gives all four new operation checksum/digest columns the same exact
+  format. Version 2 reads
+  quarantine that legacy suffix, and bounded paging
   admits at most four operations. Exact prepared history may gain its committed
   suffix once; it cannot be rebound or deleted while the anchor remains, and
   whole-table truncation is always rejected.

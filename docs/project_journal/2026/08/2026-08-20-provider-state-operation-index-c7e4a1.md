@@ -37,10 +37,11 @@ superseded_by:
   delete guard rejects partial history removal while its anchor exists, while
   same-transaction operations-first anchor teardown remains available to tests
   and explicit administrative cleanup. A statement trigger rejects every
-  `TRUNCATE`; no runtime deletion API is exposed. All three head checksum
-  columns and four operation checksum/digest columns use exact-length
-  `varchar(64)` storage, and migration rejects short blank-padded legacy head
-  values.
+  `TRUNCATE`; no runtime deletion API is exposed. Migration 008 already requires
+  every non-null value in the three head checksum columns to be an exact 64-byte
+  lowercase-hex value. Migration 010 normalizes those valid values to
+  `varchar(64)` before version 3 and defines all four operation checksum/digest
+  columns with the same exact format.
 - `createPostgresFilesystemImageProviderStateAuthority()` is separate from the
   existing exact two-method head anchor. It supports exact head-bound reads,
   C-collated bounded operation paging, append-prepared, append-committed, and
@@ -53,10 +54,11 @@ superseded_by:
   aborts the transaction and therefore rolls the head back. Commit
   acknowledgement loss remains explicit; exact head and operation readback can
   determine whether the joint durable cut exists.
-- Migration 010 permits external head contract versions 2 and 3 but neither
-  rewrites existing version 2 rows nor enables a version 3 writer. Production
-  version 2 checkpoints still retain all operations, so this foundation alone
-  does not reduce local storage.
+- Migration 010 permits external head contract versions 2 and 3 and normalizes
+  checksum column storage without changing existing version 2 logical head
+  values or contract versions. It does not enable a version 3 writer.
+  Production version 2 checkpoints still retain all operations, so this
+  foundation alone does not reduce local storage.
 
 ## Safety Boundary
 

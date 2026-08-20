@@ -229,9 +229,11 @@
   cut; mismatch rolls back both. Prepared history may acquire its committed
   suffix exactly once, and operation deletion requires same-transaction
   teardown of the complete anchor; whole-table truncation is forbidden. The
-  migration also converts all external-head and operation checksum/digest
-  columns to exact-length `varchar(64)`, rejecting short blank-padded legacy
-  values. Existing valid version 2 heads remain unchanged and production
+  version 2 migration already requires every non-null value in the three
+  external-head checksum columns to be an exact 64-byte lowercase-hex value.
+  Migration 010 normalizes those valid values to `varchar(64)` before version 3
+  and gives all four new operation checksum/digest columns the same exact
+  format. Existing valid version 2 heads remain unchanged and production
   serving is unchanged.
 - [pending] Third-b, switch provider state to version 3. Under the provider
   lock, validate and atomically adopt complete version 2 operation history into

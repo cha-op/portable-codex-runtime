@@ -550,9 +550,11 @@ Their trusted persistent-identity bridge and same-process conformance evidence
 are complete. Migration 010 now adds the separate PostgreSQL provider-operation
 index authority foundation: an exact head CAS and prepared/committed record
 transition share one serializable durable cut, while existing version 2 heads
-retain their logical values and serving remains unchanged. Exact-length
-checksum storage rejects short blank-padded authority, and the permanent
-history table cannot be truncated.
+retain their logical values and serving remains unchanged. Migration 008
+already requires every non-null value in the three head-checksum columns to be
+an exact 64-byte lowercase-hex value; migration 010 normalizes those valid
+values to `varchar(64)` before version 3, and the permanent history table cannot
+be truncated.
 Native committed suffixes retain an exact frame
 checksum; unrecoverable rotated version 2 checksums have a separate null-
 checksum provenance that remains quarantined until a covering version 3

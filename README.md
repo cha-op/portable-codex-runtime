@@ -654,12 +654,13 @@ the additive PostgreSQL operation-index foundation: canonical prepared and
 committed records, prepared frame checksums, explicit committed-checksum
 provenance, and domain-separated record digests advance atomically with the
 external head through one serializable compare-and-swap. Native indexed
-commits store `indexed-frame-v1` plus the exact checksum. Migration 010 also
-converts the three external-head checksum columns and defines all four new
-operation checksum/digest columns as exact-length `varchar(64)` values, so a
-short blank-padded legacy value blocks migration instead of becoming poisoned
-authority. It reserves `unavailable-adopted-v2` with a null checksum for rotated legacy
-history whose original committed-frame checksum no longer exists. The version
+commits store `indexed-frame-v1` plus the exact checksum. Migration 008 already
+requires every non-null value in the three external-head checksum columns to be
+an exact 64-byte lowercase-hex value. Migration 010 normalizes those valid values
+to `varchar(64)` before version 3 and defines all four new operation checksum and
+digest columns with the same exact format. It reserves
+`unavailable-adopted-v2` with a null checksum for rotated legacy history whose
+original committed-frame checksum no longer exists. The version
 2 adapter quarantines that legacy suffix; the version 3 adoption cut may admit
 it only inside the adopted checkpoint boundary. Reads page at most four
 operations so limit-plus-one materialization cannot exceed five pairs of

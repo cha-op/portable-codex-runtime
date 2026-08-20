@@ -2530,12 +2530,13 @@ version 2 history whose checksum no longer exists is represented only by
 `unavailable-adopted-v2` plus a null checksum. That suffix may be written only
 after the same transaction has advanced the parent to a version 3 checkpoint
 whose boundary covers the committed revision. Updates cannot rewrite the
-prepared prefix; committed history is immutable. The migration converts the
-three version 2 head checksum columns and defines the four operation checksum/
-digest columns as `varchar(64)` with exact byte checks, so a short blank-padded
-legacy value aborts migration. A deferred delete guard permits row removal only
-when the same transaction tears down the whole external head, while a statement
-trigger rejects every `TRUNCATE`.
+prepared prefix; committed history is immutable. Migration 008 already requires
+every non-null value in the three version 2 head checksum columns to be an exact
+64-byte lowercase-hex value. Migration 010 normalizes those valid values to
+`varchar(64)` before version 3 and defines the four operation checksum/digest
+columns with the same exact format. A deferred delete guard permits row removal
+only when the same transaction tears down the whole external head, while a
+statement trigger rejects every `TRUNCATE`.
 
 `createPostgresFilesystemImageProviderStateAuthority()` exposes a separate
 closed adapter rather than expanding the existing two-method `headAnchor`.

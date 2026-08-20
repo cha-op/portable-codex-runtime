@@ -759,29 +759,38 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     ].join(" "),
     [providerId, anchorId],
   );
-  const poisonAnchorId = `operation-index-bpchar-poison-${randomUUID()}`;
-  const poisonHead = await pool.query(
-    [
-      "INSERT INTO session_authority.filesystem_image_provider_heads",
-      "(provider_id, anchor_id, contract_version, anchor_revision, generation,",
-      "state_revision, base_head_checksum, checkpoint_state_revision,",
-      "checkpoint_frame_count, checkpoint_checksum, checkpoint_bytes,",
-      "frame_count, last_checksum, ledger_bytes)",
-      "VALUES ($1, $2, 2, 1, 0, 1, NULL, 0, 0, NULL, 0, 1, $3, 1)",
-      "RETURNING last_checksum::pg_catalog.text AS last_checksum,",
-      "pg_catalog.octet_length(last_checksum) AS last_checksum_bytes",
-    ].join(" "),
-    [providerId, poisonAnchorId, "a"],
+  const rejectedShortAnchorId =
+    `operation-index-bpchar-short-${randomUUID()}`;
+  await assert.rejects(
+    pool.query(
+      [
+        "INSERT INTO session_authority.filesystem_image_provider_heads",
+        "(provider_id, anchor_id, contract_version, anchor_revision, generation,",
+        "state_revision, base_head_checksum, checkpoint_state_revision,",
+        "checkpoint_frame_count, checkpoint_checksum, checkpoint_bytes,",
+        "frame_count, last_checksum, ledger_bytes)",
+        "VALUES ($1, $2, 2, 1, 0, 1, NULL, 0, 0, NULL, 0, 1, $3, 1)",
+      ].join(" "),
+      [providerId, rejectedShortAnchorId, "a"],
+    ),
+    (error) => {
+      assert.equal(error.code, "23514");
+      assert.equal(
+        error.constraint,
+        "filesystem_image_provider_heads_last_checksum_format",
+      );
+      return true;
+    },
   );
-  assert.deepEqual(poisonHead.rows, [
-    { last_checksum: "a", last_checksum_bytes: 64 },
-  ]);
-  await assert.rejects(store.migrate(), (error) => {
-    assert.ok(error instanceof PostgresSerializableStoreError);
-    assert.equal(error.code, "migration_failed");
-    assert.equal(error.commitState, "not-committed");
-    return true;
-  });
+  const rejectedShortHead = await pool.query(
+    [
+      "SELECT last_checksum",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id = $2",
+    ].join(" "),
+    [providerId, rejectedShortAnchorId],
+  );
+  assert.deepEqual(rejectedShortHead.rows, []);
   assert.deepEqual(
     await readMigrationLedger(pool),
     trackedMigrations.slice(0, 9).map(({ checksum, version }) => ({
@@ -789,15 +798,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       version,
     })),
   );
-  const rolledBackOperationTable = await pool.query(
-    [
-      "SELECT pg_catalog.to_regclass(",
-      "'session_authority.filesystem_image_provider_operations'",
-      ") AS value",
-    ].join(" "),
-  );
-  assert.equal(rolledBackOperationTable.rows[0].value, null);
-  const rolledBackHeadChecksumType = await pool.query(
+  const versionNineHeadChecksumType = await pool.query(
     [
       "SELECT pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)",
       "AS data_type",
@@ -811,27 +812,9 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       "AND attribute.attnum > 0 AND attribute.attisdropped = false",
     ].join(" "),
   );
-  assert.deepEqual(rolledBackHeadChecksumType.rows, [
+  assert.deepEqual(versionNineHeadChecksumType.rows, [
     { data_type: "character(64)" },
   ]);
-  const retainedPoisonHead = await pool.query(
-    [
-      "SELECT last_checksum::pg_catalog.text AS last_checksum,",
-      "pg_catalog.octet_length(last_checksum) AS last_checksum_bytes",
-      "FROM session_authority.filesystem_image_provider_heads",
-      "WHERE provider_id = $1 AND anchor_id = $2",
-    ].join(" "),
-    [providerId, poisonAnchorId],
-  );
-  assert.deepEqual(retainedPoisonHead.rows, poisonHead.rows);
-  const removedPoisonHead = await pool.query(
-    [
-      "DELETE FROM session_authority.filesystem_image_provider_heads",
-      "WHERE provider_id = $1 AND anchor_id = $2",
-    ].join(" "),
-    [providerId, poisonAnchorId],
-  );
-  assert.equal(removedPoisonHead.rowCount, 1);
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,

@@ -1,9 +1,10 @@
 -- Contract version 3 adds a PostgreSQL-indexed permanent operation history.
 -- Existing valid version 2 head values remain valid; writers must not create
 -- version 3 heads until the matching adapter rollout gate is explicitly open.
--- Convert the version 2 bpchar checksums before opening version 3. The USING
--- casts remove bpchar padding, then PostgreSQL revalidates the existing format
--- constraints so any historically short value blocks this migration.
+-- Migration 008 already requires every non-null checksum value to have exact
+-- 64-byte length and lowercase-hex content, rejecting blank-padded short inputs.
+-- Normalize its valid bpchar values to varchar before opening version 3 and
+-- revalidate the same format constraints.
 ALTER TABLE session_authority.filesystem_image_provider_heads
   ALTER COLUMN base_head_checksum
     TYPE character varying(64) COLLATE pg_catalog."C"

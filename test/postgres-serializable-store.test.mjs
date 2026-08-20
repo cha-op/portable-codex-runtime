@@ -2742,10 +2742,6 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     imageProviderMigration.sql,
-    /last_checksum character\(64\) COLLATE pg_catalog\."C" NOT NULL/u,
-  );
-  assert.match(
-    imageProviderMigration.sql,
     /provider_id character varying\(128\) COLLATE pg_catalog\."C" NOT NULL/u,
   );
   assert.match(
@@ -2754,16 +2750,50 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     imageProviderMigration.sql,
-    /last_checksum !~ '\[\^0-9a-f\]'/u,
+    /last_checksum character\(64\) COLLATE pg_catalog\."C" NOT NULL/u,
   );
-  assert.match(
-    imageProviderMigration.sql,
-    /base_head_checksum !~ '\[\^0-9a-f\]'/u,
-  );
-  assert.match(
-    imageProviderMigration.sql,
-    /checkpoint_checksum !~ '\[\^0-9a-f\]'/u,
-  );
+  for (const [checksumColumn, constraintName] of [
+    [
+      "base_head_checksum",
+      "filesystem_image_provider_heads_base_checksum_format",
+    ],
+    [
+      "checkpoint_checksum",
+      "filesystem_image_provider_heads_checkpoint_checksum_format",
+    ],
+    [
+      "last_checksum",
+      "filesystem_image_provider_heads_last_checksum_format",
+    ],
+  ]) {
+    assert.match(
+      imageProviderMigration.sql,
+      new RegExp(
+        `${checksumColumn} character\\(64\\) COLLATE pg_catalog\\.\"C\"`,
+        "u",
+      ),
+    );
+
+    const constraintMarker = `CONSTRAINT ${constraintName}`;
+    const constraintStart = imageProviderMigration.sql.indexOf(constraintMarker);
+    assert.notEqual(constraintStart, -1);
+    const nextConstraintStart = imageProviderMigration.sql.indexOf(
+      "\n  CONSTRAINT ",
+      constraintStart + constraintMarker.length,
+    );
+    const constraintSql = imageProviderMigration.sql.slice(
+      constraintStart,
+      nextConstraintStart === -1 ? undefined : nextConstraintStart,
+    );
+    assert.match(
+      constraintSql,
+      new RegExp(`octet_length\\(${checksumColumn}\\) = 64`, "u"),
+    );
+    assert.match(
+      constraintSql,
+      new RegExp(`${checksumColumn} !~ '\\[\\^0-9a-f\\]'`, "u"),
+    );
+  }
   assert.match(
     imageProviderMigration.sql,
     /generation = 0[\s\S]+base_head_checksum IS NULL[\s\S]+checkpoint_checksum IS NULL/u,

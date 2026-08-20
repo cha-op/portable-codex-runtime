@@ -421,11 +421,12 @@ domain-separated SHA-256. Explicit metadata binds its kind, storage, logical
 revision, prepared checksum, and committed-checksum provenance. Native commits
 store `indexed-frame-v1` with the exact checksum. The schema separately
 represents a future rotated v2 adoption whose committed checksum is no longer
-recoverable; current version 2 reads reject that suffix. Migration 010 converts
-the three head checksums and defines the four operation checksum/digest columns
-as exact-length `varchar(64)` values, so short blank-padded legacy authority
-fails the migration. The new state-authority
-adapter compares the complete expected head, advances it, and inserts or
+recoverable; current version 2 reads reject that suffix. Migration 008 already
+requires every non-null value in the three head checksum columns to be an exact
+64-byte lowercase-hex value. Migration 010 normalizes those valid values to
+`varchar(64)` before version 3 and defines the four operation checksum/digest
+columns with the same exact format. The new state-authority adapter compares the
+complete expected head, advances it, and inserts or
 commits the matching operation row in one serializable transaction. A failed
 head CAS writes no history; a later record mismatch rolls back the head. The
 prepared prefix is immutable, a committed row cannot change again, a row
