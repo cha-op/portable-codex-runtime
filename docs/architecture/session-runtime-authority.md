@@ -2514,14 +2514,83 @@ whole engine lifecycle or provide another scoped namespace-release proof.
 
 The provider-state checkpoint above is a control-plane replay snapshot, not a
 physical image checkpoint, published checkpoint artifact, or content root.
-Automatic rotation bounds only the active delta log. Permanent exact replay
-makes later provider-state checkpoints and aggregate persistent storage grow
-with unique operations. This slice has no retention floor or garbage
-collection: deployment hosts must monitor `inspectCapacity()` and the backing
-directory until an authority-safe retention floor or PostgreSQL-indexed history
-is designed. Any such floor must retain the origin operation referenced by
-each current attachment so the committed attachment identity remains
-reconstructable.
+Automatic rotation bounds only the active delta log. Permanent exact replay in
+version 2 makes later checkpoints and aggregate persistent storage grow with
+unique operations.
+
+Migration 010 (schema version 10) adds the PostgreSQL operation-index
+foundation without changing that serving path. It keeps existing version 2
+heads valid and reserves version 3, then creates permanent rows keyed by
+`(provider_id, anchor_id, operation_id)`. Each row stores bounded canonical
+prepared bytes, their domain-separated digest, logical revision, operation and
+storage identity, and prepared checksum. A prepared row may acquire matching
+committed bytes, digest, revision, and checksum provenance exactly once. Native
+commits use `indexed-frame-v1` plus the exact committed-frame checksum.
+Migration 010 neither represents nor permits a rotated-version-2 suffix whose
+checksum no longer exists. Updates cannot rewrite the prepared prefix;
+committed history is immutable. Migration 008 already requires
+every non-null value in the three version 2 head checksum columns to be an exact
+64-byte lowercase-hex value. Migration 010 normalizes those valid values to
+`varchar(64)` before version 3 and defines the four operation checksum/digest
+columns with the same exact format. A deferred delete guard permits row removal
+only when the same transaction tears down the whole external head, while a
+statement trigger rejects every `TRUNCATE`.
+
+The head relation also gains a nullable internal
+`operation_index_state_revision` completeness marker. Migration leaves every
+existing version 2 row null and therefore explicitly unadopted; it does not
+pretend that an empty PostgreSQL index means no storage exists. The state
+authority may still return the public head through `readHead()`, but
+exact-head operation reads, paging, and appends reject an absent or lagging
+marker as state-invalid. A real genesis insert sets the marker to the first
+logical state revision. Every later logical append advances it together with
+the public head, while maintenance rotation preserves the shared state
+revision and marker. Version 3 heads require a non-null exact marker at rest.
+
+`createPostgresFilesystemImageProviderStateAuthority()` exposes a separate
+closed adapter rather than expanding the existing two-method `headAnchor`.
+For an append, it requires the supplied frame checksum to equal the complete
+next head and, for a prepare, the record's prepared checksum. In one
+serializable transaction it first distinguishes a stale public head from an
+exact but incomplete index, performs the exact head-and-marker CAS, and only
+after winning that CAS reads the target storage's latest committed operation.
+The fully revalidated canonical committed record is the current storage
+projection; the adapter compares its complete `storageState` (or null when no
+committed record exists) with the append's complete canonical
+`storageStateBefore`. It then applies the matching insert or update. A stale
+head returns `false` with zero operation or projection access; an incomplete
+exact head, projection mismatch, or record mismatch is state-invalid and rolls
+the head, marker, and history back. A committed destroy remains the latest
+destroyed tombstone, so later reuse of that storage ID cannot pass as a fresh
+provision. Rotation changes the public head while retaining the logical state
+revision and marker.
+Canonical record bytes are the replay authority; PostgreSQL JSON
+reserialization is not used. Each record may occupy at most 4 MiB. Page reads
+admit at most four operations, so the limit-plus-one query materializes no more
+than five prepared/committed record pairs. Migration 010's schema and current
+version 2 adapter accept only `indexed-frame-v1`; an active operation tail also
+requires equality with `head.lastChecksum`.
+
+The parent-head predicate is an at-rest consistency gate, not checkpoint
+provenance by itself. A covering version 3 head or transaction token alone is
+not write capability. PR-B migration 011 must atomically introduce the
+`unavailable-adopted-v2` provenance and write path only with the complete
+version 2 checkpoint-and-tail validator, proof that the imported set is unique
+and covers the claimed revision boundary, imported rows, covering checkpoint
+head, and exact completeness marker in one serializable transaction.
+
+This foundation is not retention by itself. Production version 2 still writes
+complete local history, so deployment hosts must monitor `inspectCapacity()`
+and the backing directory. The next version 3 cut must atomically adopt all
+version 2 operations into the index and install the covering checkpoint head
+with its exact completeness marker in the same transaction. Only then may it
+keep current storage and destroyed tombstones locally while serving exact
+operation replay from PostgreSQL. It
+must retain the origin operation referenced by each current attachment so the
+committed attachment identity remains reconstructable. Migration 011 must add
+any unavailable legacy suffix only in the same atomic cut that installs its
+validator-approved rows, version 3 checkpoint head, and marker, so the database
+constraint and reader both reject a partial adoption.
 
 The resulting scope is deliberately clean and manually fenced. Two hosted
 Ubuntu runners independently anchor the archive mount-root and artifact-child

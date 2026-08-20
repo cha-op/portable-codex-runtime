@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -69,6 +70,10 @@ const AUTHORITY_MIGRATION_URLS = Object.freeze([
   ),
   new URL(
     "../migrations/authority/009-writer-supervisor-state-gc.sql",
+    import.meta.url,
+  ),
+  new URL(
+    "../migrations/authority/010-filesystem-image-provider-operations.sql",
     import.meta.url,
   ),
 ]);
@@ -2418,6 +2423,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   const writerStopCaptureMigration = migrations[5];
   const stablePlanMigration = migrations[6];
   const imageProviderMigration = migrations[7];
+  const stateGcMigration = migrations[8];
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
     {},
@@ -2425,6 +2431,8 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
@@ -2513,12 +2521,17 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
     [8, imageProviderMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[22], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[22], [stateGcMigration.sql]);
   assert.deepEqual(migrationQueries[23], [
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
-    [9, latestMigration.checksum],
+    [9, stateGcMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[24], ["COMMIT"]);
+  assert.deepEqual(migrationQueries[24], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[25], [
+    "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+    [10, latestMigration.checksum],
+  ]);
+  assert.deepEqual(migrationQueries[26], ["COMMIT"]);
   assert.deepEqual(client.queries.at(0), ["DISCARD ALL"]);
   assert.deepEqual(client.queries.at(-1), ["DISCARD ALL"]);
   assert.deepEqual(client.releaseCalls, [[]]);
@@ -2730,10 +2743,6 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     imageProviderMigration.sql,
-    /last_checksum character\(64\) COLLATE pg_catalog\."C" NOT NULL/u,
-  );
-  assert.match(
-    imageProviderMigration.sql,
     /provider_id character varying\(128\) COLLATE pg_catalog\."C" NOT NULL/u,
   );
   assert.match(
@@ -2742,16 +2751,50 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     imageProviderMigration.sql,
-    /last_checksum !~ '\[\^0-9a-f\]'/u,
+    /last_checksum character\(64\) COLLATE pg_catalog\."C" NOT NULL/u,
   );
-  assert.match(
-    imageProviderMigration.sql,
-    /base_head_checksum !~ '\[\^0-9a-f\]'/u,
-  );
-  assert.match(
-    imageProviderMigration.sql,
-    /checkpoint_checksum !~ '\[\^0-9a-f\]'/u,
-  );
+  for (const [checksumColumn, constraintName] of [
+    [
+      "base_head_checksum",
+      "filesystem_image_provider_heads_base_checksum_format",
+    ],
+    [
+      "checkpoint_checksum",
+      "filesystem_image_provider_heads_checkpoint_checksum_format",
+    ],
+    [
+      "last_checksum",
+      "filesystem_image_provider_heads_last_checksum_format",
+    ],
+  ]) {
+    assert.match(
+      imageProviderMigration.sql,
+      new RegExp(
+        `${checksumColumn} character\\(64\\) COLLATE pg_catalog\\.\"C\"`,
+        "u",
+      ),
+    );
+
+    const constraintMarker = `CONSTRAINT ${constraintName}`;
+    const constraintStart = imageProviderMigration.sql.indexOf(constraintMarker);
+    assert.notEqual(constraintStart, -1);
+    const nextConstraintStart = imageProviderMigration.sql.indexOf(
+      "\n  CONSTRAINT ",
+      constraintStart + constraintMarker.length,
+    );
+    const constraintSql = imageProviderMigration.sql.slice(
+      constraintStart,
+      nextConstraintStart === -1 ? undefined : nextConstraintStart,
+    );
+    assert.match(
+      constraintSql,
+      new RegExp(`octet_length\\(${checksumColumn}\\) = 64`, "u"),
+    );
+    assert.match(
+      constraintSql,
+      new RegExp(`${checksumColumn} !~ '\\[\\^0-9a-f\\]'`, "u"),
+    );
+  }
   assert.match(
     imageProviderMigration.sql,
     /generation = 0[\s\S]+base_head_checksum IS NULL[\s\S]+checkpoint_checksum IS NULL/u,
@@ -2774,83 +2817,319 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.doesNotMatch(imageProviderMigration.sql, /\bsequence\b/u);
   assert.doesNotMatch(imageProviderMigration.sql, /jsonb/u);
+  for (const checksumColumn of [
+    "base_head_checksum",
+    "checkpoint_checksum",
+    "last_checksum",
+  ]) {
+    assert.match(
+      latestMigration.sql,
+      new RegExp(
+        [
+          `ALTER COLUMN ${checksumColumn}`,
+          "[\\s\\S]+TYPE character varying\\(64\\) COLLATE ",
+          'pg_catalog\\.\"C\"[\\s\\S]+USING ',
+          `${checksumColumn}::character varying\\(64\\)`,
+        ].join(""),
+        "u",
+      ),
+    );
+    assert.doesNotMatch(
+      latestMigration.sql,
+      new RegExp(
+        `ALTER COLUMN ${checksumColumn}[\\s\\S]+TYPE character\\(64\\)`,
+        "u",
+      ),
+    );
+  }
   assert.match(
     latestMigration.sql,
+    /ALTER COLUMN last_checksum[\s\S]+TYPE character varying\(64\)[\s\S]+USING last_checksum::character varying\(64\);[\s\S]+DROP CONSTRAINT filesystem_image_provider_heads_contract_version_supported[\s\S]+ADD CONSTRAINT filesystem_image_provider_heads_contract_version_supported[\s\S]+contract_version IN \(2, 3\)/u,
+  );
+  const operationIndexAlterStart = latestMigration.sql.indexOf(
+    "ADD COLUMN operation_index_state_revision",
+  );
+  assert.notEqual(operationIndexAlterStart, -1);
+  const operationIndexAlterEnd = latestMigration.sql.indexOf(
+    ";",
+    operationIndexAlterStart,
+  );
+  assert.notEqual(operationIndexAlterEnd, -1);
+  const operationIndexAlterSql = latestMigration.sql.slice(
+    operationIndexAlterStart,
+    operationIndexAlterEnd + 1,
+  );
+  assert.match(
+    operationIndexAlterSql,
+    /ADD COLUMN operation_index_state_revision numeric\(20, 0\)/u,
+  );
+  assert.match(
+    operationIndexAlterSql,
+    /CONSTRAINT filesystem_image_provider_heads_operation_index_revision_match[\s\S]+operation_index_state_revision IS NULL[\s\S]+OR operation_index_state_revision = state_revision/u,
+  );
+  assert.match(
+    operationIndexAlterSql,
+    /CONSTRAINT filesystem_image_provider_heads_v3_operation_index_required[\s\S]+contract_version <> 3[\s\S]+OR operation_index_state_revision IS NOT NULL/u,
+  );
+  const latestMigrationDdlIdentifiers = [
+    ...latestMigration.sql.matchAll(
+      /\b(?:(?:ADD|ALTER)\s+COLUMN|(?:(?:ADD|DROP)\s+)?CONSTRAINT|CREATE\s+(?:UNIQUE\s+)?INDEX|CREATE\s+(?:CONSTRAINT\s+)?TRIGGER|CREATE\s+(?:TABLE|FUNCTION))\s+(?:session_authority\.)?([A-Za-z_][A-Za-z0-9_]*)/gu,
+    ),
+  ].map((match) => match[1]);
+  assert.ok(
+    latestMigrationDdlIdentifiers.includes(
+      "filesystem_image_provider_heads_operation_index_revision_match",
+    ),
+  );
+  for (const identifier of latestMigrationDdlIdentifiers) {
+    assert.ok(
+      Buffer.byteLength(identifier, "utf8") <= 63,
+      `PostgreSQL DDL identifier exceeds 63 bytes: ${identifier}`,
+    );
+  }
+  assert.match(
+    latestMigration.sql,
+    /CREATE TABLE session_authority\.filesystem_image_provider_operations/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /provider_id character varying\(128\) COLLATE pg_catalog\."C" NOT NULL[\s\S]+anchor_id character varying\(128\) COLLATE pg_catalog\."C" NOT NULL[\s\S]+operation_id character varying\(128\) COLLATE pg_catalog\."C" NOT NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /record_contract_version integer NOT NULL[\s\S]+state character varying\(16\) COLLATE pg_catalog\."C" NOT NULL[\s\S]+kind character varying\(32\) COLLATE pg_catalog\."C" NOT NULL[\s\S]+storage_id character varying\(128\) COLLATE pg_catalog\."C" NOT NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /prepared_state_revision numeric\(20, 0\) NOT NULL[\s\S]+prepared_checksum character varying\(64\) COLLATE pg_catalog\."C" NOT NULL[\s\S]+prepared_record_bytes bytea NOT NULL[\s\S]+prepared_record_sha256 character varying\(64\) COLLATE pg_catalog\."C" NOT NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /committed_state_revision numeric\(20, 0\),[\s\S]+committed_checksum_provenance character varying\(32\) COLLATE pg_catalog\."C",[\s\S]+committed_checksum character varying\(64\) COLLATE pg_catalog\."C",[\s\S]+committed_record_bytes bytea,[\s\S]+committed_record_sha256 character varying\(64\) COLLATE pg_catalog\."C"/u,
+  );
+  for (const digestColumn of [
+    "prepared_checksum",
+    "prepared_record_sha256",
+    "committed_checksum",
+    "committed_record_sha256",
+  ]) {
+    assert.match(
+      latestMigration.sql,
+      new RegExp(
+        `${digestColumn} character varying\\(64\\) COLLATE pg_catalog\\.\"C\"`,
+        "u",
+      ),
+    );
+    assert.doesNotMatch(
+      latestMigration.sql,
+      new RegExp(`${digestColumn} character\\(64\\)`, "u"),
+    );
+  }
+  assert.match(
+    latestMigration.sql,
+    /PRIMARY KEY \(provider_id, anchor_id, operation_id\)[\s\S]+FOREIGN KEY \(provider_id, anchor_id\)[\s\S]+REFERENCES session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.doesNotMatch(latestMigration.sql, /\bON DELETE\b/u);
+  assert.match(latestMigration.sql, /record_contract_version = 1/u);
+  assert.match(latestMigration.sql, /state IN \('prepared', 'committed'\)/u);
+  assert.match(
+    latestMigration.sql,
+    /kind IN \([\s\S]+'provision',[\s\S]+'attach',[\s\S]+'detach',[\s\S]+'destroy',[\s\S]+'checkpoint',[\s\S]+'restore',[\s\S]+'restore-attach'[\s\S]+\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /prepared_state_revision BETWEEN 1 AND 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /state = 'prepared'[\s\S]+committed_state_revision IS NULL[\s\S]+committed_checksum_provenance IS NULL[\s\S]+committed_checksum IS NULL[\s\S]+committed_record_bytes IS NULL[\s\S]+committed_record_sha256 IS NULL[\s\S]+state = 'committed'[\s\S]+committed_state_revision IS NOT NULL[\s\S]+committed_checksum_provenance IS NOT NULL[\s\S]+committed_record_bytes IS NOT NULL[\s\S]+committed_record_sha256 IS NOT NULL[\s\S]+committed_state_revision > prepared_state_revision[\s\S]+committed_state_revision <= 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /committed_checksum_provenance = 'indexed-frame-v1'[\s\S]+committed_checksum IS NOT NULL[\s\S]+octet_length\(committed_checksum\) = 64[\s\S]+committed_checksum !~ '\[\^0-9a-f\]'/u,
+  );
+  assert.doesNotMatch(latestMigration.sql, /unavailable-adopted-v2/u);
+  for (const recordBytesColumn of [
+    "prepared_record_bytes",
+    "committed_record_bytes",
+  ]) {
+    assert.match(
+      latestMigration.sql,
+      new RegExp(
+        `octet_length\\(${recordBytesColumn}\\) BETWEEN 1 AND 4194304`,
+        "u",
+      ),
+    );
+  }
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT filesystem_image_provider_operations_prepared_bytes_bounded/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT filesystem_image_provider_operations_prepared_sha256_format/u,
+  );
+  assert.doesNotMatch(
+    latestMigration.sql,
+    /filesystem_image_provider_operations_prepared_record_(?:bytes_bounded|sha256_format)/u,
+  );
+  for (const digestColumn of [
+    "prepared_checksum",
+    "prepared_record_sha256",
+    "committed_record_sha256",
+  ]) {
+    assert.match(
+      latestMigration.sql,
+      new RegExp(
+        `octet_length\\(${digestColumn}\\) = 64[\\s\\S]+${digestColumn} !~ '\\[\\^0-9a-f\\]'`,
+        "u",
+      ),
+    );
+  }
+  assert.match(
+    latestMigration.sql,
+    /CREATE UNIQUE INDEX filesystem_image_provider_operations_one_prepared_storage[\s\S]+\(\s*provider_id,[\s\S]+anchor_id,[\s\S]+storage_id[\s\S]+WHERE state = 'prepared'/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE INDEX filesystem_image_provider_operations_state_storage_idx[\s\S]+provider_id,[\s\S]+anchor_id,[\s\S]+state,[\s\S]+storage_id COLLATE pg_catalog\."C"/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE INDEX filesystem_image_provider_operations_prepared_revision_idx[\s\S]+provider_id,[\s\S]+anchor_id,[\s\S]+prepared_state_revision,[\s\S]+operation_id COLLATE pg_catalog\."C"/u,
+  );
+  const committedTailIndexStart = latestMigration.sql.indexOf(
+    "CREATE INDEX filesystem_image_provider_operations_committed_storage_tail_idx",
+  );
+  assert.notEqual(committedTailIndexStart, -1);
+  const committedTailIndexEnd = latestMigration.sql.indexOf(
+    ";",
+    committedTailIndexStart,
+  );
+  assert.notEqual(committedTailIndexEnd, -1);
+  const committedTailIndexSql = latestMigration.sql.slice(
+    committedTailIndexStart,
+    committedTailIndexEnd + 1,
+  );
+  assert.match(
+    committedTailIndexSql,
+    /CREATE INDEX filesystem_image_provider_operations_committed_storage_tail_idx[\s\S]+provider_id,[\s\S]+anchor_id,[\s\S]+storage_id COLLATE pg_catalog\."C",[\s\S]+committed_state_revision DESC,[\s\S]+operation_id COLLATE pg_catalog\."C" DESC[\s\S]+WHERE state = 'committed'/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_filesystem_image_provider_operation_insert[\s\S]+NEW\.state = 'prepared'[\s\S]+NEW\.committed_state_revision IS NULL[\s\S]+NEW\.committed_checksum_provenance IS NULL[\s\S]+NEW\.committed_checksum IS NULL[\s\S]+NEW\.committed_record_bytes IS NULL[\s\S]+NEW\.committed_record_sha256 IS NULL[\s\S]+ERRCODE = '55000'[\s\S]+filesystem_image_provider_operations_insert_prepared_only/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TRIGGER filesystem_image_provider_operations_insert_guard[\s\S]+BEFORE INSERT ON session_authority\.filesystem_image_provider_operations/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_filesystem_image_provider_operation_update[\s\S]+OLD\.state = 'prepared'[\s\S]+NEW\.state = 'committed'[\s\S]+NEW\.provider_id IS NOT DISTINCT FROM OLD\.provider_id[\s\S]+NEW\.anchor_id IS NOT DISTINCT FROM OLD\.anchor_id[\s\S]+NEW\.operation_id IS NOT DISTINCT FROM OLD\.operation_id[\s\S]+NEW\.record_contract_version IS NOT DISTINCT FROM OLD\.record_contract_version[\s\S]+NEW\.kind IS NOT DISTINCT FROM OLD\.kind[\s\S]+NEW\.storage_id IS NOT DISTINCT FROM OLD\.storage_id[\s\S]+NEW\.prepared_state_revision IS NOT DISTINCT FROM OLD\.prepared_state_revision[\s\S]+NEW\.prepared_checksum IS NOT DISTINCT FROM OLD\.prepared_checksum[\s\S]+NEW\.prepared_record_bytes IS NOT DISTINCT FROM OLD\.prepared_record_bytes[\s\S]+NEW\.prepared_record_sha256 IS NOT DISTINCT FROM OLD\.prepared_record_sha256[\s\S]+ERRCODE = '55000'[\s\S]+filesystem_image_provider_operations_prepared_to_committed_only/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TRIGGER filesystem_image_provider_operations_update_guard[\s\S]+BEFORE UPDATE ON session_authority\.filesystem_image_provider_operations/u,
+  );
+  assert.doesNotMatch(
+    latestMigration.sql,
+    /NEW\.committed_checksum_provenance IS NOT DISTINCT FROM OLD\.committed_checksum_provenance/u,
+  );
+  assert.doesNotMatch(latestMigration.sql, /\b(?:history_origin|record_origin)\b/u);
+  assert.match(
+    latestMigration.sql,
+    /enforce_filesystem_image_provider_operation_delete[\s\S]+FROM session_authority\.filesystem_image_provider_heads AS head[\s\S]+head\.provider_id = OLD\.provider_id[\s\S]+head\.anchor_id = OLD\.anchor_id[\s\S]+ERRCODE = '23503'[\s\S]+filesystem_image_provider_operations_delete_requires_teardown/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE CONSTRAINT TRIGGER filesystem_image_provider_operations_delete_guard[\s\S]+AFTER DELETE ON session_authority\.filesystem_image_provider_operations[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /reject_filesystem_image_provider_operation_truncate[\s\S]+RAISE EXCEPTION[\s\S]+ERRCODE = '55000'[\s\S]+filesystem_image_provider_operations_truncate_forbidden/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TRIGGER filesystem_image_provider_operations_truncate_guard[\s\S]+BEFORE TRUNCATE ON session_authority\.filesystem_image_provider_operations[\s\S]+FOR EACH STATEMENT[\s\S]+EXECUTE FUNCTION session_authority\.reject_filesystem_image_provider_operation_truncate/u,
+  );
+  assert.doesNotMatch(latestMigration.sql, /\bjsonb\b|pgcrypto|\bdigest\s*\(/u);
+  assert.match(
+    stateGcMigration.sql,
     /LOCK TABLE session_authority\.sessions IN EXCLUSIVE MODE;[\s\S]+LOCK TABLE session_authority\.operation_claims IN ACCESS EXCLUSIVE MODE;[\s\S]+writer_supervisor_state_owner_migration[\s\S]+launch\.kind = 'writer-launch-attempt-v1'[\s\S]+launch\.state IN \('starting', 'uncertain'\)[\s\S]+FROM session_authority\.sessions AS session[\s\S]+session\.document #> '\{launch\}' IS NOT NULL[\s\S]+session\.document #> '\{launch\}' <> 'null'::jsonb[\s\S]+writer_supervisor_state_owners_require_quiescent_launches[\s\S]+CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /launch_attempt_id character varying\(128\) PRIMARY KEY[\s\S]+state_owner_id character varying\(76\) NOT NULL[\s\S]+bound_at timestamp with time zone NOT NULL/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /writer_supervisor_state_owners_launch_attempt_fk[\s\S]+FOREIGN KEY \(launch_attempt_id, session_id\)[\s\S]+REFERENCES session_authority\.operation_claims/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /writer_supervisor_state_owners_state_owner_id_format[\s\S]+\^state-owner:\[0-9a-f\]\{64\}\$/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /writer_supervisor_state_owners_launch_session_owner_unique[\s\S]+UNIQUE \(launch_attempt_id, session_id, state_owner_id\)/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /CREATE TRIGGER writer_supervisor_state_owners_reject_update[\s\S]+BEFORE UPDATE ON session_authority\.writer_supervisor_state_owners/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /enforce_writer_supervisor_state_owner_delete[\s\S]+FROM session_authority\.operation_id_registry AS registry[\s\S]+registry\.operation_id = OLD\.launch_attempt_id[\s\S]+registry\.session_id = OLD\.session_id[\s\S]+writer_supervisor_state_owners_delete_requires_claim_teardown/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /CREATE CONSTRAINT TRIGGER writer_supervisor_state_owners_enforce_delete_teardown[\s\S]+AFTER DELETE ON session_authority\.writer_supervisor_state_owners[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /CREATE CONSTRAINT TRIGGER operation_claims_writer_launch_state_owner_guard[\s\S]+AFTER INSERT OR UPDATE ON session_authority\.operation_claims[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /enforce_writer_launch_state_owner[\s\S]+OLD\.state = 'prepared'[\s\S]+NEW\.result #>> '\{outcome\}' = 'cancelled-before-dispatch'[\s\S]+FROM session_authority\.writer_supervisor_state_owners AS owner[\s\S]+owner\.launch_attempt_id = NEW\.operation_id[\s\S]+owner\.session_id = NEW\.session_id[\s\S]+owner\.supervisor_id =[\s\S]+NEW\.request #>> '\{payload,supervisor,supervisorId\}'[\s\S]+owner\.bound_at >= NEW\.created_at[\s\S]+operation_claims_writer_launch_state_owner/u,
   );
-  assert.match(latestMigration.sql, /writer_supervisor_state_gc/u);
+  assert.match(stateGcMigration.sql, /writer_supervisor_state_gc/u);
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /terminal_operation_id character varying\(128\) PRIMARY KEY/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /FOREIGN KEY \(terminal_operation_id, session_id\)[\s\S]+REFERENCES session_authority\.operation_claims/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /writer_supervisor_state_gc_state_owner_fk[\s\S]+FOREIGN KEY \(launch_attempt_id, session_id, state_owner_id\)[\s\S]+REFERENCES session_authority\.writer_supervisor_state_owners/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /writer_supervisor_state_gc_state_owner_id_format[\s\S]+\^state-owner:\[0-9a-f\]\{64\}\$/u,
   );
   for (const terminalKind of [
     "writer-launch-attempt-v1",
     "writer-launch-stop-v1",
   ]) {
-    assert.equal(latestMigration.sql.includes(`'${terminalKind}'`), true);
+    assert.equal(stateGcMigration.sql.includes(`'${terminalKind}'`), true);
   }
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /writer_supervisor_state_gc_collection_shape[\s\S]+\(collection_status IS NULL\) =[\s\S]+\(collection_receipt_sha256 IS NULL\)[\s\S]+\(collection_status IS NULL\) = \(collected_at IS NULL\)/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /collection_status IN \('collected', 'absent'\)/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /jsonb_typeof\(terminal_record\) = 'object'/u,
   );
   for (const digestColumn of [
@@ -2859,16 +3138,16 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     "collection_receipt_sha256",
   ]) {
     assert.match(
-      latestMigration.sql,
+      stateGcMigration.sql,
       new RegExp(`${digestColumn}[^;]+\\^\\[0-9a-f\\]\\{64\\}\\$`, "u"),
     );
   }
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /collected_at IS NULL OR collected_at >= authorized_at/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     new RegExp(
       [
         "CREATE INDEX writer_supervisor_state_gc_pending_page[\\s\\S]+",
@@ -2880,15 +3159,15 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     ),
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /DROP CONSTRAINT restore_recovery_cursors_lane_allowed/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     /ADD CONSTRAINT restore_recovery_cursors_lane_allowed[\s\S]+'supervisor-state-gc'/u,
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     new RegExp(
       [
         "ADD COLUMN after_authorized_at timestamp with time zone,",
@@ -2899,7 +3178,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     ),
   );
   assert.match(
-    latestMigration.sql,
+    stateGcMigration.sql,
     new RegExp(
       [
         "restore_recovery_cursors_gc_position_shape[\\s\\S]+",
@@ -2929,6 +3208,8 @@ test("migrate destroys a client when its post-COMMIT reset fails", async () => {
       {},
       {},
       { rows: [] },
+      {},
+      {},
       {},
       {},
       {},
@@ -3003,7 +3284,7 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v1 ledger through v9", async () => {
+test("migrate upgrades an exact v1 ledger through v10", async () => {
   const migrations = await readAuthorityMigrations();
   const firstMigration = migrations[0];
   const latestMigration = migrations.at(-1);
@@ -3020,6 +3301,8 @@ test("migrate upgrades an exact v1 ledger through v9", async () => {
         },
       ],
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -3083,6 +3366,11 @@ test("migrate upgrades an exact v1 ledger through v9", async () => {
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[7].version, migrations[7].checksum],
     ],
+    [migrations[8].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[8].version, migrations[8].checksum],
+    ],
     [latestMigration.sql],
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
@@ -3094,7 +3382,7 @@ test("migrate upgrades an exact v1 ledger through v9", async () => {
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v2 ledger through v9", async () => {
+test("migrate upgrades an exact v2 ledger through v10", async () => {
   const migrations = await readAuthorityMigrations();
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
@@ -3108,6 +3396,8 @@ test("migrate upgrades an exact v2 ledger through v9", async () => {
         version,
       })),
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -3163,6 +3453,11 @@ test("migrate upgrades an exact v2 ledger through v9", async () => {
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[7].version, migrations[7].checksum],
+    ],
+    [migrations[8].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[8].version, migrations[8].checksum],
     ],
     [latestMigration.sql],
     [
@@ -3333,7 +3628,7 @@ test("migrate rejects a future-only migration ledger", async () => {
     {},
     {},
     {},
-    { rows: [{ checksum: "0".repeat(64), version: 10 }] },
+    { rows: [{ checksum: "0".repeat(64), version: 11 }] },
     {},
   ]);
   const store = new PostgresSerializableStore({
@@ -3359,7 +3654,7 @@ test("migrate rejects an exact latest prefix accompanied by an extra version", a
     {
       rows: [
         ...migrations.map(({ checksum, version }) => ({ checksum, version })),
-        { checksum: "0".repeat(64), version: 10 },
+        { checksum: "0".repeat(64), version: 11 },
       ],
     },
     {},
@@ -3500,6 +3795,8 @@ test("migrate rejects a COMMIT acknowledgement that reports ROLLBACK", async () 
     {},
     {},
     {},
+    {},
+    {},
     { command: "ROLLBACK" },
   ]);
   const store = new PostgresSerializableStore({
@@ -3523,6 +3820,8 @@ test("migrate treats a failed COMMIT as uncertain and never reapplies", async ()
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},

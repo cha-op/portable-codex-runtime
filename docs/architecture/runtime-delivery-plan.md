@@ -12,8 +12,11 @@ plane.
 - After each squash merge, update local `master` and create the next branch from
   that new commit.
 - Run the complete repository test suite for every pull request.
-- Require GitHub Codex review, an independent Codex PR review, and an offline
-  frozen-diff review before merge.
+- Require one fresh-context local Codex review and one exact current-head
+  `@codex review` request before merge. This repository does not require a
+  Claude lane.
+- Treat a trusted GitHub Codex clean comment on the latest commit as the
+  GitHub lane pass when the pull request has no unresolved finding.
 - Resolve every pull-request conversation before merge.
 - Keep credentials, untracked private files, and unrelated repositories outside
   review and evidence artifacts.
@@ -543,13 +546,35 @@ FD-bound raw-image lifecycle below host-owned `rprivate` carriers in one
 long-lived private mount namespace, externally anchored provider state,
 distinct publication-control identities, and two-host clean detach, transfer,
 and remount verification plus a producer peer-namespace non-propagation gate.
-Their trusted
-persistent-identity bridge and same-process conformance evidence remain
-pending. See
-`linux-ext4-physical-backend.md`. Later slices own power-loss/crash-prefix
-evidence, automatic stale-writer fencing, differential export/compression,
-content-addressed distribution, encryption, retention, registry trust, remote
-transport, and broader operational hardening.
+Their trusted persistent-identity bridge and same-process conformance evidence
+are complete. Migration 010 now adds the separate PostgreSQL provider-operation
+index authority foundation: an exact head CAS and prepared/committed record
+transition share one serializable durable cut. A nullable completeness marker
+leaves migrated version 2 heads explicitly unadopted, while genesis-created
+indexed heads advance the marker with every logical operation and retain it
+through rotation. Operation reads, paging, and exact-head appends fail closed
+on an unadopted head. The latest validated committed operation for a storage
+is its current PostgreSQL projection; every operation append compares the full
+canonical before-state, and destroyed state remains a committed tombstone.
+Existing version 2 heads retain their logical values and production serving
+remains unchanged. Migration 008
+already requires every non-null value in the three head-checksum columns to be
+an exact 64-byte lowercase-hex value; migration 010 normalizes those valid
+values to `varchar(64)` before version 3, and the permanent history table cannot
+be truncated.
+Migration 010 accepts only native committed suffixes with
+`indexed-frame-v1` and an exact frame checksum; it neither represents nor
+permits a null-checksum rotated-legacy suffix. The next slice's migration 011
+must atomically introduce the `unavailable-adopted-v2` provenance and write
+path with the complete v2 validator, revision coverage and uniqueness proof,
+imported rows, covering version 3 checkpoint head, and exact completeness
+marker. A transaction token or covering head alone is not write capability,
+and permanent operation history cannot be removed from local checkpoints
+before that complete cut. See `linux-ext4-physical-backend.md`. Later
+slices own
+power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
+export/compression, content-addressed distribution, encryption, registry trust,
+remote transport, and broader operational hardening.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

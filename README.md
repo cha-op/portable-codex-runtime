@@ -649,12 +649,48 @@ at that envelope. The provider-state checkpoint is a control-plane exact-
 replay snapshot, not a physical ext4 image checkpoint or content root. It
 retains every prepared and committed operation, current storage state, and
 destroyed tombstone; exact replay therefore makes checkpoint and aggregate
-provider-state storage grow with unique operations. This slice supplies no
-provider-state retention or garbage collection, so hosts must monitor
-`inspectCapacity()` and the provider-state directory until a retention floor or
-PostgreSQL-indexed history is designed. Any future retention floor must
-preserve the origin operation for every current attachment so its committed
-identity remains reconstructable.
+provider-state storage grow with unique operations. Migration 010 now supplies
+the additive PostgreSQL operation-index foundation: canonical prepared and
+committed records, prepared frame checksums, explicit committed-checksum
+provenance, and domain-separated record digests advance atomically with the
+external head through one serializable compare-and-swap. A hidden
+`operation_index_state_revision` completeness marker is null on migrated
+version 2 heads. The new adapter sets it when an empty genesis anchor receives
+its first operation, advances it with each logical append, and preserves it
+across maintenance rotation. Public head readback remains available for an
+unadopted legacy head, but exact-head operation reads, paging, and appends fail
+closed until one atomic adoption proves the complete history. Native indexed
+commits store `indexed-frame-v1` plus the exact checksum. The latest fully
+validated committed record for a storage is the current PostgreSQL storage
+projection; every operation append compares the complete canonical
+`storageStateBefore` against that projection in the same transaction, and a
+mismatch rolls back the head, marker, and history together. Committed
+destroyed state remains a tombstone rather than making the storage ID absent.
+Migration 008 already
+requires every non-null value in the three external-head checksum columns to be
+an exact 64-byte lowercase-hex value. Migration 010 normalizes those valid values
+to `varchar(64)` before version 3 and defines all four new operation checksum and
+digest columns with the same exact format. Migration 010 accepts only
+`indexed-frame-v1`; it neither represents nor permits an unavailable legacy
+committed-checksum suffix. PR-B migration 011 must introduce
+`unavailable-adopted-v2` together with the complete v2 validator, imported
+rows, covering version 3 checkpoint head, and exact completeness marker in one
+transaction. A transaction token or covering version 3 head alone is not that
+write capability. Reads page at most four
+operations so limit-plus-one materialization cannot exceed five pairs of
+4 MiB record columns. The relation is permanent while its anchor exists;
+`TRUNCATE` is always rejected, a prepared row may acquire its committed suffix
+exactly once, and row deletion requires same-transaction teardown of the whole
+anchor. This foundation does
+not switch the production version 2 provider or remove local history. Hosts
+must still monitor `inspectCapacity()` and the provider-state directory until
+the version 3 checkpoint/adoption cut makes PostgreSQL the replay index. Under
+the provider lock, that cut must import and validate the complete version 2
+history, prove revision coverage and uniqueness, install the covering version
+3 checkpoint head, and set the exact completeness marker in one transaction
+before local history is reduced. It
+must also preserve the origin operation for every current attachment so its
+committed identity remains reconstructable.
 
 The two-host Ubuntu conformance flow runs each Node process and helper in one
 long-lived private mount namespace with dedicated `rprivate` archive and

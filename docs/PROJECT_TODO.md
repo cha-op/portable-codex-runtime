@@ -219,13 +219,44 @@
   cryptographic host
   attestation or protection against an administrator cloning both root and
   marker.
-- [pending] Third, define an authority-safe provider-state exact-replay
-  retention floor or move permanent operation history to a PostgreSQL-indexed
-  representation. This track has its own replay authority and does not inherit
-  authority from the bridge or supervisor retention. Its retention floor must
-  preserve the origin operation for every current attachment. Until then,
-  monitor checkpoint bytes, retained operation counts, and aggregate provider-
-  state storage; automatic active-log rotation is not retention or garbage
+- [done] Third-a, add the authority-safe PostgreSQL operation-index foundation.
+  Migration 010 stores bounded canonical prepared and committed record bytes,
+  the prepared checksum, explicit committed-checksum provenance, and domain-
+  separated record digests behind the external provider head. Native commits
+  use `indexed-frame-v1`; migration 010 neither represents nor permits an
+  unavailable rotated-legacy suffix. A nullable head marker records the exact
+  state revision whose operation index is complete. Migrated version 2 heads
+  remain unadopted;
+  operation reads, paging, and exact-head appends fail closed until adoption.
+  Genesis-created indexed heads advance the marker with each logical append
+  and retain it across rotation. A serializable head CAS and record
+  insert/update form one durable cut. The latest validated committed record is
+  the current storage projection, and a full canonical before-state mismatch
+  rolls back the head, marker, and history. Destroyed storage remains a
+  committed tombstone. Prepared history may acquire its committed
+  suffix exactly once, and operation deletion requires same-transaction
+  teardown of the complete anchor; whole-table truncation is forbidden. The
+  version 2 migration already requires every non-null value in the three
+  external-head checksum columns to be an exact 64-byte lowercase-hex value.
+  Migration 010 normalizes those valid values to `varchar(64)` before version 3
+  and gives all four new operation checksum/digest columns the same exact
+  format. Existing valid version 2 heads remain unchanged and production
+  serving is unchanged.
+- [pending] Third-b, switch provider state to version 3. PR-B migration 011 must
+  atomically introduce the `unavailable-adopted-v2` provenance and its write
+  path only after the provider-locked complete v2 validator proves revision
+  coverage and uniqueness, imports the rows, installs the covering version 3
+  checkpoint head, and sets its exact operation-index completeness marker in
+  the same transaction. A transaction token or covering head alone is not
+  write capability. Only then keep current storage records and destroyed
+  tombstones in local
+  checkpoints. Exact operation replay must come from the
+  permanent index, and each current attachment must retain and verify its
+  origin operation. The cut must place every unavailable legacy committed
+  suffix at or before the version 3 checkpoint boundary before it becomes
+  readable. Until that cut lands, monitor checkpoint bytes, retained
+  operation counts, and aggregate provider-state storage; automatic active-log
+  rotation and the additive index foundation are not retention or garbage
   collection.
 - [pending] Extend beyond that clean/manual-fencing boundary only in separately
   scoped work: power-loss/crash-prefix evidence, automatic stale-writer

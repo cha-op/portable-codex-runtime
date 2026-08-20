@@ -3,7 +3,7 @@ id: 20260819-a4c821
 title: ext4-to-Podman Attachment Composition
 status: completed
 created: 2026-08-19
-updated: 2026-08-19
+updated: 2026-08-20
 branch: wip/ext4-podman-composition
 pr:
 supersedes: []
@@ -50,12 +50,10 @@ superseded_by:
 
 ## Next Steps
 
-- Add authority-owned terminal supervisor-state garbage collection only after
-  PostgreSQL has permanently committed the exact terminal attempt and every
-  callback for that attempt is quiescent.
-- Define an authority-safe provider-state history retention or migration
-  policy. Its retention floor must preserve the origin operation for every
-  current attachment.
+- Complete the version 3 provider-state adoption and checkpoint cut on top of
+  migration 010's PostgreSQL operation-index authority. Permanent replay may
+  leave local checkpoints only after every current attachment's origin
+  operation remains exact and durable in that index.
 - Keep Git Summary deferred; it is not checkpoint or recovery authority.
 
 ## Evidence
