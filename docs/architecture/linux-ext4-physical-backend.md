@@ -426,21 +426,34 @@ requires every non-null value in the three head checksum columns to be an exact
 64-byte lowercase-hex value. Migration 010 normalizes those valid values to
 `varchar(64)` before version 3 and defines the four operation checksum/digest
 columns with the same exact format. The new state-authority adapter compares the
-complete expected head, advances it, and inserts or
-commits the matching operation row in one serializable transaction. A failed
-head CAS writes no history; a later record mismatch rolls back the head. The
-prepared prefix is immutable, a committed row cannot change again, a row
+complete expected head and an internal
+`operation_index_state_revision` completeness marker. A migrated version 2
+head keeps a null marker: its public head remains readable, but operation
+reads, paging, and exact-head appends fail closed because absent indexed
+history cannot be interpreted as absent storage. A genesis-created indexed
+head sets the marker on its first append, advances it with every logical
+append, and preserves it through rotation. After a successful head CAS, the
+adapter reads the latest fully validated committed record for the target
+storage as the current projection and compares the complete canonical
+`storageStateBefore`. It then inserts or commits the matching operation row in
+the same serializable transaction. A failed head CAS writes no history; a
+projection or record mismatch rolls the head and marker back. Committed
+destroyed state remains a tombstone, so a destroyed storage ID cannot be
+mistaken for a never-provisioned ID. The prepared prefix is immutable, a
+committed row cannot change again, a row
 cannot be deleted while its anchor remains, and `TRUNCATE` is always rejected.
-Rotation changes only the head.
+Rotation changes the public head but retains the logical revision and marker.
 Migration 010 permits head contract versions 2 and 3 but does not create a
-version 3 writer or alter existing version 2 rows.
+version 3 writer or change existing version 2 logical head values.
 
 Production version 2 still has no retention floor or garbage collection, so a
 host must monitor `inspectCapacity()` and the provider-state filesystem. The
 next slice must atomically adopt complete version 2 history, make the
-PostgreSQL index the exact-replay source, and write version 3 checkpoints that
-retain current storage and destroyed tombstones without duplicating permanent
-operation history. It must preserve the origin operation for every current
+PostgreSQL index the exact-replay source, and write a covering version 3
+checkpoint head plus its exact completeness marker in the same transaction.
+Only after that cut may version 3 checkpoints retain current storage and
+destroyed tombstones without duplicating permanent operation history. It must
+preserve the origin operation for every current
 attachment so its committed attachment identity remains reconstructable.
 
 A prepared provision has not exposed a storage result. Its retry may adopt a

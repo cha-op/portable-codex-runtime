@@ -104,6 +104,7 @@ const HEAD_ROW_KEYS = Object.freeze([
   "frame_count",
   "last_checksum",
   "ledger_bytes",
+  "operation_index_state_revision",
 ]);
 const OPERATION_ROW_KEYS = Object.freeze([
   "provider_id",
@@ -147,6 +148,7 @@ const HEAD_COLUMNS = [
   "frame_count::pg_catalog.text AS frame_count",
   "last_checksum",
   "ledger_bytes::pg_catalog.text AS ledger_bytes",
+  "operation_index_state_revision::pg_catalog.text AS operation_index_state_revision",
 ].join(", ");
 const OPERATION_COLUMNS = [
   "provider_id",
@@ -176,10 +178,11 @@ const INSERT_HEAD_QUERY = [
   "(provider_id, anchor_id, contract_version, anchor_revision, generation,",
   "state_revision, base_head_checksum, checkpoint_state_revision,",
   "checkpoint_frame_count, checkpoint_checksum, checkpoint_bytes,",
-  "frame_count, last_checksum, ledger_bytes)",
+  "frame_count, last_checksum, ledger_bytes, operation_index_state_revision)",
   "VALUES ($1, $2, $3, $4::pg_catalog.numeric, $5::pg_catalog.numeric,",
   "$6::pg_catalog.numeric, $7, $8::pg_catalog.numeric, $9::pg_catalog.int8,",
-  "$10, $11::pg_catalog.int8, $12::pg_catalog.int4, $13, $14::pg_catalog.int8)",
+  "$10, $11::pg_catalog.int8, $12::pg_catalog.int4, $13, $14::pg_catalog.int8,",
+  "$15::pg_catalog.numeric)",
   "ON CONFLICT (provider_id, anchor_id) DO NOTHING",
   `RETURNING ${HEAD_COLUMNS}`,
 ].join(" ");
@@ -190,20 +193,22 @@ const UPDATE_HEAD_QUERY = [
   "base_head_checksum = $7, checkpoint_state_revision = $8::pg_catalog.numeric,",
   "checkpoint_frame_count = $9::pg_catalog.int8, checkpoint_checksum = $10,",
   "checkpoint_bytes = $11::pg_catalog.int8, frame_count = $12::pg_catalog.int4,",
-  "last_checksum = $13, ledger_bytes = $14::pg_catalog.int8",
+  "last_checksum = $13, ledger_bytes = $14::pg_catalog.int8,",
+  "operation_index_state_revision = $15::pg_catalog.numeric",
   "WHERE provider_id = $1 AND anchor_id = $2",
-  "AND contract_version = $15",
-  "AND anchor_revision = $16::pg_catalog.numeric",
-  "AND generation = $17::pg_catalog.numeric",
-  "AND state_revision = $18::pg_catalog.numeric",
-  "AND base_head_checksum IS NOT DISTINCT FROM $19",
-  "AND checkpoint_state_revision = $20::pg_catalog.numeric",
-  "AND checkpoint_frame_count = $21::pg_catalog.int8",
-  "AND checkpoint_checksum IS NOT DISTINCT FROM $22",
-  "AND checkpoint_bytes = $23::pg_catalog.int8",
-  "AND frame_count = $24::pg_catalog.int4",
-  "AND last_checksum IS NOT DISTINCT FROM $25",
-  "AND ledger_bytes = $26::pg_catalog.int8",
+  "AND contract_version = $16",
+  "AND anchor_revision = $17::pg_catalog.numeric",
+  "AND generation = $18::pg_catalog.numeric",
+  "AND state_revision = $19::pg_catalog.numeric",
+  "AND base_head_checksum IS NOT DISTINCT FROM $20",
+  "AND checkpoint_state_revision = $21::pg_catalog.numeric",
+  "AND checkpoint_frame_count = $22::pg_catalog.int8",
+  "AND checkpoint_checksum IS NOT DISTINCT FROM $23",
+  "AND checkpoint_bytes = $24::pg_catalog.int8",
+  "AND frame_count = $25::pg_catalog.int4",
+  "AND last_checksum IS NOT DISTINCT FROM $26",
+  "AND ledger_bytes = $27::pg_catalog.int8",
+  "AND operation_index_state_revision = $19::pg_catalog.numeric",
   `RETURNING ${HEAD_COLUMNS}`,
 ].join(" ");
 const READ_OPERATION_QUERY = [
@@ -225,6 +230,15 @@ const READ_OPERATIONS_PAGE_AFTER_QUERY = [
   'AND operation_id COLLATE pg_catalog."C" > $3 COLLATE pg_catalog."C"',
   'ORDER BY operation_id COLLATE pg_catalog."C"',
   "LIMIT $4::pg_catalog.int4",
+].join(" ");
+const READ_LATEST_COMMITTED_STORAGE_QUERY = [
+  `SELECT ${OPERATION_COLUMNS}`,
+  "FROM session_authority.filesystem_image_provider_operations",
+  "WHERE provider_id = $1 AND anchor_id = $2 AND storage_id = $3",
+  "AND state = 'committed'",
+  "ORDER BY committed_state_revision DESC,",
+  'operation_id COLLATE pg_catalog."C" DESC',
+  "LIMIT 1",
 ].join(" ");
 const INSERT_PREPARED_QUERY = [
   "INSERT INTO session_authority.filesystem_image_provider_operations",
@@ -1401,7 +1415,15 @@ function normalizeHeadRow(value, identity, code) {
     code,
   );
   ensure(!headEqual(head, genesisHead()), code);
-  return head;
+  const operationIndexStateRevision =
+    row.operation_index_state_revision === null
+      ? null
+      : canonicalUint64(row.operation_index_state_revision, code).value;
+  return objectFreeze({
+    exists: true,
+    head,
+    operationIndexStateRevision,
+  });
 }
 
 function normalizeOperationRow(value, identity, code) {
@@ -1555,6 +1577,7 @@ function headValues(identity, head) {
     StringConstructor(head.frameCount),
     head.lastChecksum,
     StringConstructor(head.ledgerBytes),
+    head.stateRevision,
   ];
 }
 
@@ -1579,6 +1602,15 @@ function expectedHeadValues(identity, expectedHead, nextHead) {
 }
 
 async function readHeadInTransaction(transaction, identity, code) {
+  const snapshot = await readHeadSnapshotInTransaction(
+    transaction,
+    identity,
+    code,
+  );
+  return snapshot.head;
+}
+
+async function readHeadSnapshotInTransaction(transaction, identity, code) {
   const result = await queryTransaction(
     transaction,
     READ_HEAD_QUERY,
@@ -1586,12 +1618,30 @@ async function readHeadInTransaction(transaction, identity, code) {
     code,
   );
   const rows = rowsFromResult(result, "SELECT", 1, code);
-  return rows.length === 0 ? genesisHead() : normalizeHeadRow(rows[0], identity, code);
+  if (rows.length !== 0) return normalizeHeadRow(rows[0], identity, code);
+  const head = genesisHead();
+  return objectFreeze({
+    exists: false,
+    head,
+    operationIndexStateRevision: head.stateRevision,
+  });
 }
 
 async function requireExpectedHead(transaction, identity, expectedHead, code) {
-  const observed = await readHeadInTransaction(transaction, identity, code);
-  ensure(headEqual(observed, expectedHead), code);
+  const observed = await readHeadSnapshotInTransaction(
+    transaction,
+    identity,
+    code,
+  );
+  ensure(headEqual(observed.head, expectedHead), code);
+  return observed;
+}
+
+function requireExpectedOperationIndex(snapshot, expectedHead, code) {
+  ensure(
+    snapshot.operationIndexStateRevision === expectedHead.stateRevision,
+    code,
+  );
 }
 
 async function compareHeadInTransaction(
@@ -1599,9 +1649,10 @@ async function compareHeadInTransaction(
   identity,
   expectedHead,
   nextHead,
+  observedHead,
   code,
 ) {
-  const genesis = headEqual(expectedHead, genesisHead());
+  const genesis = !observedHead.exists;
   const result = await queryTransaction(
     transaction,
     genesis ? INSERT_HEAD_QUERY : UPDATE_HEAD_QUERY,
@@ -1611,7 +1662,11 @@ async function compareHeadInTransaction(
   const rows = rowsFromResult(result, genesis ? "INSERT" : "UPDATE", 1, code);
   if (rows.length === 0) return false;
   const stored = normalizeHeadRow(rows[0], identity, code);
-  ensure(headEqual(stored, nextHead), code);
+  ensure(
+    headEqual(stored.head, nextHead) &&
+      stored.operationIndexStateRevision === nextHead.stateRevision,
+    code,
+  );
   return true;
 }
 
@@ -1683,6 +1738,31 @@ async function readOperationsPageInTransaction(
         ? operations[operations.length - 1].operationId
         : null,
   });
+}
+
+async function readLatestCommittedStorageStateInTransaction(
+  transaction,
+  identity,
+  storageId,
+  expectedHead,
+  code,
+) {
+  const result = await queryTransaction(
+    transaction,
+    READ_LATEST_COMMITTED_STORAGE_QUERY,
+    [identity.providerId, identity.anchorId, storageId],
+    code,
+  );
+  const rows = rowsFromResult(result, "SELECT", 1, code);
+  if (rows.length === 0) return null;
+  const material = normalizeOperationRow(rows[0], identity, code);
+  ensure(
+    material.record.state === "committed" &&
+      material.record.storageId === storageId,
+    code,
+  );
+  assertOperationVisibleAtHead(material, expectedHead, code);
+  return material.record.storageState;
 }
 
 function preparedInsertValues(identity, material) {
@@ -1891,7 +1971,14 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
     const expectedHead = canonicalHead(input.expectedHead, requestCode);
     const operationId = canonicalOpaqueId(input.operationId, requestCode);
     return await runSerializable(store, async (transaction) => {
-      await requireExpectedHead(transaction, identity, expectedHead, stateCode);
+      const observedHead = await requireExpectedHead(
+        transaction,
+        identity,
+        expectedHead,
+        stateCode,
+      );
+      requireExpectedOperationIndex(observedHead, expectedHead, stateCode);
+      if (!observedHead.exists) return null;
       return await readOperationInTransaction(
         transaction,
         identity,
@@ -1922,7 +2009,18 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
       limit: input.limit,
     });
     return await runSerializable(store, async (transaction) => {
-      await requireExpectedHead(transaction, identity, expectedHead, stateCode);
+      const observedHead = await requireExpectedHead(
+        transaction,
+        identity,
+        expectedHead,
+        stateCode,
+      );
+      requireExpectedOperationIndex(observedHead, expectedHead, stateCode);
+      if (!observedHead.exists) {
+        const operations = [];
+        objectFreeze(operations);
+        return objectFreeze({ operations, nextAfterOperationId: null });
+      }
       return await readOperationsPageInTransaction(
         transaction,
         identity,
@@ -1944,14 +2042,39 @@ export function createPostgresFilesystemImageProviderStateAuthority(...args) {
       requestCode,
     );
     return await runSerializable(store, async (transaction) => {
+      const observedHead = await readHeadSnapshotInTransaction(
+        transaction,
+        identity,
+        stateCode,
+      );
+      if (!headEqual(observedHead.head, expectedHead)) return false;
+      requireExpectedOperationIndex(observedHead, expectedHead, stateCode);
       const advanced = await compareHeadInTransaction(
         transaction,
         identity,
         expectedHead,
         nextHead,
+        observedHead,
         stateCode,
       );
       if (!advanced) return false;
+      if (transition.type !== "rotate-v1") {
+        const currentStorageState =
+          await readLatestCommittedStorageStateInTransaction(
+            transaction,
+            identity,
+            transition.material.record.storageId,
+            expectedHead,
+            stateCode,
+          );
+        ensure(
+          canonicalEqual(
+            currentStorageState,
+            transition.material.record.storageStateBefore,
+          ),
+          stateCode,
+        );
+      }
       if (transition.type === "append-prepared-v1") {
         await insertPreparedInTransaction(
           transaction,

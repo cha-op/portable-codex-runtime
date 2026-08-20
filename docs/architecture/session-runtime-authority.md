@@ -2538,13 +2538,34 @@ columns with the same exact format. A deferred delete guard permits row removal
 only when the same transaction tears down the whole external head, while a
 statement trigger rejects every `TRUNCATE`.
 
+The head relation also gains a nullable internal
+`operation_index_state_revision` completeness marker. Migration leaves every
+existing version 2 row null and therefore explicitly unadopted; it does not
+pretend that an empty PostgreSQL index means no storage exists. The state
+authority may still return the public head through `readHead()`, but
+exact-head operation reads, paging, and appends reject an absent or lagging
+marker as state-invalid. A real genesis insert sets the marker to the first
+logical state revision. Every later logical append advances it together with
+the public head, while maintenance rotation preserves the shared state
+revision and marker. Version 3 heads require a non-null exact marker at rest.
+
 `createPostgresFilesystemImageProviderStateAuthority()` exposes a separate
 closed adapter rather than expanding the existing two-method `headAnchor`.
 For an append, it requires the supplied frame checksum to equal the complete
-next head and, for a prepare, the record's prepared checksum. It performs the
-exact head CAS before the matching insert or update in the same serializable
-transaction. A stale head returns `false` with zero operation mutation; a
-record mismatch rolls the transaction back. Rotation changes only the head.
+next head and, for a prepare, the record's prepared checksum. In one
+serializable transaction it first distinguishes a stale public head from an
+exact but incomplete index, performs the exact head-and-marker CAS, and only
+after winning that CAS reads the target storage's latest committed operation.
+The fully revalidated canonical committed record is the current storage
+projection; the adapter compares its complete `storageState` (or null when no
+committed record exists) with the append's complete canonical
+`storageStateBefore`. It then applies the matching insert or update. A stale
+head returns `false` with zero operation or projection access; an incomplete
+exact head, projection mismatch, or record mismatch is state-invalid and rolls
+the head, marker, and history back. A committed destroy remains the latest
+destroyed tombstone, so later reuse of that storage ID cannot pass as a fresh
+provision. Rotation changes the public head while retaining the logical state
+revision and marker.
 Canonical record bytes are the replay authority; PostgreSQL JSON
 reserialization is not used. Each record may occupy at most 4 MiB. Page reads
 admit at most four operations, so the limit-plus-one query materializes no more
@@ -2562,12 +2583,15 @@ one serializable transaction.
 This foundation is not retention by itself. Production version 2 still writes
 complete local history, so deployment hosts must monitor `inspectCapacity()`
 and the backing directory. The next version 3 cut must atomically adopt all
-version 2 operations into the index, then keep current storage and destroyed
-tombstones locally while serving exact operation replay from PostgreSQL. It
+version 2 operations into the index and install the covering checkpoint head
+with its exact completeness marker in the same transaction. Only then may it
+keep current storage and destroyed tombstones locally while serving exact
+operation replay from PostgreSQL. It
 must retain the origin operation referenced by each current attachment so the
 committed attachment identity remains reconstructable. The atomic cut must
-advance the version 3 checkpoint head before adding any unavailable legacy
-suffix, so the database constraint and reader both reject a partial adoption.
+advance the version 3 checkpoint head and marker in the transaction that adds
+any unavailable legacy suffix, so the database constraint and reader both
+reject a partial adoption.
 
 The resulting scope is deliberately clean and manually fenced. Two hosted
 Ubuntu runners independently anchor the archive mount-root and artifact-child

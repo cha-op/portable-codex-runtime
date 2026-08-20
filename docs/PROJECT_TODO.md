@@ -225,8 +225,15 @@
   separated record digests behind the external provider head. Native commits
   use `indexed-frame-v1`; rotated legacy history may later use
   `unavailable-adopted-v2` with a null checksum, but version 2 reads quarantine
-  that suffix. A serializable head CAS and record insert/update form one durable
-  cut; mismatch rolls back both. Prepared history may acquire its committed
+  that suffix. A nullable head marker records the exact state revision whose
+  operation index is complete. Migrated version 2 heads remain unadopted;
+  operation reads, paging, and exact-head appends fail closed until adoption.
+  Genesis-created indexed heads advance the marker with each logical append
+  and retain it across rotation. A serializable head CAS and record
+  insert/update form one durable cut. The latest validated committed record is
+  the current storage projection, and a full canonical before-state mismatch
+  rolls back the head, marker, and history. Destroyed storage remains a
+  committed tombstone. Prepared history may acquire its committed
   suffix exactly once, and operation deletion requires same-transaction
   teardown of the complete anchor; whole-table truncation is forbidden. The
   version 2 migration already requires every non-null value in the three
@@ -237,8 +244,10 @@
   serving is unchanged.
 - [pending] Third-b, switch provider state to version 3. Under the provider
   lock, validate and atomically adopt complete version 2 operation history into
-  the PostgreSQL index, then keep only current storage records and destroyed
-  tombstones in local checkpoints. Exact operation replay must come from the
+  the PostgreSQL index, install the covering version 3 checkpoint head, and set
+  its exact operation-index completeness marker in the same transaction. Only
+  then keep current storage records and destroyed tombstones in local
+  checkpoints. Exact operation replay must come from the
   permanent index, and each current attachment must retain and verify its
   origin operation. The cut must place every unavailable legacy committed
   suffix at or before the version 3 checkpoint boundary before it becomes

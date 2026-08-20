@@ -78,19 +78,21 @@ function rotationHead(expectedHead) {
 
 function preparedRecord({
   checksum = "a".repeat(64),
+  kind = "provision",
   operationId = "operation-1",
   revision = "1",
   storageId = "storage-1",
+  storageStateBefore = null,
 } = {}) {
   return {
-    kind: "provision",
+    kind,
     operationId,
     preparedChecksum: checksum,
     preparedStateRevision: revision,
     request: { storageId },
     state: "prepared",
     storageId,
-    storageStateBefore: null,
+    storageStateBefore,
   };
 }
 
@@ -285,6 +287,7 @@ class FakeAuthorityClient {
         frame_count: values[11],
         last_checksum: values[12],
         ledger_bytes: values[13],
+        operation_index_state_revision: values[14],
       };
       this.heads.set(identity, stored);
       return result("INSERT", [copyHeadRow(stored)]);
@@ -292,18 +295,19 @@ class FakeAuthorityClient {
     const stored = this.heads.get(identity);
     if (
       stored === undefined ||
-      stored.contract_version !== values[14] ||
-      stored.anchor_revision !== values[15] ||
-      stored.generation !== values[16] ||
-      stored.state_revision !== values[17] ||
-      stored.base_head_checksum !== values[18] ||
-      stored.checkpoint_state_revision !== values[19] ||
-      stored.checkpoint_frame_count !== values[20] ||
-      stored.checkpoint_checksum !== values[21] ||
-      stored.checkpoint_bytes !== values[22] ||
-      stored.frame_count !== values[23] ||
-      stored.last_checksum !== values[24] ||
-      stored.ledger_bytes !== values[25]
+      stored.contract_version !== values[15] ||
+      stored.anchor_revision !== values[16] ||
+      stored.generation !== values[17] ||
+      stored.state_revision !== values[18] ||
+      stored.base_head_checksum !== values[19] ||
+      stored.checkpoint_state_revision !== values[20] ||
+      stored.checkpoint_frame_count !== values[21] ||
+      stored.checkpoint_checksum !== values[22] ||
+      stored.checkpoint_bytes !== values[23] ||
+      stored.frame_count !== values[24] ||
+      stored.last_checksum !== values[25] ||
+      stored.ledger_bytes !== values[26] ||
+      stored.operation_index_state_revision !== values[18]
     ) {
       return result("UPDATE");
     }
@@ -322,6 +326,7 @@ class FakeAuthorityClient {
       frame_count: values[11],
       last_checksum: values[12],
       ledger_bytes: values[13],
+      operation_index_state_revision: values[14],
     };
     this.heads.set(identity, updated);
     return result("UPDATE", [copyHeadRow(updated)]);
@@ -342,6 +347,31 @@ class FakeAuthorityClient {
           "SELECT",
           stored === undefined ? [] : [copyOperationRow(stored)],
         );
+      }
+      if (text.includes("storage_id = $3")) {
+        const rows = [...this.operations.values()]
+          .filter(
+            (row) =>
+              row.provider_id === values[0] &&
+              row.anchor_id === values[1] &&
+              row.storage_id === values[2] &&
+              row.state === "committed",
+          )
+          .sort((left, right) => {
+            const revisionOrder =
+              BigInt(right.committed_state_revision) -
+              BigInt(left.committed_state_revision);
+            if (revisionOrder < 0n) return -1;
+            if (revisionOrder > 0n) return 1;
+            return left.operation_id < right.operation_id
+              ? 1
+              : left.operation_id > right.operation_id
+                ? -1
+                : 0;
+          })
+          .slice(0, 1)
+          .map(copyOperationRow);
+        return result("SELECT", rows);
       }
       const after = text.includes("operation_id COLLATE") && values.length === 4
         ? values[2]
@@ -484,6 +514,42 @@ async function appendPrepared(
   return { advanced, nextHead, record };
 }
 
+async function appendCommitted(
+  authority,
+  expectedHead,
+  prepared,
+  {
+    checksum = "b".repeat(64),
+    ledgerBytes = expectedHead.ledgerBytes + 192,
+  } = {},
+) {
+  const nextHead = appendHead(expectedHead, checksum, ledgerBytes);
+  const record = committedRecord(prepared, nextHead.stateRevision);
+  const advanced = await authority.compareAndAdvance({
+    expectedHead,
+    nextHead,
+    transition: {
+      contractVersion: 1,
+      type: "append-committed-v1",
+      frameChecksum: checksum,
+      record,
+    },
+  });
+  return { advanced, nextHead, record };
+}
+
+async function fixtureWithCommittedProvision() {
+  const fixture = createFixture();
+  const prepared = await appendPrepared(fixture.authority, GENESIS);
+  const committed = await appendCommitted(
+    fixture.authority,
+    prepared.nextHead,
+    prepared.record,
+  );
+  assert.equal(committed.advanced, true);
+  return { ...fixture, committed, prepared };
+}
+
 test("exposes a frozen exact receiver-independent authority surface", async () => {
   const { authority, createAuthority, database, store } = createFixture();
   assert.equal(
@@ -528,6 +594,12 @@ test("exposes a frozen exact receiver-independent authority surface", async () =
     { operations: [], nextAfterOperationId: null },
   );
   assert.equal(database.operations.size, 0);
+  assert.equal(
+    database.queries.some(
+      ([text]) => text.includes("filesystem_image_provider_operations"),
+    ),
+    false,
+  );
 
   assert.throws(
     () =>
@@ -549,6 +621,57 @@ test("exposes a frozen exact receiver-independent authority surface", async () =
   );
 });
 
+test("rejects a forged non-provision storage lineage at complete genesis without durable mutation", async () => {
+  const { authority, database } = createFixture();
+  const checksum = "a".repeat(64);
+  const nextHead = appendHead(GENESIS, checksum, 128);
+  const record = preparedRecord({
+    kind: "attach",
+    storageStateBefore: provisionedStorage(),
+  });
+
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: GENESIS,
+      nextHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: checksum,
+        record,
+      },
+    }),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.equal(database.heads.size, 0);
+  assert.equal(database.operations.size, 0);
+
+  const headMutationIndex = database.queries.findIndex(
+    ([text]) =>
+      text.startsWith(
+        "INSERT INTO session_authority.filesystem_image_provider_heads",
+      ),
+  );
+  const lineageReadIndex = database.queries.findIndex(
+    ([text]) =>
+      text.includes("filesystem_image_provider_operations") &&
+      text.includes("storage_id = $3"),
+  );
+  assert.ok(headMutationIndex >= 0);
+  assert.ok(lineageReadIndex > headMutationIndex);
+  assert.equal(
+    database.queries.some(
+      ([text]) =>
+        text.startsWith(
+          "INSERT INTO session_authority.filesystem_image_provider_operations",
+        ),
+    ),
+    false,
+  );
+});
+
 test("atomically appends prepared and committed rows with canonical bytes and the fixed digest vector", async () => {
   const { authority, database } = createFixture();
   const prepared = await appendPrepared(authority, GENESIS);
@@ -558,6 +681,12 @@ test("atomically appends prepared and committed rows with canonical bytes and th
   );
   assert.equal(storedPrepared.state, "prepared");
   assert.equal(storedPrepared.prepared_checksum, "a".repeat(64));
+  assert.equal(
+    database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ).operation_index_state_revision,
+    prepared.nextHead.stateRevision,
+  );
   assert.equal(
     storedPrepared.prepared_record_bytes.toString("utf8"),
     '{"kind":"provision","operationId":"operation-1",' +
@@ -617,6 +746,12 @@ test("atomically appends prepared and committed rows with canonical bytes and th
   );
   assert.equal(storedCommitted.committed_checksum, committedChecksum);
   assert.equal(
+    database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ).operation_index_state_revision,
+    committedHead.stateRevision,
+  );
+  assert.equal(
     storedCommitted.committed_record_sha256,
     createHash("sha256")
       .update(RECORD_DOMAIN)
@@ -661,6 +796,355 @@ test("atomically appends prepared and committed rows with canonical bytes and th
   assert.match(updateQuery[0], /committed_checksum = \$15/u);
   assert.equal(updateQuery[1][13], "indexed-frame-v1");
   assert.equal(updateQuery[1][14], committedChecksum);
+
+  const insertHeadQuery = database.queries.find(
+    ([text]) =>
+      text.startsWith(
+        "INSERT INTO session_authority.filesystem_image_provider_heads",
+      ),
+  );
+  const readHeadQuery = database.queries.find(
+    ([text]) =>
+      text.startsWith("SELECT ") &&
+      text.includes("filesystem_image_provider_heads"),
+  );
+  assert.match(
+    readHeadQuery[0],
+    /operation_index_state_revision::pg_catalog\.text AS operation_index_state_revision/u,
+  );
+  assert.match(
+    insertHeadQuery[0],
+    /ledger_bytes, operation_index_state_revision\) VALUES[\s\S]+\$15::pg_catalog\.numeric\)/u,
+  );
+  assert.equal(insertHeadQuery[1][14], prepared.nextHead.stateRevision);
+  const updateHeadQuery = database.queries.find(
+    ([text]) =>
+      text.startsWith(
+        "UPDATE session_authority.filesystem_image_provider_heads",
+      ),
+  );
+  assert.match(
+    updateHeadQuery[0],
+    /operation_index_state_revision = \$15::pg_catalog\.numeric[\s\S]+state_revision = \$19::pg_catalog\.numeric[\s\S]+operation_index_state_revision = \$19::pg_catalog\.numeric/u,
+  );
+  assert.equal(updateHeadQuery[1][14], committedHead.stateRevision);
+  assert.equal(updateHeadQuery[1][18], prepared.nextHead.stateRevision);
+
+  const lineageReadQueries = database.queries.filter(
+    ([text]) =>
+      text.includes("filesystem_image_provider_operations") &&
+      text.includes("storage_id = $3"),
+  );
+  assert.equal(lineageReadQueries.length, 2);
+  const lineageReadQuery = lineageReadQueries[0];
+  assert.match(
+    lineageReadQuery[0],
+    /WHERE provider_id = \$1 AND anchor_id = \$2 AND storage_id = \$3 AND state = 'committed' ORDER BY committed_state_revision DESC, operation_id COLLATE pg_catalog\."C" DESC LIMIT 1/u,
+  );
+  assert.deepEqual(lineageReadQuery[1], [
+    "filesystem-image-ext4",
+    "host-primary",
+    "storage-1",
+  ]);
+  assert.ok(
+    database.queries.indexOf(insertHeadQuery) <
+      database.queries.indexOf(lineageReadQueries[0]),
+  );
+  assert.ok(
+    database.queries.indexOf(lineageReadQueries[0]) <
+      database.queries.indexOf(insertQuery),
+  );
+  assert.ok(
+    database.queries.indexOf(updateHeadQuery) <
+      database.queries.indexOf(lineageReadQueries[1]),
+  );
+  assert.ok(
+    database.queries.indexOf(lineageReadQueries[1]) <
+      database.queries.indexOf(updateQuery),
+  );
+});
+
+test("rolls back a repeated null-before provision after the storage has committed", async () => {
+  const { authority, committed, database } =
+    await fixtureWithCommittedProvision();
+  const beforeHead = copyHeadRow(
+    database.heads.get(identityKey("filesystem-image-ext4", "host-primary")),
+  );
+  const beforeOperations = cloneMap(database.operations, copyOperationRow);
+  const checksum = "c".repeat(64);
+  const nextHead = appendHead(committed.nextHead, checksum, 512);
+  const record = preparedRecord({
+    checksum,
+    operationId: "operation-2",
+    revision: nextHead.stateRevision,
+  });
+
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: committed.nextHead,
+      nextHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: checksum,
+        record,
+      },
+    }),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.deepEqual(
+    database.heads.get(identityKey("filesystem-image-ext4", "host-primary")),
+    beforeHead,
+  );
+  assert.deepEqual(database.operations, beforeOperations);
+});
+
+test("rejects stale storage revision and physical identity lineage after the head CAS", async (t) => {
+  for (const [name, staleBefore] of [
+    [
+      "revision",
+      {
+        ...provisionedStorage(),
+        revision: "2",
+      },
+    ],
+    [
+      "physical identity",
+      {
+        ...provisionedStorage(),
+        mount: {
+          ...provisionedStorage().mount,
+          rootIdentity: {
+            ...provisionedStorage().mount.rootIdentity,
+            objectId: "1:30",
+          },
+        },
+      },
+    ],
+  ]) {
+    await t.test(name, async () => {
+      const { authority, committed, database } =
+        await fixtureWithCommittedProvision();
+      const beforeHead = copyHeadRow(
+        database.heads.get(
+          identityKey("filesystem-image-ext4", "host-primary"),
+        ),
+      );
+      const checksum = "c".repeat(64);
+      const nextHead = appendHead(committed.nextHead, checksum, 512);
+      const record = preparedRecord({
+        checksum,
+        kind: "checkpoint",
+        operationId: `operation-stale-${name.replace(" ", "-")}`,
+        revision: nextHead.stateRevision,
+        storageStateBefore: staleBefore,
+      });
+
+      await assert.rejects(
+        authority.compareAndAdvance({
+          expectedHead: committed.nextHead,
+          nextHead,
+          transition: {
+            contractVersion: 1,
+            type: "append-prepared-v1",
+            frameChecksum: checksum,
+            record,
+          },
+        }),
+        authorityError(
+          "postgres_filesystem_image_provider_state_authority_state_invalid",
+        ),
+      );
+      assert.deepEqual(
+        database.heads.get(
+          identityKey("filesystem-image-ext4", "host-primary"),
+        ),
+        beforeHead,
+      );
+      assert.equal(database.operations.size, 1);
+    });
+  }
+});
+
+test("isolates latest committed storage lineage by storage id", async () => {
+  const { authority, committed, database } =
+    await fixtureWithCommittedProvision();
+  const checksum = "c".repeat(64);
+  const nextHead = appendHead(committed.nextHead, checksum, 512);
+  const record = preparedRecord({
+    checksum,
+    operationId: "operation-storage-2",
+    revision: nextHead.stateRevision,
+    storageId: "storage-2",
+  });
+
+  assert.equal(
+    await authority.compareAndAdvance({
+      expectedHead: committed.nextHead,
+      nextHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: checksum,
+        record,
+      },
+    }),
+    true,
+  );
+  assert.equal(database.operations.size, 2);
+  const lineageReads = database.queries.filter(
+    ([text]) =>
+      text.includes("filesystem_image_provider_operations") &&
+      text.includes("storage_id = $3"),
+  );
+  assert.deepEqual(lineageReads.at(-1)[1], [
+    "filesystem-image-ext4",
+    "host-primary",
+    "storage-2",
+  ]);
+});
+
+test("fails closed and rolls back the head when the latest committed storage row is corrupt", async () => {
+  const { authority, committed, database } =
+    await fixtureWithCommittedProvision();
+  const beforeHead = copyHeadRow(
+    database.heads.get(identityKey("filesystem-image-ext4", "host-primary")),
+  );
+  database.operations.get(
+    operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
+  ).committed_record_sha256 = "f".repeat(64);
+  const checksum = "c".repeat(64);
+  const nextHead = appendHead(committed.nextHead, checksum, 512);
+  const record = preparedRecord({
+    checksum,
+    kind: "checkpoint",
+    operationId: "operation-2",
+    revision: nextHead.stateRevision,
+    storageStateBefore: provisionedStorage(),
+  });
+
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: committed.nextHead,
+      nextHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: checksum,
+        record,
+      },
+    }),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.deepEqual(
+    database.heads.get(identityKey("filesystem-image-ext4", "host-primary")),
+    beforeHead,
+  );
+  assert.equal(database.operations.size, 1);
+  assert.equal(
+    database.operations.has(
+      operationKey("filesystem-image-ext4", "host-primary", "operation-2"),
+    ),
+    false,
+  );
+});
+
+test("fails closed on a non-genesis head whose operation index marker is missing or behind", async (t) => {
+  for (const [name, marker] of [
+    ["missing", null],
+    ["behind", "0"],
+  ]) {
+    await t.test(name, async () => {
+      const { authority, database } = createFixture();
+      const prepared = await appendPrepared(authority, GENESIS);
+      const headKey = identityKey(
+        "filesystem-image-ext4",
+        "host-primary",
+      );
+      database.heads.get(headKey).operation_index_state_revision = marker;
+      const beforeHead = copyHeadRow(database.heads.get(headKey));
+      const beforeOperations = cloneMap(database.operations, copyOperationRow);
+      const beforeQueries = database.queries.length;
+
+      await assert.rejects(
+        authority.readOperation({
+          expectedHead: prepared.nextHead,
+          operationId: "operation-1",
+        }),
+        authorityError(
+          "postgres_filesystem_image_provider_state_authority_state_invalid",
+        ),
+      );
+      await assert.rejects(
+        authority.readOperationsPage({
+          afterOperationId: null,
+          expectedHead: prepared.nextHead,
+          limit: 1,
+        }),
+        authorityError(
+          "postgres_filesystem_image_provider_state_authority_state_invalid",
+        ),
+      );
+
+      const checksum = "b".repeat(64);
+      const nextHead = appendHead(prepared.nextHead, checksum, 320);
+      await assert.rejects(
+        authority.compareAndAdvance({
+          expectedHead: prepared.nextHead,
+          nextHead,
+          transition: {
+            contractVersion: 1,
+            type: "append-committed-v1",
+            frameChecksum: checksum,
+            record: committedRecord(
+              prepared.record,
+              nextHead.stateRevision,
+            ),
+          },
+        }),
+        authorityError(
+          "postgres_filesystem_image_provider_state_authority_state_invalid",
+        ),
+      );
+      assert.deepEqual(database.heads.get(headKey), beforeHead);
+      assert.deepEqual(database.operations, beforeOperations);
+      assert.equal(
+        database.queries.slice(beforeQueries).some(
+          ([text]) =>
+            text.includes("filesystem_image_provider_operations") ||
+            text.startsWith(
+              "UPDATE session_authority.filesystem_image_provider_heads",
+            ),
+        ),
+        false,
+      );
+
+      const staleChecksum = "c".repeat(64);
+      assert.equal(
+        await authority.compareAndAdvance({
+          expectedHead: GENESIS,
+          nextHead: appendHead(GENESIS, staleChecksum, 128),
+          transition: {
+            contractVersion: 1,
+            type: "append-prepared-v1",
+            frameChecksum: staleChecksum,
+            record: preparedRecord({
+              checksum: staleChecksum,
+              operationId: "operation-stale-head",
+              storageId: "storage-2",
+            }),
+          },
+        }),
+        false,
+      );
+      assert.deepEqual(database.heads.get(headKey), beforeHead);
+      assert.deepEqual(database.operations, beforeOperations);
+    });
+  }
 });
 
 test("rotates the head without mutating permanent operations", async () => {
@@ -677,6 +1161,12 @@ test("rotates the head without mutating permanent operations", async () => {
     true,
   );
   assert.deepEqual(database.operations, before);
+  assert.equal(
+    database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ).operation_index_state_revision,
+    prepared.nextHead.stateRevision,
+  );
   assert.deepEqual(await authority.readHead(), nextHead);
   assert.deepEqual(
     await authority.readOperation({
@@ -842,7 +1332,7 @@ test("returns false on exact head CAS loss before any operation mutation", async
   assert.deepEqual(await authority.readHead(), GENESIS);
 });
 
-test("rolls back a successful head CAS when the exact operation mutation mismatches", async () => {
+test("rolls back a successful head and marker CAS when the exact operation mutation mismatches", async () => {
   const { authority, database } = createFixture();
   const prepared = await appendPrepared(authority, GENESIS);
   const beforeHead = copyHeadRow(
@@ -852,6 +1342,10 @@ test("rolls back a successful head CAS when the exact operation mutation mismatc
     database.operations.get(
       operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
     ),
+  );
+  assert.equal(
+    beforeHead.operation_index_state_revision,
+    prepared.nextHead.stateRevision,
   );
   const checksum = "b".repeat(64);
   const nextHead = appendHead(prepared.nextHead, checksum, 320);

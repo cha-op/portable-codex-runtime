@@ -549,8 +549,15 @@ and remount verification plus a producer peer-namespace non-propagation gate.
 Their trusted persistent-identity bridge and same-process conformance evidence
 are complete. Migration 010 now adds the separate PostgreSQL provider-operation
 index authority foundation: an exact head CAS and prepared/committed record
-transition share one serializable durable cut, while existing version 2 heads
-retain their logical values and serving remains unchanged. Migration 008
+transition share one serializable durable cut. A nullable completeness marker
+leaves migrated version 2 heads explicitly unadopted, while genesis-created
+indexed heads advance the marker with every logical operation and retain it
+through rotation. Operation reads, paging, and exact-head appends fail closed
+on an unadopted head. The latest validated committed operation for a storage
+is its current PostgreSQL projection; every operation append compares the full
+canonical before-state, and destroyed state remains a committed tombstone.
+Existing version 2 heads retain their logical values and production serving
+remains unchanged. Migration 008
 already requires every non-null value in the three head-checksum columns to be
 an exact 64-byte lowercase-hex value; migration 010 normalizes those valid
 values to `varchar(64)` before version 3, and the permanent history table cannot
@@ -559,8 +566,10 @@ Native committed suffixes retain an exact frame
 checksum; unrecoverable rotated version 2 checksums have a separate null-
 checksum provenance that remains quarantined until a covering version 3
 checkpoint cut. The next slice owns that atomic version 2 adoption and the
-version 3 checkpoint cut that removes permanent operation history from local
-checkpoints. See `linux-ext4-physical-backend.md`. Later slices own
+version 3 checkpoint cut: complete import, covering head, and exact
+completeness marker must commit together before permanent operation history is
+removed from local checkpoints. See `linux-ext4-physical-backend.md`. Later
+slices own
 power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
 export/compression, content-addressed distribution, encryption, registry trust,
 remote transport, and broader operational hardening.

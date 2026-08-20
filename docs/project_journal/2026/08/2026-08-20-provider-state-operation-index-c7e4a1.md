@@ -18,6 +18,8 @@ superseded_by:
   filesystem-image-provider operation history.
 - Added a separate state-authority adapter that advances the external head and
   matching prepared or committed record in one serializable durable cut.
+- Added an exact-revision completeness marker so migrated head-only version 2
+  state cannot be mistaken for a complete empty operation index.
 - Kept production version 2 provider-state serving unchanged. The version 3
   adoption and local-history removal remain the next independent slice.
 
@@ -28,6 +30,9 @@ superseded_by:
   head. It stores bounded canonical UTF-8 bytes rather than PostgreSQL JSON
   text, plus a domain-separated record digest and explicit operation, storage,
   logical-revision, prepared-checksum, and committed-checksum provenance.
+  A dedicated partial index selects the latest committed operation for one
+  storage; its fully validated canonical record is the current storage
+  projection rather than a second mutable storage table.
 - A row starts with the complete prepared checkpoint record. Its prepared
   prefix is immutable; it may gain the exact committed record, revision,
   checksum provenance, and digest once. Native commits use `indexed-frame-v1`
@@ -42,16 +47,30 @@ superseded_by:
   lowercase-hex value. Migration 010 normalizes those valid values to
   `varchar(64)` before version 3 and defines all four operation checksum/digest
   columns with the same exact format.
+- `filesystem_image_provider_heads.operation_index_state_revision` is the
+  internal completeness marker. Existing version 2 rows remain null and
+  unadopted. A genesis-created indexed head sets it on the first logical
+  append, each later logical append advances it with `state_revision`, and
+  maintenance rotation retains it. Version 3 rows require an exact non-null
+  marker.
 - `createPostgresFilesystemImageProviderStateAuthority()` is separate from the
   existing exact two-method head anchor. It supports exact head-bound reads,
   C-collated bounded operation paging, append-prepared, append-committed, and
   rotation transitions. Append checksums must equal `nextHead.lastChecksum`;
   the prepared record also repeats that checksum. Page reads accept no more
   than four operations and each canonical record is capped at 4 MiB.
-- The adapter performs the complete head compare-and-swap first, then applies
-  the matching operation mutation in the same serializable transaction. A
-  stale head returns `false` without touching history. Any operation mismatch
-  aborts the transaction and therefore rolls the head back. Commit
+- The adapter performs the complete head-and-marker compare-and-swap before it
+  applies the matching operation mutation in the same serializable
+  transaction. An
+  exact but null or lagging marker fails closed; `readHead()` may still return
+  the public legacy head, but operation read, paging, and exact-head append do
+  not interpret missing history as absent storage. A stale public head returns
+  `false` without touching history. After winning the CAS, the adapter derives
+  current storage from the latest fully validated committed operation and
+  compares the complete canonical `storageStateBefore`. Any projection or
+  operation mismatch aborts the transaction and therefore rolls the head,
+  marker, and history back. A committed destroyed state remains the latest
+  tombstone rather than reopening the storage ID. Commit
   acknowledgement loss remains explicit; exact head and operation readback can
   determine whether the joint durable cut exists.
 - Migration 010 permits external head contract versions 2 and 3 and normalizes
@@ -81,9 +100,11 @@ superseded_by:
 
 - Implement the version 3 provider-state switch. Under the provider lock,
   validate complete version 2 checkpoint and log history, import it atomically
-  into an empty PostgreSQL index while advancing the head, and resolve commit
-  acknowledgement loss by exact readback. The version 3 checkpoint must cover
-  every unavailable legacy suffix before that suffix becomes readable.
+  into an empty PostgreSQL index while installing the covering version 3 head
+  and its exact completeness marker, and resolve commit acknowledgement loss
+  by exact readback. All three parts must commit together. The version 3
+  checkpoint must cover every unavailable legacy suffix before that suffix
+  becomes readable.
 - Make version 3 checkpoints retain current storage and destroyed tombstones
   while serving arbitrary-age exact operation replay from PostgreSQL. Preserve
   and validate each current attachment's origin operation.

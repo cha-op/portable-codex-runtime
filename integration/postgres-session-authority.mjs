@@ -611,6 +611,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
 
   const providerId = "filesystem-image-ext4";
   const anchorId = `operation-index-${randomUUID()}`;
+  const legacyAnchorId = `operation-index-legacy-v2-${randomUUID()}`;
   const acknowledgementLossAnchorId =
     `operation-index-ack-loss-${randomUUID()}`;
   const adoptedAnchorId = `operation-index-adopted-v2-${randomUUID()}`;
@@ -674,18 +675,21 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   };
   const preparedRecord = ({
     checksum,
+    kind = "provision",
     operationId,
     revision,
+    request,
     storageId,
+    storageStateBefore = null,
   }) => ({
-    kind: "provision",
+    kind,
     operationId,
     preparedChecksum: checksum,
     preparedStateRevision: revision,
-    request: { storageId },
+    request: request ?? { storageId },
     state: "prepared",
     storageId,
-    storageStateBefore: null,
+    storageStateBefore,
   });
   const provisionedStorage = (storageId) => ({
     storageId,
@@ -744,9 +748,41 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
 
   const legacyHead = appendHead(genesis, "1".repeat(64), 512);
   assert.equal(
-    await createHeadAnchor(store, anchorId).compareAndAdvance({
+    await createHeadAnchor(store, legacyAnchorId).compareAndAdvance({
       expectedHead: genesis,
       nextHead: legacyHead,
+    }),
+    true,
+  );
+  const adoptedPreparedHead = appendHead(genesis, "4".repeat(64), 512);
+  const adoptedCommittedHead = appendHead(
+    adoptedPreparedHead,
+    "5".repeat(64),
+    1024,
+  );
+  const adoptedOperationId = `provider-operation-adopted-${randomUUID()}`;
+  const adoptedPrepared = preparedRecord({
+    checksum: adoptedPreparedHead.lastChecksum,
+    operationId: adoptedOperationId,
+    revision: adoptedPreparedHead.stateRevision,
+    storageId: `provider-storage-adopted-${randomUUID()}`,
+  });
+  const adoptedCommitted = committedRecord(
+    adoptedPrepared,
+    adoptedCommittedHead.stateRevision,
+  );
+  const adoptedHeadAnchor = createHeadAnchor(store, adoptedAnchorId);
+  assert.equal(
+    await adoptedHeadAnchor.compareAndAdvance({
+      expectedHead: genesis,
+      nextHead: adoptedPreparedHead,
+    }),
+    true,
+  );
+  assert.equal(
+    await adoptedHeadAnchor.compareAndAdvance({
+      expectedHead: adoptedPreparedHead,
+      nextHead: adoptedCommittedHead,
     }),
     true,
   );
@@ -757,7 +793,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       "FROM session_authority.filesystem_image_provider_heads",
       "WHERE provider_id = $1 AND anchor_id = $2",
     ].join(" "),
-    [providerId, anchorId],
+    [providerId, legacyAnchorId],
   );
   const rejectedShortAnchorId =
     `operation-index-bpchar-short-${randomUUID()}`;
@@ -820,6 +856,23 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     checksum: trackedMigrations.at(-1).checksum,
     version: 10,
   });
+  const operationIndexMarkerColumn = await pool.query(
+    [
+      "SELECT pg_catalog.format_type(attribute.atttypid, attribute.atttypmod)",
+      "AS data_type, attribute.attnotnull",
+      "FROM pg_catalog.pg_attribute AS attribute",
+      "JOIN pg_catalog.pg_class AS relation ON relation.oid = attribute.attrelid",
+      "JOIN pg_catalog.pg_namespace AS namespace",
+      "ON namespace.oid = relation.relnamespace",
+      "WHERE namespace.nspname = 'session_authority'",
+      "AND relation.relname = 'filesystem_image_provider_heads'",
+      "AND attribute.attname = 'operation_index_state_revision'",
+      "AND attribute.attnum > 0 AND attribute.attisdropped = false",
+    ].join(" "),
+  );
+  assert.deepEqual(operationIndexMarkerColumn.rows, [
+    { data_type: "numeric(20,0)", attnotnull: false },
+  ]);
   const legacyAfter = await pool.query(
     [
       "SELECT contract_version, anchor_revision::pg_catalog.text AS anchor_revision,",
@@ -827,7 +880,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       "FROM session_authority.filesystem_image_provider_heads",
       "WHERE provider_id = $1 AND anchor_id = $2",
     ].join(" "),
-    [providerId, anchorId],
+    [providerId, legacyAnchorId],
   );
   assert.deepEqual(legacyAfter.rows, legacyBefore.rows);
   assert.deepEqual(legacyAfter.rows, [
@@ -845,7 +898,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
         "SET last_checksum = $3",
         "WHERE provider_id = $1 AND anchor_id = $2",
       ].join(" "),
-      [providerId, anchorId, "a".repeat(63)],
+      [providerId, legacyAnchorId, "a".repeat(63)],
     ),
     (error) => {
       assert.equal(error.code, "23514");
@@ -863,9 +916,29 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       "FROM session_authority.filesystem_image_provider_heads",
       "WHERE provider_id = $1 AND anchor_id = $2",
     ].join(" "),
-    [providerId, anchorId],
+    [providerId, legacyAnchorId],
   );
   assert.deepEqual(legacyAfterRejectedShortChecksum.rows, legacyAfter.rows);
+  const migratedMarkerRows = await pool.query(
+    [
+      "SELECT anchor_id,",
+      "operation_index_state_revision::pg_catalog.text",
+      "AS operation_index_state_revision",
+      "FROM session_authority.filesystem_image_provider_heads",
+      "WHERE provider_id = $1 AND anchor_id IN ($2, $3)",
+      'ORDER BY anchor_id COLLATE pg_catalog."C"',
+    ].join(" "),
+    [providerId, legacyAnchorId, adoptedAnchorId],
+  );
+  assert.deepEqual(
+    migratedMarkerRows.rows,
+    [legacyAnchorId, adoptedAnchorId]
+      .sort()
+      .map((selectedAnchorId) => ({
+        anchor_id: selectedAnchorId,
+        operation_index_state_revision: null,
+      })),
+  );
   const checksumColumnTypes = await pool.query(
     [
       "SELECT relation.relname AS relation_name,",
@@ -939,11 +1012,43 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     ].join(" "),
   );
   assert.deepEqual(operationIndexes.rows, [
+    {
+      indexname:
+        "filesystem_image_provider_operations_committed_storage_tail_idx",
+    },
     { indexname: "filesystem_image_provider_operations_one_prepared_storage" },
     { indexname: "filesystem_image_provider_operations_pkey" },
     { indexname: "filesystem_image_provider_operations_prepared_revision_idx" },
     { indexname: "filesystem_image_provider_operations_state_storage_idx" },
   ]);
+  const committedStorageTailIndex = await pool.query(
+    [
+      "SELECT index_catalog.indisunique, index_catalog.indnkeyatts,",
+      "index_catalog.indpred IS NOT NULL AS has_predicate,",
+      "pg_catalog.pg_get_expr(",
+      "index_catalog.indpred, index_catalog.indrelid, true) AS predicate",
+      "FROM pg_catalog.pg_index AS index_catalog",
+      "JOIN pg_catalog.pg_class AS index_relation",
+      "ON index_relation.oid = index_catalog.indexrelid",
+      "JOIN pg_catalog.pg_namespace AS namespace",
+      "ON namespace.oid = index_relation.relnamespace",
+      "WHERE namespace.nspname = 'session_authority'",
+      "AND index_relation.relname =",
+      "'filesystem_image_provider_operations_committed_storage_tail_idx'",
+    ].join(" "),
+  );
+  assert.equal(committedStorageTailIndex.rowCount, 1);
+  assert.equal(committedStorageTailIndex.rows[0].indisunique, false);
+  assert.equal(committedStorageTailIndex.rows[0].indnkeyatts, 5);
+  assert.equal(committedStorageTailIndex.rows[0].has_predicate, true);
+  assert.equal(
+    committedStorageTailIndex.rows[0].predicate.includes("state"),
+    true,
+  );
+  assert.equal(
+    committedStorageTailIndex.rows[0].predicate.includes("committed"),
+    true,
+  );
   const operationTriggers = await pool.query(
     [
       "SELECT trigger.tgname, trigger.tgdeferrable, trigger.tginitdeferred",
@@ -980,7 +1085,6 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     },
   ]);
 
-  const authority = createAuthority(store, anchorId);
   const assertStateInvalid = (error) => {
     assert.equal(
       error instanceof PostgresFilesystemImageProviderStateAuthorityError,
@@ -992,9 +1096,87 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     );
     return true;
   };
-  assert.deepEqual(await authority.readHead(), legacyHead);
+  const readProviderAnchorSnapshot = async (selectedAnchorId) => {
+    const head = await pool.query(
+      [
+        "SELECT contract_version, anchor_revision::pg_catalog.text,",
+        "generation::pg_catalog.text, state_revision::pg_catalog.text,",
+        "base_head_checksum, checkpoint_state_revision::pg_catalog.text,",
+        "checkpoint_frame_count::pg_catalog.text, checkpoint_checksum,",
+        "checkpoint_bytes::pg_catalog.text, frame_count::pg_catalog.text,",
+        "last_checksum, ledger_bytes::pg_catalog.text,",
+        "operation_index_state_revision::pg_catalog.text",
+        "FROM session_authority.filesystem_image_provider_heads",
+        "WHERE provider_id = $1 AND anchor_id = $2",
+      ].join(" "),
+      [providerId, selectedAnchorId],
+    );
+    const operations = await pool.query(
+      [
+        "SELECT operation_id, record_contract_version, state, kind, storage_id,",
+        "prepared_state_revision::pg_catalog.text, prepared_checksum,",
+        "pg_catalog.encode(prepared_record_bytes, 'hex') AS prepared_record_hex,",
+        "prepared_record_sha256, committed_state_revision::pg_catalog.text,",
+        "committed_checksum_provenance, committed_checksum,",
+        "pg_catalog.encode(committed_record_bytes, 'hex') AS committed_record_hex,",
+        "committed_record_sha256",
+        "FROM session_authority.filesystem_image_provider_operations",
+        "WHERE provider_id = $1 AND anchor_id = $2",
+        'ORDER BY operation_id COLLATE pg_catalog."C"',
+      ].join(" "),
+      [providerId, selectedAnchorId],
+    );
+    return { head: head.rows, operations: operations.rows };
+  };
+
+  const legacyAuthority = createAuthority(store, legacyAnchorId);
+  assert.deepEqual(await legacyAuthority.readHead(), legacyHead);
+  const legacySnapshot = await readProviderAnchorSnapshot(legacyAnchorId);
+  const legacyOperationId = `provider-operation-legacy-${randomUUID()}`;
+  const legacyNextHead = appendHead(legacyHead, "a".repeat(64), 1024);
+  const legacyPrepared = preparedRecord({
+    checksum: legacyNextHead.lastChecksum,
+    operationId: legacyOperationId,
+    revision: legacyNextHead.stateRevision,
+    storageId: `provider-storage-legacy-${randomUUID()}`,
+  });
+  await assert.rejects(
+    legacyAuthority.readOperation({
+      expectedHead: legacyHead,
+      operationId: legacyOperationId,
+    }),
+    assertStateInvalid,
+  );
+  await assert.rejects(
+    legacyAuthority.readOperationsPage({
+      afterOperationId: null,
+      expectedHead: legacyHead,
+      limit: 1,
+    }),
+    assertStateInvalid,
+  );
+  await assert.rejects(
+    legacyAuthority.compareAndAdvance({
+      expectedHead: legacyHead,
+      nextHead: legacyNextHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: legacyNextHead.lastChecksum,
+        record: legacyPrepared,
+      },
+    }),
+    assertStateInvalid,
+  );
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(legacyAnchorId),
+    legacySnapshot,
+  );
+
+  const authority = createAuthority(store, anchorId);
+  assert.deepEqual(await authority.readHead(), genesis);
   const operationZ = `provider-operation-z-${randomUUID()}`;
-  const preparedZHead = appendHead(legacyHead, "a".repeat(64), 1024);
+  const preparedZHead = appendHead(genesis, "a".repeat(64), 512);
   const preparedZ = preparedRecord({
     checksum: preparedZHead.lastChecksum,
     operationId: operationZ,
@@ -1003,7 +1185,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   });
   assert.equal(
     await authority.compareAndAdvance({
-      expectedHead: legacyHead,
+      expectedHead: genesis,
       nextHead: preparedZHead,
       transition: {
         contractVersion: 1,
@@ -1013,6 +1195,18 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       },
     }),
     true,
+  );
+  const preparedZSnapshot = await readProviderAnchorSnapshot(anchorId);
+  assert.equal(
+    preparedZSnapshot.head[0].operation_index_state_revision,
+    preparedZHead.stateRevision,
+  );
+  assert.deepEqual(
+    preparedZSnapshot.operations.map(({ operation_id, state }) => ({
+      operation_id,
+      state,
+    })),
+    [{ operation_id: operationZ, state: "prepared" }],
   );
   assert.deepEqual(
     await authority.readOperation({
@@ -1356,6 +1550,205 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     }),
     committedZ,
   );
+  const committedZSnapshot = await readProviderAnchorSnapshot(anchorId);
+  assert.equal(
+    committedZSnapshot.head[0].operation_index_state_revision,
+    committedZHead.stateRevision,
+  );
+  assert.deepEqual(
+    committedZSnapshot.operations.map(({ operation_id, state }) => ({
+      operation_id,
+      state,
+    })),
+    [{ operation_id: operationZ, state: "committed" }],
+  );
+
+  const duplicateProvisionHead = appendHead(
+    committedZHead,
+    "2".repeat(64),
+    2048,
+  );
+  const duplicateProvision = preparedRecord({
+    checksum: duplicateProvisionHead.lastChecksum,
+    operationId: `provider-operation-duplicate-${randomUUID()}`,
+    revision: duplicateProvisionHead.stateRevision,
+    storageId: preparedZ.storageId,
+  });
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: committedZHead,
+      nextHead: duplicateProvisionHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: duplicateProvisionHead.lastChecksum,
+        record: duplicateProvision,
+      },
+    }),
+    assertStateInvalid,
+  );
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(anchorId),
+    committedZSnapshot,
+  );
+
+  const mismatchedProjectionHead = appendHead(
+    committedZHead,
+    "3".repeat(64),
+    2048,
+  );
+  const mismatchedProjection = preparedRecord({
+    checksum: mismatchedProjectionHead.lastChecksum,
+    kind: "checkpoint",
+    operationId: `provider-operation-mismatched-before-${randomUUID()}`,
+    revision: mismatchedProjectionHead.stateRevision,
+    request: { storageId: preparedZ.storageId },
+    storageId: preparedZ.storageId,
+    storageStateBefore: {
+      ...committedZ.storageState,
+      publicationControlIdentity: {
+        ...committedZ.storageState.publicationControlIdentity,
+        objectId: `${preparedZ.storageId}:different-publication`,
+      },
+    },
+  });
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: committedZHead,
+      nextHead: mismatchedProjectionHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: mismatchedProjectionHead.lastChecksum,
+        record: mismatchedProjection,
+      },
+    }),
+    assertStateInvalid,
+  );
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(anchorId),
+    committedZSnapshot,
+  );
+
+  const phantomStorageId = `provider-storage-phantom-${randomUUID()}`;
+  const phantomAttachHead = appendHead(
+    committedZHead,
+    "4".repeat(64),
+    2048,
+  );
+  const phantomAttach = preparedRecord({
+    checksum: phantomAttachHead.lastChecksum,
+    kind: "attach",
+    operationId: `provider-operation-phantom-${randomUUID()}`,
+    revision: phantomAttachHead.stateRevision,
+    request: { storageId: phantomStorageId },
+    storageId: phantomStorageId,
+    storageStateBefore: provisionedStorage(phantomStorageId),
+  });
+  await assert.rejects(
+    authority.compareAndAdvance({
+      expectedHead: committedZHead,
+      nextHead: phantomAttachHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: phantomAttachHead.lastChecksum,
+        record: phantomAttach,
+      },
+    }),
+    assertStateInvalid,
+  );
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(anchorId),
+    committedZSnapshot,
+  );
+
+  let markerCasInterfered = false;
+  const markerCasInterferencePool = Object.freeze({
+    async connect() {
+      const client = await pool.connect();
+      return {
+        connection: client.connection,
+        async query(...args) {
+          const input = args[0];
+          const text =
+            typeof input === "string" ? input : input?.text;
+          if (
+            !markerCasInterfered &&
+            typeof text === "string" &&
+            text.startsWith(
+              "UPDATE session_authority.filesystem_image_provider_heads",
+            ) &&
+            text.includes(
+              "AND operation_index_state_revision = $19::pg_catalog.numeric",
+            )
+          ) {
+            markerCasInterfered = true;
+            await client.query(
+              [
+                "UPDATE session_authority.filesystem_image_provider_heads",
+                "SET operation_index_state_revision = NULL",
+                "WHERE provider_id = $1 AND anchor_id = $2",
+              ].join(" "),
+              [providerId, anchorId],
+            );
+            try {
+              return await Reflect.apply(client.query, client, args);
+            } finally {
+              await client.query(
+                [
+                  "UPDATE session_authority.filesystem_image_provider_heads",
+                  "SET operation_index_state_revision = state_revision",
+                  "WHERE provider_id = $1 AND anchor_id = $2",
+                ].join(" "),
+                [providerId, anchorId],
+              );
+            }
+          }
+          return Reflect.apply(client.query, client, args);
+        },
+        release(...args) {
+          return Reflect.apply(client.release, client, args);
+        },
+      };
+    },
+  });
+  const markerCasInterferenceStore = new PostgresSerializableStore({
+    dedicatedPool: markerCasInterferencePool,
+    maxTransactionAttempts: 1,
+  });
+  const markerCasMissHead = appendHead(
+    committedZHead,
+    "5".repeat(64),
+    2048,
+  );
+  const markerCasMissOperation = preparedRecord({
+    checksum: markerCasMissHead.lastChecksum,
+    operationId: `provider-operation-marker-race-${randomUUID()}`,
+    revision: markerCasMissHead.stateRevision,
+    storageId: `provider-storage-marker-race-${randomUUID()}`,
+  });
+  assert.equal(
+    await createAuthority(
+      markerCasInterferenceStore,
+      anchorId,
+    ).compareAndAdvance({
+      expectedHead: committedZHead,
+      nextHead: markerCasMissHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: markerCasMissHead.lastChecksum,
+        record: markerCasMissOperation,
+      },
+    }),
+    false,
+  );
+  assert.equal(markerCasInterfered, true);
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(anchorId),
+    committedZSnapshot,
+  );
 
   const operationA = `provider-operation-A-${randomUUID()}`;
   const preparedAHead = appendHead(committedZHead, "c".repeat(64), 2048);
@@ -1486,6 +1879,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   );
   assert.deepEqual(await authority.readHead(), committedAHead);
 
+  const beforeRotationSnapshot = await readProviderAnchorSnapshot(anchorId);
   const rotatedHead = rotationHead(committedAHead);
   assert.equal(
     await authority.compareAndAdvance({
@@ -1494,6 +1888,15 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       transition: { contractVersion: 1, type: "rotate-v1" },
     }),
     true,
+  );
+  const afterRotationSnapshot = await readProviderAnchorSnapshot(anchorId);
+  assert.equal(
+    afterRotationSnapshot.head[0].operation_index_state_revision,
+    beforeRotationSnapshot.head[0].operation_index_state_revision,
+  );
+  assert.deepEqual(
+    afterRotationSnapshot.operations,
+    beforeRotationSnapshot.operations,
   );
   assert.deepEqual(
     await authority.readOperationsPage({
@@ -1507,37 +1910,17 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     },
   );
 
-  const adoptedAuthority = createAuthority(store, adoptedAnchorId);
-  const adoptedPreparedHead = appendHead(genesis, "4".repeat(64), 512);
-  const adoptedOperationId = `provider-operation-adopted-${randomUUID()}`;
-  const adoptedPrepared = preparedRecord({
-    checksum: adoptedPreparedHead.lastChecksum,
-    operationId: adoptedOperationId,
-    revision: adoptedPreparedHead.stateRevision,
-    storageId: `provider-storage-adopted-${randomUUID()}`,
-  });
-  assert.equal(
-    await adoptedAuthority.compareAndAdvance({
-      expectedHead: genesis,
-      nextHead: adoptedPreparedHead,
-      transition: {
-        contractVersion: 1,
-        type: "append-prepared-v1",
-        frameChecksum: adoptedPreparedHead.lastChecksum,
-        record: adoptedPrepared,
-      },
-    }),
-    true,
+  const adoptedPreparedBytes = Buffer.from(
+    canonicalRecordJson(adoptedPrepared),
+    "utf8",
   );
-  const adoptedCommittedHead = appendHead(
-    adoptedPreparedHead,
-    "5".repeat(64),
-    1024,
-  );
-  const adoptedCommitted = committedRecord(
-    adoptedPrepared,
-    adoptedCommittedHead.stateRevision,
-  );
+  const adoptedPreparedSha256 = createHash("sha256")
+    .update(
+      "portable-codex/filesystem-image-provider-state/operation-record/v1\0",
+      "utf8",
+    )
+    .update(adoptedPreparedBytes)
+    .digest("hex");
   const adoptedCommittedBytes = Buffer.from(
     canonicalRecordJson(adoptedCommitted),
     "utf8",
@@ -1549,13 +1932,25 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     )
     .update(adoptedCommittedBytes)
     .digest("hex");
-  assert.equal(
-    await createHeadAnchor(store, adoptedAnchorId).compareAndAdvance({
-      expectedHead: adoptedPreparedHead,
-      nextHead: adoptedCommittedHead,
-    }),
-    true,
-  );
+  const adoptedInsertQuery = [
+    "INSERT INTO session_authority.filesystem_image_provider_operations",
+    "(provider_id, anchor_id, operation_id, record_contract_version, state,",
+    "kind, storage_id, prepared_state_revision, prepared_checksum,",
+    "prepared_record_bytes, prepared_record_sha256)",
+    "VALUES ($1, $2, $3, 1, 'prepared', $4, $5,",
+    "$6::pg_catalog.numeric, $7, $8, $9)",
+  ].join(" ");
+  const adoptedInsertValues = [
+    providerId,
+    adoptedAnchorId,
+    adoptedOperationId,
+    adoptedPrepared.kind,
+    adoptedPrepared.storageId,
+    adoptedPrepared.preparedStateRevision,
+    adoptedPrepared.preparedChecksum,
+    adoptedPreparedBytes,
+    adoptedPreparedSha256,
+  ];
   const adoptedUpdateQuery = [
     "UPDATE session_authority.filesystem_image_provider_operations",
     "SET state = 'committed', committed_state_revision = $4::pg_catalog.numeric,",
@@ -1572,61 +1967,162 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     adoptedCommittedBytes,
     adoptedCommittedSha256,
   ];
+  const adoptedLegacySnapshot =
+    await readProviderAnchorSnapshot(adoptedAnchorId);
+  const rejectedAdoptionClient = await pool.connect();
+  let rejectedAdoptionTransactionOpen = false;
+  try {
+    await rejectedAdoptionClient.query("BEGIN");
+    rejectedAdoptionTransactionOpen = true;
+    assert.equal(
+      (
+        await rejectedAdoptionClient.query(
+          adoptedInsertQuery,
+          adoptedInsertValues,
+        )
+      ).rowCount,
+      1,
+    );
+    await assert.rejects(
+      rejectedAdoptionClient.query(
+        adoptedUpdateQuery,
+        adoptedUpdateValues,
+      ),
+      (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "filesystem_image_provider_operations_adopted_v3_cut",
+        );
+        return true;
+      },
+    );
+    await rejectedAdoptionClient.query("ROLLBACK");
+    rejectedAdoptionTransactionOpen = false;
+  } finally {
+    if (rejectedAdoptionTransactionOpen) {
+      await rejectedAdoptionClient.query("ROLLBACK");
+    }
+    rejectedAdoptionClient.release();
+  }
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(adoptedAnchorId),
+    adoptedLegacySnapshot,
+  );
+
   await assert.rejects(
-    pool.query(adoptedUpdateQuery, adoptedUpdateValues),
+    pool.query(
+      [
+        "UPDATE session_authority.filesystem_image_provider_heads",
+        "SET contract_version = 3",
+        "WHERE provider_id = $1 AND anchor_id = $2",
+      ].join(" "),
+      [providerId, adoptedAnchorId],
+    ),
     (error) => {
       assert.equal(error.code, "23514");
       assert.equal(
         error.constraint,
-        "filesystem_image_provider_operations_adopted_v3_cut",
+        "filesystem_image_provider_heads_v3_operation_index_required",
       );
       return true;
     },
   );
+  assert.deepEqual(
+    await readProviderAnchorSnapshot(adoptedAnchorId),
+    adoptedLegacySnapshot,
+  );
+
   const adoptedCutHead = {
     ...rotationHead(adoptedCommittedHead),
     contractVersion: 3,
   };
+  const adoptedHeadUpdateQuery = [
+    "UPDATE session_authority.filesystem_image_provider_heads",
+    "SET contract_version = $3, anchor_revision = $4::pg_catalog.numeric,",
+    "generation = $5::pg_catalog.numeric, state_revision = $6::pg_catalog.numeric,",
+    "base_head_checksum = $7,",
+    "checkpoint_state_revision = $8::pg_catalog.numeric,",
+    "checkpoint_frame_count = $9::pg_catalog.int8, checkpoint_checksum = $10,",
+    "checkpoint_bytes = $11::pg_catalog.int8, frame_count = $12::pg_catalog.int4,",
+    "last_checksum = $13, ledger_bytes = $14::pg_catalog.int8,",
+    "operation_index_state_revision = $15::pg_catalog.numeric",
+    "WHERE provider_id = $1 AND anchor_id = $2",
+    "AND contract_version = $16",
+    "AND anchor_revision = $17::pg_catalog.numeric",
+    "AND generation = $18::pg_catalog.numeric",
+    "AND state_revision = $19::pg_catalog.numeric",
+    "AND base_head_checksum IS NOT DISTINCT FROM $20",
+    "AND checkpoint_state_revision = $21::pg_catalog.numeric",
+    "AND checkpoint_frame_count = $22::pg_catalog.int8",
+    "AND checkpoint_checksum IS NOT DISTINCT FROM $23",
+    "AND checkpoint_bytes = $24::pg_catalog.int8",
+    "AND frame_count = $25::pg_catalog.int4",
+    "AND last_checksum IS NOT DISTINCT FROM $26",
+    "AND ledger_bytes = $27::pg_catalog.int8",
+    "AND operation_index_state_revision IS NULL",
+  ].join(" ");
+  const adoptedHeadUpdateValues = [
+    providerId,
+    adoptedAnchorId,
+    adoptedCutHead.contractVersion,
+    adoptedCutHead.anchorRevision,
+    adoptedCutHead.generation,
+    adoptedCutHead.stateRevision,
+    adoptedCutHead.baseHeadChecksum,
+    adoptedCutHead.checkpointStateRevision,
+    adoptedCutHead.checkpointFrameCount,
+    adoptedCutHead.checkpointChecksum,
+    adoptedCutHead.checkpointBytes,
+    adoptedCutHead.frameCount,
+    adoptedCutHead.lastChecksum,
+    adoptedCutHead.ledgerBytes,
+    adoptedCutHead.stateRevision,
+    adoptedCommittedHead.contractVersion,
+    adoptedCommittedHead.anchorRevision,
+    adoptedCommittedHead.generation,
+    adoptedCommittedHead.stateRevision,
+    adoptedCommittedHead.baseHeadChecksum,
+    adoptedCommittedHead.checkpointStateRevision,
+    adoptedCommittedHead.checkpointFrameCount,
+    adoptedCommittedHead.checkpointChecksum,
+    adoptedCommittedHead.checkpointBytes,
+    adoptedCommittedHead.frameCount,
+    adoptedCommittedHead.lastChecksum,
+    adoptedCommittedHead.ledgerBytes,
+  ];
   const adoptedClient = await pool.connect();
   let adoptedTransactionOpen = false;
   try {
     await adoptedClient.query("BEGIN");
     adoptedTransactionOpen = true;
-    const adoptedHeadUpdate = await adoptedClient.query(
-      [
-        "UPDATE session_authority.filesystem_image_provider_heads",
-        "SET contract_version = $3, anchor_revision = $4::pg_catalog.numeric,",
-        "generation = $5::pg_catalog.numeric, state_revision = $6::pg_catalog.numeric,",
-        "base_head_checksum = $7,",
-        "checkpoint_state_revision = $8::pg_catalog.numeric,",
-        "checkpoint_frame_count = $9::pg_catalog.int8, checkpoint_checksum = $10,",
-        "checkpoint_bytes = $11::pg_catalog.int8, frame_count = $12::pg_catalog.int4,",
-        "last_checksum = $13, ledger_bytes = $14::pg_catalog.int8",
-        "WHERE provider_id = $1 AND anchor_id = $2",
-      ].join(" "),
-      [
-        providerId,
-        adoptedAnchorId,
-        adoptedCutHead.contractVersion,
-        adoptedCutHead.anchorRevision,
-        adoptedCutHead.generation,
-        adoptedCutHead.stateRevision,
-        adoptedCutHead.baseHeadChecksum,
-        adoptedCutHead.checkpointStateRevision,
-        adoptedCutHead.checkpointFrameCount,
-        adoptedCutHead.checkpointChecksum,
-        adoptedCutHead.checkpointBytes,
-        adoptedCutHead.frameCount,
-        adoptedCutHead.lastChecksum,
-        adoptedCutHead.ledgerBytes,
-      ],
+    assert.equal(
+      (
+        await adoptedClient.query(
+          adoptedInsertQuery,
+          adoptedInsertValues,
+        )
+      ).rowCount,
+      1,
     );
-    assert.equal(adoptedHeadUpdate.rowCount, 1);
-    const adoptedUpdate = await adoptedClient.query(
-      adoptedUpdateQuery,
-      adoptedUpdateValues,
+    assert.equal(
+      (
+        await adoptedClient.query(
+          adoptedHeadUpdateQuery,
+          adoptedHeadUpdateValues,
+        )
+      ).rowCount,
+      1,
     );
-    assert.equal(adoptedUpdate.rowCount, 1);
+    assert.equal(
+      (
+        await adoptedClient.query(
+          adoptedUpdateQuery,
+          adoptedUpdateValues,
+        )
+      ).rowCount,
+      1,
+    );
     await adoptedClient.query("COMMIT");
     adoptedTransactionOpen = false;
   } finally {
@@ -1636,6 +2132,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   const adoptedRows = await pool.query(
     [
       "SELECT head.contract_version, head.checkpoint_state_revision::text,",
+      "head.operation_index_state_revision::text,",
       "operation.committed_checksum_provenance, operation.committed_checksum",
       "FROM session_authority.filesystem_image_provider_heads AS head",
       "JOIN session_authority.filesystem_image_provider_operations AS operation",
@@ -1649,6 +2146,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     {
       contract_version: 3,
       checkpoint_state_revision: adoptedCommittedHead.stateRevision,
+      operation_index_state_revision: adoptedCommittedHead.stateRevision,
       committed_checksum_provenance: "unavailable-adopted-v2",
       committed_checksum: null,
     },
@@ -1711,6 +2209,18 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       operationId: acknowledgementLossOperationId,
     }),
     acknowledgementLossPrepared,
+  );
+  const acknowledgementLossSnapshot =
+    await readProviderAnchorSnapshot(acknowledgementLossAnchorId);
+  assert.equal(
+    acknowledgementLossSnapshot.head[0].operation_index_state_revision,
+    acknowledgementLossHead.stateRevision,
+  );
+  assert.deepEqual(
+    acknowledgementLossSnapshot.operations.map(
+      ({ operation_id, state }) => ({ operation_id, state }),
+    ),
+    [{ operation_id: acknowledgementLossOperationId, state: "prepared" }],
   );
 
   const stored = await pool.query(
@@ -1867,16 +2377,28 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     await cleanup.query(
       [
         "DELETE FROM session_authority.filesystem_image_provider_operations",
-        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4)",
+        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4, $5)",
       ].join(" "),
-      [providerId, anchorId, acknowledgementLossAnchorId, adoptedAnchorId],
+      [
+        providerId,
+        anchorId,
+        legacyAnchorId,
+        acknowledgementLossAnchorId,
+        adoptedAnchorId,
+      ],
     );
     await cleanup.query(
       [
         "DELETE FROM session_authority.filesystem_image_provider_heads",
-        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4)",
+        "WHERE provider_id = $1 AND anchor_id IN ($2, $3, $4, $5)",
       ].join(" "),
-      [providerId, anchorId, acknowledgementLossAnchorId, adoptedAnchorId],
+      [
+        providerId,
+        anchorId,
+        legacyAnchorId,
+        acknowledgementLossAnchorId,
+        adoptedAnchorId,
+      ],
     );
     await cleanup.query("COMMIT");
     cleanupTransactionOpen = false;

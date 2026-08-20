@@ -534,6 +534,15 @@
   permanent PostgreSQL operation-index foundation whose canonical prepared and
   committed records, prepared checksums, committed-checksum provenance, and
   record digests share one serializable durable cut with the external head.
+  The head now carries an internal nullable operation-index completeness
+  marker. Existing version 2 heads remain unadopted with a null marker;
+  `readHead()` may report their public head, while operation reads, paging, and
+  exact-head appends fail closed. Genesis-created indexed heads set and advance
+  the marker with logical appends and preserve it through rotation. The latest
+  validated committed record per storage is the current PostgreSQL projection,
+  so a full canonical `storageStateBefore` mismatch rolls back the head,
+  marker, and history. Destroyed storage remains represented by its committed
+  tombstone.
   Native commits retain `indexed-frame-v1` plus the exact checksum; the schema
   reserves `unavailable-adopted-v2` with a null checksum for rotated legacy
   history. Migration 008 already requires every non-null value in the three
@@ -547,8 +556,9 @@
   whole-table truncation is always rejected.
   Production still serves version 2 provider state and retains the same
   complete local history, so hosts must continue monitoring checkpoint and
-  aggregate provider-state bytes until the version 3 adoption cut. Producer
-  outputs bind
+  aggregate provider-state bytes until the version 3 adoption cut atomically
+  imports complete history, installs its covering checkpoint head, and sets
+  the exact completeness marker. Producer outputs bind
   the archive mount-root and artifact-child tuples separately; on the consumer,
   the former makes the first remount verification-only and the latter
   authorizes verification for the exact publication root. Two hosted Ubuntu
@@ -758,5 +768,7 @@
   commit is complete for both healthy-session callback quiescence and exact
   same-authorization session-loss overlap. The provider operation-index
   authority foundation is complete; the next independent slice switches the
-  provider to version 3 and must preserve every current attachment's origin
-  operation while removing permanent operation history from local checkpoints.
+  provider to version 3 by atomically importing the complete version 2 history
+  and setting the covering head's completeness marker. It must preserve every
+  current attachment's origin operation while removing permanent operation
+  history from local checkpoints.

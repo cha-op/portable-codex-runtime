@@ -653,8 +653,20 @@ provider-state storage grow with unique operations. Migration 010 now supplies
 the additive PostgreSQL operation-index foundation: canonical prepared and
 committed records, prepared frame checksums, explicit committed-checksum
 provenance, and domain-separated record digests advance atomically with the
-external head through one serializable compare-and-swap. Native indexed
-commits store `indexed-frame-v1` plus the exact checksum. Migration 008 already
+external head through one serializable compare-and-swap. A hidden
+`operation_index_state_revision` completeness marker is null on migrated
+version 2 heads. The new adapter sets it when an empty genesis anchor receives
+its first operation, advances it with each logical append, and preserves it
+across maintenance rotation. Public head readback remains available for an
+unadopted legacy head, but exact-head operation reads, paging, and appends fail
+closed until one atomic adoption proves the complete history. Native indexed
+commits store `indexed-frame-v1` plus the exact checksum. The latest fully
+validated committed record for a storage is the current PostgreSQL storage
+projection; every operation append compares the complete canonical
+`storageStateBefore` against that projection in the same transaction, and a
+mismatch rolls back the head, marker, and history together. Committed
+destroyed state remains a tombstone rather than making the storage ID absent.
+Migration 008 already
 requires every non-null value in the three external-head checksum columns to be
 an exact 64-byte lowercase-hex value. Migration 010 normalizes those valid values
 to `varchar(64)` before version 3 and defines all four new operation checksum and
@@ -670,8 +682,11 @@ exactly once, and row deletion requires same-transaction teardown of the whole
 anchor. This foundation does
 not switch the production version 2 provider or remove local history. Hosts
 must still monitor `inspectCapacity()` and the provider-state directory until
-the version 3 checkpoint/adoption cut makes PostgreSQL the replay index. That
-cut must preserve the origin operation for every current attachment so its
+the version 3 checkpoint/adoption cut makes PostgreSQL the replay index. Under
+the provider lock, that cut must import and validate the complete version 2
+history, install the covering version 3 checkpoint head, and set the exact
+completeness marker in one transaction before local history is reduced. It
+must also preserve the origin operation for every current attachment so its
 committed identity remains reconstructable.
 
 The two-host Ubuntu conformance flow runs each Node process and helper in one

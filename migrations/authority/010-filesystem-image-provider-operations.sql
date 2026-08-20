@@ -16,6 +16,23 @@ ALTER TABLE session_authority.filesystem_image_provider_heads
     TYPE character varying(64) COLLATE pg_catalog."C"
     USING last_checksum::character varying(64);
 
+-- A nullable internal marker binds operation history to the exact head
+-- revision whose storage lineage it represents. Existing version 2 rows stay
+-- unadopted until an indexed writer advances them, while version 3 rows must
+-- always carry the binding.
+ALTER TABLE session_authority.filesystem_image_provider_heads
+  ADD COLUMN operation_index_state_revision numeric(20, 0),
+  ADD CONSTRAINT filesystem_image_provider_heads_operation_index_revision_match
+    CHECK (
+      operation_index_state_revision IS NULL
+      OR operation_index_state_revision = state_revision
+    ),
+  ADD CONSTRAINT filesystem_image_provider_heads_v3_operation_index_required
+    CHECK (
+      contract_version <> 3
+      OR operation_index_state_revision IS NOT NULL
+    );
+
 ALTER TABLE session_authority.filesystem_image_provider_heads
   DROP CONSTRAINT filesystem_image_provider_heads_contract_version_supported;
 
@@ -171,6 +188,18 @@ CREATE INDEX filesystem_image_provider_operations_prepared_revision_idx
     prepared_state_revision,
     operation_id COLLATE pg_catalog."C"
   );
+
+-- The adapter reads exactly one fully validated committed tail for a storage
+-- after winning the head CAS. Keep that lookup bounded and deterministic.
+CREATE INDEX filesystem_image_provider_operations_committed_storage_tail_idx
+  ON session_authority.filesystem_image_provider_operations (
+    provider_id,
+    anchor_id,
+    storage_id COLLATE pg_catalog."C",
+    committed_state_revision DESC,
+    operation_id COLLATE pg_catalog."C" DESC
+  )
+  WHERE state = 'committed';
 
 -- Every history row enters through its prepared prefix. Adoption may insert
 -- and then commit old history in one transaction, but it may not manufacture a

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { EventEmitter } from "node:events";
@@ -2845,6 +2846,47 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     latestMigration.sql,
     /ALTER COLUMN last_checksum[\s\S]+TYPE character varying\(64\)[\s\S]+USING last_checksum::character varying\(64\);[\s\S]+DROP CONSTRAINT filesystem_image_provider_heads_contract_version_supported[\s\S]+ADD CONSTRAINT filesystem_image_provider_heads_contract_version_supported[\s\S]+contract_version IN \(2, 3\)/u,
   );
+  const operationIndexAlterStart = latestMigration.sql.indexOf(
+    "ADD COLUMN operation_index_state_revision",
+  );
+  assert.notEqual(operationIndexAlterStart, -1);
+  const operationIndexAlterEnd = latestMigration.sql.indexOf(
+    ";",
+    operationIndexAlterStart,
+  );
+  assert.notEqual(operationIndexAlterEnd, -1);
+  const operationIndexAlterSql = latestMigration.sql.slice(
+    operationIndexAlterStart,
+    operationIndexAlterEnd + 1,
+  );
+  assert.match(
+    operationIndexAlterSql,
+    /ADD COLUMN operation_index_state_revision numeric\(20, 0\)/u,
+  );
+  assert.match(
+    operationIndexAlterSql,
+    /CONSTRAINT filesystem_image_provider_heads_operation_index_revision_match[\s\S]+operation_index_state_revision IS NULL[\s\S]+OR operation_index_state_revision = state_revision/u,
+  );
+  assert.match(
+    operationIndexAlterSql,
+    /CONSTRAINT filesystem_image_provider_heads_v3_operation_index_required[\s\S]+contract_version <> 3[\s\S]+OR operation_index_state_revision IS NOT NULL/u,
+  );
+  const latestMigrationDdlIdentifiers = [
+    ...latestMigration.sql.matchAll(
+      /\b(?:(?:ADD|ALTER)\s+COLUMN|(?:(?:ADD|DROP)\s+)?CONSTRAINT|CREATE\s+(?:UNIQUE\s+)?INDEX|CREATE\s+(?:CONSTRAINT\s+)?TRIGGER|CREATE\s+(?:TABLE|FUNCTION))\s+(?:session_authority\.)?([A-Za-z_][A-Za-z0-9_]*)/gu,
+    ),
+  ].map((match) => match[1]);
+  assert.ok(
+    latestMigrationDdlIdentifiers.includes(
+      "filesystem_image_provider_heads_operation_index_revision_match",
+    ),
+  );
+  for (const identifier of latestMigrationDdlIdentifiers) {
+    assert.ok(
+      Buffer.byteLength(identifier, "utf8") <= 63,
+      `PostgreSQL DDL identifier exceeds 63 bytes: ${identifier}`,
+    );
+  }
   assert.match(
     latestMigration.sql,
     /CREATE TABLE session_authority\.filesystem_image_provider_operations/u,
@@ -2954,6 +2996,23 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.match(
     latestMigration.sql,
     /CREATE INDEX filesystem_image_provider_operations_prepared_revision_idx[\s\S]+provider_id,[\s\S]+anchor_id,[\s\S]+prepared_state_revision,[\s\S]+operation_id COLLATE pg_catalog\."C"/u,
+  );
+  const committedTailIndexStart = latestMigration.sql.indexOf(
+    "CREATE INDEX filesystem_image_provider_operations_committed_storage_tail_idx",
+  );
+  assert.notEqual(committedTailIndexStart, -1);
+  const committedTailIndexEnd = latestMigration.sql.indexOf(
+    ";",
+    committedTailIndexStart,
+  );
+  assert.notEqual(committedTailIndexEnd, -1);
+  const committedTailIndexSql = latestMigration.sql.slice(
+    committedTailIndexStart,
+    committedTailIndexEnd + 1,
+  );
+  assert.match(
+    committedTailIndexSql,
+    /CREATE INDEX filesystem_image_provider_operations_committed_storage_tail_idx[\s\S]+provider_id,[\s\S]+anchor_id,[\s\S]+storage_id COLLATE pg_catalog\."C",[\s\S]+committed_state_revision DESC,[\s\S]+operation_id COLLATE pg_catalog\."C" DESC[\s\S]+WHERE state = 'committed'/u,
   );
   assert.match(
     latestMigration.sql,
