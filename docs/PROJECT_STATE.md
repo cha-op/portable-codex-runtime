@@ -291,6 +291,9 @@
   attempt, plus one immutable pre-dispatch owner binding in
   `writer_supervisor_state_owners`. Each private state root supplies a
   persistent high-entropy marker matching `state-owner:<64 lowercase hex>`.
+  Owner updates are rejected immediately. Owner deletion is accepted only
+  with same-transaction teardown of the permanent operation-ID claim, so
+  delete-and-reinsert cannot transfer recovery authority to another root.
   Only an owner-bound finalizer that commits exact `complete-stopped` evidence
   with its stopped revision 4 `terminalRecord` may create that authorization.
   Immediate launch/stop and exact revision 4 cold retirement use that path;

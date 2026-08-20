@@ -340,8 +340,12 @@ private supervisor state root supplies one persistent high-entropy marker with
 the exact form `state-owner:<64 lowercase hex>`. The authority binds that
 `stateOwnerId` before physical launch dispatch, and only an owner-bound
 finalizer that commits exact `complete-stopped` evidence with its stopped
-revision 4 `terminalRecord` can insert an authorization. Immediate launch/stop
-and durable revision 4 cold retirement use that finalizer; observer-only
+revision 4 `terminalRecord` can insert an authorization. Owner updates are
+forbidden, and owner deletion requires complete
+same-transaction teardown of the permanent operation-ID claim, so a
+delete-and-reinsert cannot move recovery authority to another root.
+Immediate launch/stop and durable revision 4 cold retirement use that
+finalizer; observer-only
 reconciliation returns a null terminal record and cannot mint one. In the
 assembled production runner, the fifth lane runs last during
 the initial cold-start sweep and later passes while that runner holds the

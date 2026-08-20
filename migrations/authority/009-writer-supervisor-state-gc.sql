@@ -66,6 +66,39 @@ BEFORE UPDATE ON session_authority.writer_supervisor_state_owners
 FOR EACH ROW
 EXECUTE FUNCTION session_authority.reject_writer_supervisor_state_owner_update();
 
+-- Defer deletion validation so FK-ordered session teardown may remove the
+-- owner row before removing its permanent operation-ID claim in the same
+-- transaction. Keeping that claim while deleting and reinserting its owner
+-- must never transfer recovery authority to another state root.
+CREATE FUNCTION session_authority.enforce_writer_supervisor_state_owner_delete()
+RETURNS trigger
+LANGUAGE plpgsql
+SET search_path = pg_catalog
+AS $enforce_writer_supervisor_state_owner_delete$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM session_authority.operation_id_registry AS registry
+    WHERE registry.operation_id = OLD.launch_attempt_id
+      AND registry.session_id = OLD.session_id
+  )
+  THEN
+    RAISE EXCEPTION
+      'writer supervisor state-owner deletion requires complete operation ID teardown'
+      USING
+        ERRCODE = '23503',
+        CONSTRAINT = 'writer_supervisor_state_owners_delete_requires_claim_teardown';
+  END IF;
+  RETURN OLD;
+END
+$enforce_writer_supervisor_state_owner_delete$;
+
+CREATE CONSTRAINT TRIGGER writer_supervisor_state_owners_enforce_delete_teardown
+AFTER DELETE ON session_authority.writer_supervisor_state_owners
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION session_authority.enforce_writer_supervisor_state_owner_delete();
+
 -- This constraint is deferred because the current writer claim transaction
 -- moves the operation to starting before it inserts the immutable owner row.
 -- The commit boundary must see both writes or neither write may become

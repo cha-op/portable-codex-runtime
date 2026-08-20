@@ -455,6 +455,9 @@ Restore and launcher authority are now split into eight serial pull requests:
      Migration 009 binds each
      launch attempt immutably to its local owner before dispatch; GC
      authorization/request/receipt repeat the marker and completion rechecks it.
+     Updates to that owner route are forbidden, and its deferred delete guard
+     permits removal only with same-transaction teardown of the permanent
+     operation-ID claim, preventing delete-and-reinsert ownership transfer.
      The durable launch request remains version 1. Migration 009 refuses any
      legacy `starting`/`uncertain` launch and any non-null session current-launch
      pointer regardless of its shape or referential validity, thereby requiring

@@ -31,6 +31,9 @@ superseded_by:
   009 first binds each launch attempt immutably to the private root's persistent
   high-entropy `stateOwnerId` (`state-owner:<64 lowercase hex>`), then binds GC
   authorization to that owner, the terminal operation, and launch attempt. It
+  rejects owner updates and permits owner deletion only with same-transaction
+  permanent operation-ID teardown, preventing delete-and-reinsert ownership
+  transfer. It
   retains the exact stopped revision 4 `terminalRecord` and digests and
   permanently records `collected` or `absent` completion. Observer-only launch
   reconciliation returns a null terminal record, remains no-GC, and ordinary

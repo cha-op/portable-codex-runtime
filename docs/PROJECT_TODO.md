@@ -180,7 +180,9 @@
   That gate requires a committed current launch to be stopped or physically
   fenced and its current-launch pointer cleared before rollout. It then fences
   ownerless dispatch from already-running old binaries with a deferred
-  commit-time constraint. Historical unbound
+  commit-time constraint. Owner updates are forbidden, while deletion requires
+  same-transaction teardown of the permanent operation-ID claim; no runtime
+  API exposes partial owner deletion or rebinding. Historical unbound
   terminal work that is no longer current is not retroactively authorized and
   remains an explicit cleanup case. The collector deletes exact stopped
   revisions in two directory-

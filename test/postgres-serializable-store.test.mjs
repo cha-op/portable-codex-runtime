@@ -2804,6 +2804,14 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     latestMigration.sql,
+    /enforce_writer_supervisor_state_owner_delete[\s\S]+FROM session_authority\.operation_id_registry AS registry[\s\S]+registry\.operation_id = OLD\.launch_attempt_id[\s\S]+registry\.session_id = OLD\.session_id[\s\S]+writer_supervisor_state_owners_delete_requires_claim_teardown/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE CONSTRAINT TRIGGER writer_supervisor_state_owners_enforce_delete_teardown[\s\S]+AFTER DELETE ON session_authority\.writer_supervisor_state_owners[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
     /CREATE CONSTRAINT TRIGGER operation_claims_writer_launch_state_owner_guard[\s\S]+AFTER INSERT OR UPDATE ON session_authority\.operation_claims[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
   );
   assert.match(

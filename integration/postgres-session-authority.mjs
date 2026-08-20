@@ -1059,6 +1059,7 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   const boundOperationId = `post-migration-writer-launch-${randomUUID()}`;
   const supervisorId = `migration-supervisor-${randomUUID()}`;
   const stateOwnerId = `state-owner:${"a".repeat(64)}`;
+  const replacementStateOwnerId = `state-owner:${"b".repeat(64)}`;
   const timestamp = await pool.query(
     "SELECT pg_catalog.transaction_timestamp() AS value",
   );
@@ -1526,40 +1527,111 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
     { state: "starting", state_owner_id: stateOwnerId },
   ]);
 
-  await pool.query(
-    "DELETE FROM session_authority.writer_supervisor_state_owners WHERE launch_attempt_id = $1",
+  await assert.rejects(
+    pool.query(
+      "DELETE FROM session_authority.writer_supervisor_state_owners WHERE launch_attempt_id = $1",
+      [boundOperationId],
+    ),
+    (error) => {
+      assert.equal(error.code, "23503");
+      assert.equal(
+        error.constraint,
+        "writer_supervisor_state_owners_delete_requires_claim_teardown",
+      );
+      return true;
+    },
+  );
+
+  const rebindWriter = await pool.connect();
+  let rebindWriterTransactionOpen = false;
+  try {
+    await rebindWriter.query("BEGIN");
+    rebindWriterTransactionOpen = true;
+    await rebindWriter.query(
+      "DELETE FROM session_authority.writer_supervisor_state_owners WHERE launch_attempt_id = $1",
+      [boundOperationId],
+    );
+    await rebindWriter.query(
+      [
+        "INSERT INTO session_authority.writer_supervisor_state_owners",
+        "(launch_attempt_id, session_id, supervisor_id, state_owner_id, bound_at)",
+        "VALUES ($1, $2, $3, $4, $5)",
+      ].join(" "),
+      [
+        boundOperationId,
+        secondSessionId,
+        supervisorId,
+        replacementStateOwnerId,
+        now,
+      ],
+    );
+    await assert.rejects(rebindWriter.query("COMMIT"), (error) => {
+      assert.equal(error.code, "23503");
+      assert.equal(
+        error.constraint,
+        "writer_supervisor_state_owners_delete_requires_claim_teardown",
+      );
+      return true;
+    });
+  } finally {
+    if (rebindWriterTransactionOpen) await rebindWriter.query("ROLLBACK");
+    rebindWriter.release();
+  }
+  const stillBound = await pool.query(
+    [
+      "SELECT state_owner_id",
+      "FROM session_authority.writer_supervisor_state_owners",
+      "WHERE launch_attempt_id = $1",
+    ].join(" "),
     [boundOperationId],
   );
-  await pool.query(
-    [
-      "DELETE FROM session_authority.operation_claims",
-      "WHERE operation_id IN ($1, $2, $3, $4, $5)",
-    ].join(" "),
-    [
-      firstOperationId,
-      secondOperationId,
-      currentOperationId,
-      staleOperationId,
-      boundOperationId,
-    ],
-  );
-  await pool.query(
-    [
-      "DELETE FROM session_authority.operation_id_registry",
-      "WHERE operation_id IN ($1, $2, $3, $4, $5)",
-    ].join(" "),
-    [
-      firstOperationId,
-      secondOperationId,
-      currentOperationId,
-      staleOperationId,
-      boundOperationId,
-    ],
-  );
-  await pool.query(
-    "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2, $3)",
-    [firstSessionId, secondSessionId, currentSessionId],
-  );
+  assert.deepEqual(stillBound.rows, [{ state_owner_id: stateOwnerId }]);
+
+  const cleanup = await pool.connect();
+  let cleanupTransactionOpen = false;
+  try {
+    await cleanup.query("BEGIN");
+    cleanupTransactionOpen = true;
+    await cleanup.query(
+      "DELETE FROM session_authority.writer_supervisor_state_owners WHERE launch_attempt_id = $1",
+      [boundOperationId],
+    );
+    await cleanup.query(
+      [
+        "DELETE FROM session_authority.operation_claims",
+        "WHERE operation_id IN ($1, $2, $3, $4, $5)",
+      ].join(" "),
+      [
+        firstOperationId,
+        secondOperationId,
+        currentOperationId,
+        staleOperationId,
+        boundOperationId,
+      ],
+    );
+    await cleanup.query(
+      [
+        "DELETE FROM session_authority.operation_id_registry",
+        "WHERE operation_id IN ($1, $2, $3, $4, $5)",
+      ].join(" "),
+      [
+        firstOperationId,
+        secondOperationId,
+        currentOperationId,
+        staleOperationId,
+        boundOperationId,
+      ],
+    );
+    await cleanup.query(
+      "DELETE FROM session_authority.sessions WHERE session_id IN ($1, $2, $3)",
+      [firstSessionId, secondSessionId, currentSessionId],
+    );
+    await cleanup.query("COMMIT");
+    cleanupTransactionOpen = false;
+  } finally {
+    if (cleanupTransactionOpen) await cleanup.query("ROLLBACK");
+    cleanup.release();
+  }
 }
 
 async function waitForBackendLockWait(observer, backendPid) {
@@ -5275,104 +5347,117 @@ test(
     t.after(async () => {
       try {
         if (sessionIds.length > 0) {
-          await pool.query(
-            [
-              "DELETE FROM session_authority.restore_destination_generations",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.checkpoint_catalogue",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.capture_attempt_tombstones",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.capture_attempt_claims",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.writer_supervisor_state_gc",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.writer_supervisor_state_owners",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.reservations",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.operation_claims",
-              "WHERE operation_id IN (",
-              "SELECT operation_id",
-              "FROM session_authority.operation_id_registry",
-              "WHERE session_id = ANY($1::uuid[])",
-              "AND claim_type IN (",
-              "'restore-launch-intent-v2',",
-              "'restore-activation-launch-intent-v1',",
-              "'writer-stop-capture-intent-v3'",
-              ")",
-              ")",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.operation_id_registry",
-              "WHERE session_id = ANY($1::uuid[])",
-              "AND claim_type IN (",
-              "'restore-launch-intent-v2',",
-              "'restore-activation-launch-intent-v1',",
-              "'writer-stop-capture-intent-v3'",
-              ")",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.operation_claims",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.operation_id_registry",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
-          await pool.query(
-            [
-              "DELETE FROM session_authority.sessions",
-              "WHERE session_id = ANY($1::uuid[])",
-            ].join(" "),
-            [sessionIds],
-          );
+          const cleanupClient = await pool.connect();
+          let cleanupTransactionOpen = false;
+          try {
+            await cleanupClient.query("BEGIN");
+            cleanupTransactionOpen = true;
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.restore_destination_generations",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.checkpoint_catalogue",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.capture_attempt_tombstones",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.capture_attempt_claims",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.writer_supervisor_state_gc",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.writer_supervisor_state_owners",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.reservations",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.operation_claims",
+                "WHERE operation_id IN (",
+                "SELECT operation_id",
+                "FROM session_authority.operation_id_registry",
+                "WHERE session_id = ANY($1::uuid[])",
+                "AND claim_type IN (",
+                "'restore-launch-intent-v2',",
+                "'restore-activation-launch-intent-v1',",
+                "'writer-stop-capture-intent-v3'",
+                ")",
+                ")",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.operation_id_registry",
+                "WHERE session_id = ANY($1::uuid[])",
+                "AND claim_type IN (",
+                "'restore-launch-intent-v2',",
+                "'restore-activation-launch-intent-v1',",
+                "'writer-stop-capture-intent-v3'",
+                ")",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.operation_claims",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.operation_id_registry",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query(
+              [
+                "DELETE FROM session_authority.sessions",
+                "WHERE session_id = ANY($1::uuid[])",
+              ].join(" "),
+              [sessionIds],
+            );
+            await cleanupClient.query("COMMIT");
+            cleanupTransactionOpen = false;
+          } finally {
+            if (cleanupTransactionOpen) {
+              await cleanupClient.query("ROLLBACK");
+            }
+            cleanupClient.release();
+          }
         }
       } finally {
         try {

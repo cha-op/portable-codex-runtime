@@ -1473,7 +1473,11 @@ constraint then requires the matching immutable owner row at the transaction
 commit that makes dispatch durable. This permits the new authority's operation
 update followed by owner insert in one
 transaction, while preventing an already-running old binary from committing an
-ownerless dispatch. An exact `prepared` to
+ownerless dispatch. Updates to that binding are rejected immediately, and a
+deferred delete guard permits removal only when the permanent operation-ID
+claim is torn down in the same transaction. A delete-and-reinsert attempt
+therefore cannot move a live or retained launch to another state root. An exact
+`prepared` to
 `cancelled-before-dispatch` transition remains owner-free. Other unbound
 `prepared` attempts are owner-neutral only for read/cancel cleanup and cannot
 be adopted; historical unbound committed launches that are no longer current
