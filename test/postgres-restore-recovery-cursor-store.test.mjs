@@ -14,6 +14,8 @@ const RECOVERY_SCOPE_ID = "production-eu-west-2";
 const SESSION_ID = "019f2100-0000-7000-8000-000000000001";
 const OTHER_SESSION_ID = "019f2100-0000-7000-8000-000000000002";
 const TRANSITION_ID = "019f2100-0000-7000-8000-000000000003";
+const AUTHORIZED_AT = "2026-08-10T09:59:00.000Z";
+const TERMINAL_OPERATION_ID = "stop-001";
 const REQUEST_SHA256 = "a".repeat(64);
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
@@ -24,6 +26,8 @@ const CURSOR_COLUMNS = [
   "recovery_scope_id",
   "lane",
   "after_session_id::pg_catalog.text AS after_session_id",
+  "after_authorized_at",
+  "after_terminal_operation_id",
   "cycle::pg_catalog.text AS cycle",
   "revision::pg_catalog.text AS revision",
   "last_transition_id::pg_catalog.text AS last_transition_id",
@@ -45,11 +49,14 @@ const READ_QUERY = [
 ].join(" ");
 const UPDATE_QUERY = [
   "UPDATE session_authority.restore_recovery_cursors",
-  "SET after_session_id = $3, cycle = $4, revision = $5,",
-  "last_transition_id = $6, last_request_sha256 = $7, updated_at = $8",
+  "SET after_session_id = $3, after_authorized_at = $4,",
+  "after_terminal_operation_id = $5, cycle = $6, revision = $7,",
+  "last_transition_id = $8, last_request_sha256 = $9, updated_at = $10",
   "WHERE recovery_scope_id = $1 AND lane = $2",
-  "AND revision = $9 AND cycle = $10",
-  "AND after_session_id IS NOT DISTINCT FROM $11",
+  "AND revision = $11 AND cycle = $12",
+  "AND after_session_id IS NOT DISTINCT FROM $13",
+  "AND after_authorized_at IS NOT DISTINCT FROM $14",
+  "AND after_terminal_operation_id IS NOT DISTINCT FROM $15",
   `RETURNING ${CURSOR_COLUMNS}`,
 ].join(" ");
 
@@ -135,6 +142,8 @@ function cursorRow(overrides = {}) {
     recovery_scope_id: RECOVERY_SCOPE_ID,
     lane: "generation",
     after_session_id: null,
+    after_authorized_at: null,
+    after_terminal_operation_id: null,
     cycle: "0",
     revision: "0",
     last_transition_id: null,
@@ -172,6 +181,31 @@ function advanceRequest(overrides = {}) {
     expectedCycle: "0",
     expectedRevision: "0",
     nextAfterSessionId: SESSION_ID,
+    ...overrides,
+  };
+}
+
+function gcCursorRow(overrides = {}) {
+  return cursorRow({
+    lane: "supervisor-state-gc",
+    ...overrides,
+  });
+}
+
+function gcAdvanceRequest(overrides = {}) {
+  return {
+    recoveryScopeId: RECOVERY_SCOPE_ID,
+    lane: "supervisor-state-gc",
+    transitionId: TRANSITION_ID,
+    requestSha256: REQUEST_SHA256,
+    expectedAfterAuthorizedAt: null,
+    expectedAfterSessionId: null,
+    expectedAfterTerminalOperationId: null,
+    expectedCycle: "0",
+    expectedRevision: "0",
+    nextAfterAuthorizedAt: AUTHORIZED_AT,
+    nextAfterSessionId: SESSION_ID,
+    nextAfterTerminalOperationId: TERMINAL_OPERATION_ID,
     ...overrides,
   };
 }
@@ -244,6 +278,8 @@ test("advanceLane performs an exact revision-cycle-cursor CAS", async () => {
           RECOVERY_SCOPE_ID,
           "generation",
           SESSION_ID,
+          null,
+          null,
           "0",
           "1",
           TRANSITION_ID,
@@ -251,6 +287,8 @@ test("advanceLane performs an exact revision-cycle-cursor CAS", async () => {
           LATER,
           "0",
           "0",
+          null,
+          null,
           null,
         ]);
         return { command: "UPDATE", rowCount: 1, rows: [target] };
@@ -269,6 +307,148 @@ test("advanceLane performs an exact revision-cycle-cursor CAS", async () => {
   assert.equal(receipt.cursor.updatedAt, LATER);
   assert.equal(Object.isFrozen(receipt), true);
   client.assertExhausted();
+});
+
+test("supervisor-state GC cursor initializes and advances one complete position", async () => {
+  const target = gcCursorRow({
+    after_authorized_at: new Date(AUTHORIZED_AT),
+    after_session_id: SESSION_ID,
+    after_terminal_operation_id: TERMINAL_OPERATION_ID,
+    revision: "1",
+    last_transition_id: TRANSITION_ID,
+    last_request_sha256: REQUEST_SHA256,
+    updated_at: new Date(LATER),
+  });
+  const readClient = new ScriptedClient([
+    { command: "INSERT", rowCount: 1, rows: [] },
+    { rows: [gcCursorRow()] },
+  ]);
+  const advanceClient = new ScriptedClient(
+    [
+      { command: "INSERT", rowCount: 0, rows: [] },
+      { rows: [gcCursorRow()] },
+      (args) => {
+        assertExtendedQuery(args, UPDATE_QUERY, [
+          RECOVERY_SCOPE_ID,
+          "supervisor-state-gc",
+          SESSION_ID,
+          AUTHORIZED_AT,
+          TERMINAL_OPERATION_ID,
+          "0",
+          "1",
+          TRANSITION_ID,
+          REQUEST_SHA256,
+          LATER,
+          "0",
+          "0",
+          null,
+          null,
+          null,
+        ]);
+        return { command: "UPDATE", rowCount: 1, rows: [target] };
+      },
+    ],
+    { now: LATER },
+  );
+  const { cursorStore } = createHarness([readClient, advanceClient]);
+
+  const initial = await cursorStore.readLane(
+    readRequest({ lane: "supervisor-state-gc" }),
+  );
+  assert.deepEqual(initial, {
+    recoveryScopeId: RECOVERY_SCOPE_ID,
+    lane: "supervisor-state-gc",
+    afterAuthorizedAt: null,
+    afterSessionId: null,
+    afterTerminalOperationId: null,
+    cycle: "0",
+    revision: "0",
+    lastTransitionId: null,
+    lastRequestSha256: null,
+    updatedAt: NOW,
+  });
+  const advanced = await cursorStore.advanceLane(gcAdvanceRequest());
+  assert.equal(advanced.cursor.afterAuthorizedAt, AUTHORIZED_AT);
+  assert.equal(
+    advanced.cursor.afterTerminalOperationId,
+    TERMINAL_OPERATION_ID,
+  );
+  readClient.assertExhausted();
+  advanceClient.assertExhausted();
+});
+
+test("supervisor-state GC acknowledgement-loss readback binds the whole position", async () => {
+  const target = gcCursorRow({
+    after_authorized_at: new Date(AUTHORIZED_AT),
+    after_session_id: SESSION_ID,
+    after_terminal_operation_id: TERMINAL_OPERATION_ID,
+    revision: "1",
+    last_transition_id: TRANSITION_ID,
+    last_request_sha256: REQUEST_SHA256,
+    updated_at: new Date(LATER),
+  });
+  const committed = new ScriptedClient(
+    [
+      { command: "INSERT", rowCount: 0, rows: [] },
+      { rows: [gcCursorRow()] },
+      { command: "UPDATE", rowCount: 1, rows: [target] },
+    ],
+    {
+      commitError: new Error("COMMIT acknowledgement lost"),
+      now: LATER,
+    },
+  );
+  const readback = new ScriptedClient([{ rows: [target] }], { now: LATER });
+  const { cursorStore } = createHarness([committed, readback]);
+
+  const receipt = await cursorStore.advanceLane(gcAdvanceRequest());
+  assert.equal(receipt.advanced, false);
+  assert.equal(receipt.cursor.afterSessionId, SESSION_ID);
+  assert.equal(receipt.cursor.afterAuthorizedAt, AUTHORIZED_AT);
+  assert.equal(
+    receipt.cursor.afterTerminalOperationId,
+    TERMINAL_OPERATION_ID,
+  );
+  committed.assertExhausted({ destroyed: true });
+  readback.assertExhausted();
+});
+
+test("supervisor-state GC acknowledgement-loss rejects a crossed position", async () => {
+  const target = gcCursorRow({
+    after_authorized_at: new Date(AUTHORIZED_AT),
+    after_session_id: SESSION_ID,
+    after_terminal_operation_id: TERMINAL_OPERATION_ID,
+    revision: "1",
+    last_transition_id: TRANSITION_ID,
+    last_request_sha256: REQUEST_SHA256,
+    updated_at: new Date(LATER),
+  });
+  const crossed = gcCursorRow({
+    after_authorized_at: new Date(AUTHORIZED_AT),
+    after_session_id: SESSION_ID,
+    after_terminal_operation_id: "stop-002",
+    revision: "1",
+    last_transition_id: TRANSITION_ID,
+    last_request_sha256: REQUEST_SHA256,
+    updated_at: new Date(LATER),
+  });
+  const committed = new ScriptedClient(
+    [
+      { command: "INSERT", rowCount: 0, rows: [] },
+      { rows: [gcCursorRow()] },
+      { command: "UPDATE", rowCount: 1, rows: [target] },
+    ],
+    { commitError: new Error("COMMIT acknowledgement lost"), now: LATER },
+  );
+  const readback = new ScriptedClient([{ rows: [crossed] }], { now: LATER });
+  const { cursorStore } = createHarness([committed, readback]);
+
+  await assertCursorError(
+    cursorStore.advanceLane(gcAdvanceRequest()),
+    "postgres_restore_recovery_cursor_outcome_uncertain",
+  );
+  committed.assertExhausted({ destroyed: true });
+  readback.assertExhausted();
 });
 
 test("advanceLane recognizes exact durable replay without a second update", async () => {

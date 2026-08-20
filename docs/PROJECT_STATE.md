@@ -273,7 +273,12 @@
   a launcher, or reconstructs an opaque writer capability. Current-launch
   handling is inventory only.
 - PostgreSQL now persists those five cursors independently for each effective
-  recovery scope. Runtime derives that opaque scope with domain-separated
+  recovery scope. The first four lanes retain a scalar session cursor. The
+  fifth lane persists the complete
+  `(sessionId, authorizedAt, terminalOperationId)` ordering key, so one
+  permanently pending authorization cannot hide later work from the same
+  session; wrap retries it in a later cycle. Runtime derives that opaque scope
+  with domain-separated
   SHA-256 from the caller's base `recoveryScopeId` and the local persistent
   `stateOwnerId`; the base remains a fairness/replay label and is never treated
   as root identity. This prevents two roots reusing one base label from
@@ -305,6 +310,10 @@
   advisory lease earlier; a same-authorization cold retry is then safe only
   through the exact concurrent idempotent-or-fail-closed collector protocol and
   does not prove the older callback quiesced.
+  On Linux, destructive collection resolves every artifact through a
+  revalidated clone of the held state-root FD, including terminal lookup and
+  final absence proof. Non-Linux collection retains pathname identity/policy
+  brackets and does not claim resistance to an active same-UID ABA swap.
   Production deployment accepts only the exact process-local supervisor and
   collector pair returned by `createPodmanWriterSupervisorBundle()` before it
   constructs the physical adapter; matching IDs and owner strings alone are

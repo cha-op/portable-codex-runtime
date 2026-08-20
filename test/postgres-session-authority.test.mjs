@@ -1817,19 +1817,25 @@ test("writer supervisor state GC isolates same-supervisor owners across first an
   );
 
   const page = await authority.listWriterSupervisorStateGcCandidates({
+    afterAuthorizedAt: null,
     afterSessionId: null,
+    afterTerminalOperationId: null,
     limit: 1,
     stateOwnerId: STATE_OWNER_ID,
   });
   const afterPage =
     await authority.listWriterSupervisorStateGcCandidates({
+      afterAuthorizedAt: page.nextAfterAuthorizedAt,
       afterSessionId: page.nextAfterSessionId,
+      afterTerminalOperationId: page.nextAfterTerminalOperationId,
       limit: 1,
       stateOwnerId: STATE_OWNER_ID,
     });
   const otherOwnerPage =
     await authority.listWriterSupervisorStateGcCandidates({
+      afterAuthorizedAt: null,
       afterSessionId: null,
+      afterTerminalOperationId: null,
       limit: 1,
       stateOwnerId: OTHER_STATE_OWNER_ID,
     });
@@ -1856,6 +1862,14 @@ test("writer supervisor state GC isolates same-supervisor owners across first an
   assert.equal(page.candidates[0].session.sessionId, SESSION_ID);
   assert.equal(page.nextAfterSessionId, SESSION_ID);
   assert.equal(
+    page.nextAfterAuthorizedAt,
+    first.authorization.authorizedAt,
+  );
+  assert.equal(
+    page.nextAfterTerminalOperationId,
+    first.authorization.terminalOperationId,
+  );
+  assert.equal(
     afterPage.candidates[0].authorization.authorizationSha256,
     second.authorization.authorizationSha256,
   );
@@ -1869,23 +1883,113 @@ test("writer supervisor state GC isolates same-supervisor owners across first an
   assert.ok(Object.isFrozen(page.candidates[0]));
   assert.ok(
     queryTexts(clients[0]).some((text) =>
-      text?.startsWith("SELECT DISTINCT ON (session_id)"),
+      text?.startsWith("SELECT terminal_operation_id") &&
+      text?.includes("collected_at IS NULL"),
     ),
   );
   const candidateQueries = clients.map((client) =>
     client.queries.find((args) => {
       const text = typeof args[0] === "string" ? args[0] : args[0]?.text;
-      return text?.startsWith("SELECT DISTINCT ON (session_id)");
+      return (
+        text?.startsWith("SELECT terminal_operation_id") &&
+        text?.includes("collected_at IS NULL")
+      );
     }),
   );
   assert.deepEqual(candidateQueries[0][0].values, [STATE_OWNER_ID, 2]);
   assert.deepEqual(candidateQueries[1][0].values, [
     STATE_OWNER_ID,
     SESSION_ID,
+    first.authorization.authorizedAt,
+    first.authorization.terminalOperationId,
     2,
   ]);
   assert.deepEqual(candidateQueries[2][0].values, [
     OTHER_STATE_OWNER_ID,
+    2,
+  ]);
+  for (const client of clients) client.assertExhausted();
+});
+
+test("writer supervisor state GC paginates every authorization within one session", async () => {
+  const first = writerSupervisorStateGcFixture({
+    operationId: "writer-launch-gc-same-001",
+  });
+  const second = writerSupervisorStateGcFixture({
+    operationId: "writer-launch-gc-same-002",
+  });
+  const { authority, clients } = authorityWithScripts(
+    [
+      { rows: [first.gcRow, second.gcRow] },
+      { rows: [first.sessionRow] },
+      { rows: [first.operationRow] },
+      { rows: [first.stateOwnerRow] },
+      { rows: [second.sessionRow] },
+      { rows: [second.operationRow] },
+      { rows: [second.stateOwnerRow] },
+    ],
+    [
+      { rows: [second.gcRow] },
+      { rows: [second.sessionRow] },
+      { rows: [second.operationRow] },
+      { rows: [second.stateOwnerRow] },
+    ],
+  );
+
+  const firstPage = await authority.listWriterSupervisorStateGcCandidates({
+    afterAuthorizedAt: null,
+    afterSessionId: null,
+    afterTerminalOperationId: null,
+    limit: 1,
+    stateOwnerId: STATE_OWNER_ID,
+  });
+  const secondPage = await authority.listWriterSupervisorStateGcCandidates({
+    afterAuthorizedAt: firstPage.nextAfterAuthorizedAt,
+    afterSessionId: firstPage.nextAfterSessionId,
+    afterTerminalOperationId: firstPage.nextAfterTerminalOperationId,
+    limit: 1,
+    stateOwnerId: STATE_OWNER_ID,
+  });
+
+  assert.equal(firstPage.candidates.length, 1);
+  assert.equal(
+    firstPage.candidates[0].authorization.terminalOperationId,
+    first.authorization.terminalOperationId,
+  );
+  assert.equal(firstPage.nextAfterSessionId, SESSION_ID);
+  assert.equal(
+    firstPage.nextAfterTerminalOperationId,
+    first.authorization.terminalOperationId,
+  );
+  assert.equal(secondPage.candidates.length, 1);
+  assert.equal(
+    secondPage.candidates[0].authorization.terminalOperationId,
+    second.authorization.terminalOperationId,
+  );
+  assert.equal(secondPage.nextAfterSessionId, null);
+  const afterQuery = clients[1].queries.find((args) => {
+    const text = typeof args[0] === "string" ? args[0] : args[0]?.text;
+    return text?.includes("collected_at IS NULL");
+  });
+  assert.match(
+    afterQuery[0].text,
+    new RegExp(
+      [
+        "AND \\(session_id, authorized_at, terminal_operation_id COLLATE ",
+        'pg_catalog\\."C"\\) > \\(\\$2::uuid, \\$3::timestamp with time zone, ',
+        "\\$4::character varying\\(128\\) COLLATE ",
+        'pg_catalog\\."C"\\) ORDER BY session_id ASC, authorized_at ASC, ',
+        'terminal_operation_id COLLATE pg_catalog\\."C" ASC',
+      ].join(""),
+      "u",
+    ),
+  );
+  assert.equal(afterQuery[0].text.includes("DISTINCT"), false);
+  assert.deepEqual(afterQuery[0].values, [
+    STATE_OWNER_ID,
+    SESSION_ID,
+    first.authorization.authorizedAt,
+    first.authorization.terminalOperationId,
     2,
   ]);
   for (const client of clients) client.assertExhausted();
@@ -1956,7 +2060,9 @@ test("writer supervisor state GC authorization read validates the exact terminal
 test("writer supervisor state GC does not infer candidates from naked terminal operations", async () => {
   const { authority, clients } = authorityWithScripts([{ rows: [] }]);
   const page = await authority.listWriterSupervisorStateGcCandidates({
+    afterAuthorizedAt: null,
     afterSessionId: null,
+    afterTerminalOperationId: null,
     limit: 10,
     stateOwnerId: STATE_OWNER_ID,
   });

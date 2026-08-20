@@ -353,6 +353,16 @@ completes without reconstructing mutation authority. The physical collection
 request, its contract-version-2 receipt, and the authorization all carry the
 same owner marker.
 
+The first four recovery lanes keep their scalar session cursor. The fifth lane
+orders every pending authorization by the complete
+`(sessionId, authorizedAt, terminalOperationId)` key and persists that tuple in
+its cursor. Multiple authorizations from one session may therefore share a
+bounded page. A permanently `pending` item advances only the current scan
+boundary: later items from the same session remain visible, and cursor wrap
+retries the pending item in a later cycle. This prevents oldest-item
+starvation for a finite snapshot and whenever collection drains faster than
+new work arrives; it is not an infinite-arrival fairness guarantee.
+
 The third launch-attempt and fifth supervisor-state-GC recovery lanes are
 owner-filtered before a physical call. Runtime-private wrappers add the local
 marker to authority list requests; ordinary callers cannot select a foreign
@@ -693,6 +703,13 @@ and bytes with the held file before unlink, then unlinks it and positionally
 rereads the exact canonical bytes through that held descriptor while
 revalidating object identity and access policy. It finally proves the complete
 attempt absent and syncs the directory again.
+
+On Linux, every collection lookup, deletion, and final absence proof resolves
+the artifact basename through a revalidated clone of the held state-root FD at
+`/proc/self/fd/<fd>`, so replacing the named root cannot redirect a destructive
+operation. Other platforms retain held/named root identity and access-policy
+brackets because Node exposes no portable `openat`/`unlinkat` API; that bracket
+does not claim protection from an actively cooperating same-UID ABA swap.
 
 Cold reconciliation retires a container only when the local journal already
 holds the exact stopped revision 4 record. It first runs idempotent

@@ -23,6 +23,7 @@ const SESSION_ID_2 = "019f2600-0000-7000-8000-000000000002";
 const CODEX_ID = "019f2600-0000-7000-8000-000000000003";
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
 const UPDATED_AT = "2026-08-10T00:00:00.000Z";
+const GC_AUTHORIZED_AT = "2026-08-10T00:01:00.000Z";
 const LANE_SPECS = [
   { field: "generation", lane: "generation" },
   { field: "activation", lane: "activation" },
@@ -237,17 +238,33 @@ function page(candidates = [], nextAfterSessionId = null) {
   return { candidates, nextAfterSessionId };
 }
 
+function gcPage(candidates = [], nextCandidate = null) {
+  return {
+    candidates,
+    nextAfterAuthorizedAt:
+      nextCandidate === null ? null : nextCandidate.authorization.authorizedAt,
+    nextAfterSessionId:
+      nextCandidate === null ? null : nextCandidate.authorization.sessionId,
+    nextAfterTerminalOperationId:
+      nextCandidate === null
+        ? null
+        : nextCandidate.authorization.terminalOperationId,
+  };
+}
+
 function cursor(
   lane,
   {
     afterSessionId = null,
+    afterAuthorizedAt = null,
+    afterTerminalOperationId = null,
     cycle = "0",
     lastRequestSha256 = null,
     lastTransitionId = null,
     revision = "0",
   } = {},
 ) {
-  return freezeRecord({
+  const value = {
     recoveryScopeId: RECOVERY_SCOPE_ID,
     lane,
     afterSessionId,
@@ -256,7 +273,12 @@ function cursor(
     lastTransitionId,
     lastRequestSha256,
     updatedAt: UPDATED_AT,
-  });
+  };
+  if (lane === "supervisor-state-gc") {
+    value.afterAuthorizedAt = afterAuthorizedAt;
+    value.afterTerminalOperationId = afterTerminalOperationId;
+  }
+  return freezeRecord(value);
 }
 
 function increment(value) {
@@ -297,7 +319,10 @@ function createCursorStore({
       onAdvance?.(input);
       const before = state.get(input.lane);
       const advancedCursor = cursor(input.lane, {
+        afterAuthorizedAt: input.nextAfterAuthorizedAt ?? null,
         afterSessionId: input.nextAfterSessionId,
+        afterTerminalOperationId:
+          input.nextAfterTerminalOperationId ?? null,
         cycle:
           input.nextAfterSessionId === null
             ? increment(before.cycle)
@@ -328,7 +353,7 @@ function createRecoveryService({
     if (recordCalls) calls.push([field, input]);
     onList?.(field, input);
     if (listOverrides[field]) return listOverrides[field](input);
-    return pages[field] ?? page();
+    return pages[field] ?? (field === "supervisorStateGc" ? gcPage() : page());
   }
 
   const service = createPostgresRestoreActivationRecoveryService({
@@ -1273,6 +1298,87 @@ test("request hashes are deterministic over cursor state, limit, and full batch"
     narrow.generation.requestSha256,
     wide.generation.requestSha256,
   );
+});
+
+test("supervisor-state GC v2 hashes and CAS bind the complete cursor", async () => {
+  async function runGcCursor({ authorizedAt, terminalOperationId }) {
+    const cursorFixture = createCursorStore({
+      cursors: {
+        supervisorStateGc: cursor("supervisor-state-gc", {
+          afterAuthorizedAt: authorizedAt,
+          afterSessionId: SESSION_ID_1,
+          afterTerminalOperationId: terminalOperationId,
+          lastRequestSha256: "a".repeat(64),
+          lastTransitionId: "019f2600-0000-7000-8000-000000000099",
+          revision: "1",
+        }),
+      },
+    });
+    const result = await createRunner({ cursorFixture }).runner.runOnce({
+      signal: null,
+    });
+    const advance = cursorFixture.calls.find(
+      ([kind, input]) =>
+        kind === "advance" && input.lane === "supervisor-state-gc",
+    )[1];
+    return { advance, receipt: result.supervisorStateGc };
+  }
+
+  const first = await runGcCursor({
+    authorizedAt: GC_AUTHORIZED_AT,
+    terminalOperationId: "stop-gc-001",
+  });
+  const replay = await runGcCursor({
+    authorizedAt: GC_AUTHORIZED_AT,
+    terminalOperationId: "stop-gc-001",
+  });
+  const changedOperation = await runGcCursor({
+    authorizedAt: GC_AUTHORIZED_AT,
+    terminalOperationId: "stop-gc-002",
+  });
+  const changedTimestamp = await runGcCursor({
+    authorizedAt: "2026-08-10T00:01:01.000Z",
+    terminalOperationId: "stop-gc-001",
+  });
+
+  assert.equal(
+    first.receipt.requestSha256,
+    replay.receipt.requestSha256,
+  );
+  assert.equal(
+    first.receipt.requestSha256,
+    "47d7b280a45fa9134b68c61e62f4d84eed833f1af90fb0f0672fc5b1e3a689f5",
+  );
+  assert.notEqual(
+    first.receipt.requestSha256,
+    changedOperation.receipt.requestSha256,
+  );
+  assert.notEqual(
+    first.receipt.requestSha256,
+    changedTimestamp.receipt.requestSha256,
+  );
+  assert.deepEqual(Reflect.ownKeys(first.advance), [
+    "recoveryScopeId",
+    "lane",
+    "transitionId",
+    "expectedRevision",
+    "expectedCycle",
+    "expectedAfterAuthorizedAt",
+    "expectedAfterSessionId",
+    "expectedAfterTerminalOperationId",
+    "nextAfterAuthorizedAt",
+    "nextAfterSessionId",
+    "nextAfterTerminalOperationId",
+    "requestSha256",
+  ]);
+  assert.equal(first.advance.expectedAfterAuthorizedAt, GC_AUTHORIZED_AT);
+  assert.equal(
+    first.advance.expectedAfterTerminalOperationId,
+    "stop-gc-001",
+  );
+  assert.equal(first.advance.nextAfterAuthorizedAt, null);
+  assert.equal(first.advance.nextAfterTerminalOperationId, null);
+  assert.equal(first.receipt.advance.cursor.cycle, "1");
 });
 
 test(

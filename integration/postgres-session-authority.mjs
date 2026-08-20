@@ -2203,6 +2203,18 @@ async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
       data_type: "timestamp with time zone",
       is_nullable: "NO",
     },
+    {
+      character_maximum_length: null,
+      column_name: "after_authorized_at",
+      data_type: "timestamp with time zone",
+      is_nullable: "YES",
+    },
+    {
+      character_maximum_length: 128,
+      column_name: "after_terminal_operation_id",
+      data_type: "character varying",
+      is_nullable: "YES",
+    },
   ]);
 
   const constraints = await pool.query(
@@ -2223,6 +2235,7 @@ async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
     [
       "restore_recovery_cursors_cycle_nonnegative",
       "restore_recovery_cursors_cycle_within_revision",
+      "restore_recovery_cursors_gc_position_shape",
       "restore_recovery_cursors_initial_shape",
       "restore_recovery_cursors_lane_allowed",
       "restore_recovery_cursors_pkey",
@@ -2260,6 +2273,19 @@ async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
           0,
           null,
           null,
+          now,
+        ],
+      },
+      {
+        constraint: "restore_recovery_cursors_gc_position_shape",
+        values: [
+          `constraint-${randomUUID()}`,
+          "supervisor-state-gc",
+          randomUUID(),
+          0,
+          1,
+          transitionId,
+          requestSha256,
           now,
         ],
       },
@@ -2373,10 +2399,12 @@ async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
   const lazyScopeId = `lazy-${randomUUID()}`;
   const concurrentScopeId = `concurrent-${randomUUID()}`;
   const acknowledgementLossScopeId = `ack-loss-${randomUUID()}`;
+  const gcScopeId = `gc-${randomUUID()}`;
   const scopeIds = [
     lazyScopeId,
     concurrentScopeId,
     acknowledgementLossScopeId,
+    gcScopeId,
   ];
   const cursorStore = createPostgresRestoreRecoveryCursorStore({ store });
   try {
@@ -2475,6 +2503,63 @@ async function assertRestoreRecoveryCursorSchemaAndStore(pool, store) {
       }),
       successful[0].value.cursor,
     );
+
+    const gcInitial = await cursorStore.readLane({
+      lane: "supervisor-state-gc",
+      recoveryScopeId: gcScopeId,
+    });
+    assert.equal(gcInitial.afterAuthorizedAt, null);
+    assert.equal(gcInitial.afterSessionId, null);
+    assert.equal(gcInitial.afterTerminalOperationId, null);
+    const gcAuthorizedAt = new Date().toISOString();
+    const gcSessionId = randomUUID();
+    const gcTerminalOperationId = `gc-terminal-${randomUUID()}`;
+    const gcAdvanceInput = {
+      expectedAfterAuthorizedAt: null,
+      expectedAfterSessionId: null,
+      expectedAfterTerminalOperationId: null,
+      expectedCycle: gcInitial.cycle,
+      expectedRevision: gcInitial.revision,
+      lane: gcInitial.lane,
+      nextAfterAuthorizedAt: gcAuthorizedAt,
+      nextAfterSessionId: gcSessionId,
+      nextAfterTerminalOperationId: gcTerminalOperationId,
+      recoveryScopeId: gcInitial.recoveryScopeId,
+      requestSha256: "e".repeat(64),
+      transitionId: randomUUID(),
+    };
+    const gcAdvanced = await cursorStore.advanceLane(gcAdvanceInput);
+    assert.equal(gcAdvanced.cursor.afterAuthorizedAt, gcAuthorizedAt);
+    assert.equal(gcAdvanced.cursor.afterSessionId, gcSessionId);
+    assert.equal(
+      gcAdvanced.cursor.afterTerminalOperationId,
+      gcTerminalOperationId,
+    );
+    assert.deepEqual(
+      await cursorStore.readLane({
+        lane: "supervisor-state-gc",
+        recoveryScopeId: gcScopeId,
+      }),
+      gcAdvanced.cursor,
+    );
+    const gcWrapped = await cursorStore.advanceLane({
+      expectedAfterAuthorizedAt: gcAuthorizedAt,
+      expectedAfterSessionId: gcSessionId,
+      expectedAfterTerminalOperationId: gcTerminalOperationId,
+      expectedCycle: gcAdvanced.cursor.cycle,
+      expectedRevision: gcAdvanced.cursor.revision,
+      lane: gcAdvanced.cursor.lane,
+      nextAfterAuthorizedAt: null,
+      nextAfterSessionId: null,
+      nextAfterTerminalOperationId: null,
+      recoveryScopeId: gcAdvanced.cursor.recoveryScopeId,
+      requestSha256: "d".repeat(64),
+      transitionId: randomUUID(),
+    });
+    assert.equal(gcWrapped.cursor.afterAuthorizedAt, null);
+    assert.equal(gcWrapped.cursor.afterSessionId, null);
+    assert.equal(gcWrapped.cursor.afterTerminalOperationId, null);
+    assert.equal(gcWrapped.cursor.cycle, "1");
 
     const acknowledgementLossStore =
       createPostgresRestoreRecoveryCursorStore({
@@ -14744,6 +14829,48 @@ test(
     assert.deepEqual(
       structuredClone(await physicalBindings.stop()),
       { status: "stopped" },
+    );
+
+    const firstSupervisorStateGcPage =
+      await authority.listWriterSupervisorStateGcCandidates({
+        afterAuthorizedAt: null,
+        afterSessionId: null,
+        afterTerminalOperationId: null,
+        limit: 1,
+        stateOwnerId,
+      });
+    assert.equal(firstSupervisorStateGcPage.candidates.length, 1);
+    assert.notEqual(firstSupervisorStateGcPage.nextAfterAuthorizedAt, null);
+    assert.notEqual(firstSupervisorStateGcPage.nextAfterSessionId, null);
+    assert.notEqual(
+      firstSupervisorStateGcPage.nextAfterTerminalOperationId,
+      null,
+    );
+    const secondSupervisorStateGcPage =
+      await authority.listWriterSupervisorStateGcCandidates({
+        afterAuthorizedAt:
+          firstSupervisorStateGcPage.nextAfterAuthorizedAt,
+        afterSessionId: firstSupervisorStateGcPage.nextAfterSessionId,
+        afterTerminalOperationId:
+          firstSupervisorStateGcPage.nextAfterTerminalOperationId,
+        limit: 1,
+        stateOwnerId,
+      });
+    assert.equal(secondSupervisorStateGcPage.candidates.length, 1);
+    assert.equal(secondSupervisorStateGcPage.nextAfterAuthorizedAt, null);
+    assert.equal(secondSupervisorStateGcPage.nextAfterSessionId, null);
+    assert.equal(
+      secondSupervisorStateGcPage.nextAfterTerminalOperationId,
+      null,
+    );
+    assert.deepEqual(
+      [
+        firstSupervisorStateGcPage.candidates[0].authorization
+          .launchAttemptId,
+        secondSupervisorStateGcPage.candidates[0].authorization
+          .launchAttemptId,
+      ].sort(),
+      [launchAttemptId, recoveryLaunchAttemptId].sort(),
     );
 
     const restartedCalls = {

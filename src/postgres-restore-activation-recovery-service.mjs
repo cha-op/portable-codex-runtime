@@ -123,6 +123,21 @@ const GUARDED_BATCH_REQUEST_KEYS = objectFreeze([
   "limit",
   "signal",
 ]);
+const GC_BATCH_REQUEST_KEYS = objectFreeze([
+  "afterAuthorizedAt",
+  "afterSessionId",
+  "afterTerminalOperationId",
+  "limit",
+  "signal",
+]);
+const GUARDED_GC_BATCH_REQUEST_KEYS = objectFreeze([
+  "afterAuthorizedAt",
+  "afterSessionId",
+  "afterTerminalOperationId",
+  "lifecycleLease",
+  "limit",
+  "signal",
+]);
 const SWEEP_REQUEST_KEYS = objectFreeze([
   "activation",
   "currentLaunch",
@@ -141,7 +156,19 @@ const GUARDED_SWEEP_REQUEST_KEYS = objectFreeze([
   "supervisorStateGc",
 ]);
 const SWEEP_LANE_KEYS = objectFreeze(["afterSessionId", "limit"]);
+const GC_SWEEP_LANE_KEYS = objectFreeze([
+  "afterAuthorizedAt",
+  "afterSessionId",
+  "afterTerminalOperationId",
+  "limit",
+]);
 const PAGE_KEYS = objectFreeze(["candidates", "nextAfterSessionId"]);
+const GC_PAGE_KEYS = objectFreeze([
+  "candidates",
+  "nextAfterAuthorizedAt",
+  "nextAfterSessionId",
+  "nextAfterTerminalOperationId",
+]);
 const GENERATION_CANDIDATE_KEYS = objectFreeze([
   "checkpoint",
   "generationId",
@@ -335,11 +362,12 @@ export function isPostgresRestoreActivationRecoveryService(value) {
 /**
  * Consumes one authentic batch receipt exactly once. Success proves only that
  * `receipt` is the exact object minted by `service` after the named lane had
- * drained one invocation with the exact `{afterSessionId, limit}` input. The
+ * drained one invocation with the exact lane cursor and limit input. The
  * legacy five-argument form consumes only an unguarded receipt. The guarded
  * six-argument form additionally requires the exact active recovery lease
- * that minted the receipt. It is an in-process provenance check, not
- * persistent authority or a database CAS.
+ * that minted the receipt. The GC lane uses equivalent seven- and
+ * eight-argument forms carrying its timestamp and operation-ID cursor. It is
+ * an in-process provenance check, not persistent authority or a database CAS.
  *
  * Failed checks return `false` without consuming an otherwise-valid receipt.
  * The function reads no properties from either public object, so rejected
@@ -349,24 +377,53 @@ export function isPostgresRestoreActivationRecoveryService(value) {
  * @param {unknown} lane One of generation, activation, launchAttempt,
  * currentLaunch, or supervisorStateGc.
  * @param {unknown} afterSessionId
- * @param {unknown} limit
- * @param {unknown} lifecycleLeaseOrReceipt Legacy receipt or guarded recovery lease.
- * @param {unknown} [guardedReceipt] Guarded receipt when the lease is supplied.
+ * @param {unknown} limitOrAfterAuthorizedAt Legacy limit, or GC timestamp.
+ * @param {unknown} leaseOrAfterTerminalOperationId Legacy lease/receipt, or GC operation ID.
+ * @param {unknown} [receiptOrGcLimit] Legacy guarded receipt, or GC limit.
  * @returns {boolean} `true` for the first exact match; otherwise `false`.
  */
 export function consumePostgresRestoreActivationRecoveryBatchReceipt(
   service,
   lane,
   afterSessionId,
-  limit,
-  lifecycleLeaseOrReceipt,
-  guardedReceipt,
+  limitOrAfterAuthorizedAt,
+  leaseOrAfterTerminalOperationId,
+  receiptOrGcLimit,
 ) {
-  const guarded = arguments.length === 6;
-  const receipt = guarded ? guardedReceipt : lifecycleLeaseOrReceipt;
-  const lifecycleLease = guarded ? lifecycleLeaseOrReceipt : null;
+  const gcLeaseOrReceipt = arguments[6];
+  const gcGuardedReceipt = arguments[7];
+  const supervisorStateGc = lane === "supervisorStateGc";
+  const guarded = supervisorStateGc
+    ? arguments.length === 8
+    : arguments.length === 6;
+  const validArity = supervisorStateGc
+    ? arguments.length === 7 || guarded
+    : arguments.length === 5 || guarded;
+  const afterAuthorizedAt = supervisorStateGc
+    ? limitOrAfterAuthorizedAt
+    : null;
+  const afterTerminalOperationId = supervisorStateGc
+    ? leaseOrAfterTerminalOperationId
+    : null;
+  const actualLimit = supervisorStateGc
+    ? receiptOrGcLimit
+    : limitOrAfterAuthorizedAt;
+  const receipt = supervisorStateGc
+    ? guarded
+      ? gcGuardedReceipt
+      : gcLeaseOrReceipt
+    : guarded
+      ? receiptOrGcLimit
+      : leaseOrAfterTerminalOperationId;
+  const lifecycleLease = supervisorStateGc
+    ? guarded
+      ? gcLeaseOrReceipt
+      : null
+    : guarded
+      ? leaseOrAfterTerminalOperationId
+      : null;
   if (
-    (arguments.length !== 5 && !guarded) ||
+    !validArity ||
     !isPostgresRestoreActivationRecoveryService(service) ||
     (guarded &&
       !callIntrinsic(isPostgresRestoreLifecycleLease, undefined, [
@@ -388,7 +445,9 @@ export function consumePostgresRestoreActivationRecoveryBatchReceipt(
     metadata.service !== service ||
     metadata.lane !== lane ||
     metadata.afterSessionId !== afterSessionId ||
-    metadata.limit !== limit ||
+    metadata.afterAuthorizedAt !== afterAuthorizedAt ||
+    metadata.afterTerminalOperationId !== afterTerminalOperationId ||
+    metadata.limit !== actualLimit ||
     metadata.lifecycleLease !== lifecycleLease
   ) {
     return false;
@@ -1012,19 +1071,48 @@ function signalIsAborted(signal, code) {
   }
 }
 
-function normalizeLaneRequest(value, code) {
-  const normalized = exactDataObject(value, SWEEP_LANE_KEYS, code);
+function normalizeLaneRequest(value, code, supervisorStateGc = false) {
+  const normalized = exactDataObject(
+    value,
+    supervisorStateGc ? GC_SWEEP_LANE_KEYS : SWEEP_LANE_KEYS,
+    code,
+  );
   const afterSessionId =
     normalized.afterSessionId === null
       ? null
       : canonicalSessionId(normalized.afterSessionId, code);
+  const afterAuthorizedAt =
+    supervisorStateGc && normalized.afterAuthorizedAt !== null
+      ? canonicalTimestamp(normalized.afterAuthorizedAt, code)
+      : null;
+  const afterTerminalOperationId =
+    supervisorStateGc && normalized.afterTerminalOperationId !== null
+      ? canonicalOpaqueId(normalized.afterTerminalOperationId, code)
+      : null;
+  ensure(
+    !supervisorStateGc ||
+      (afterSessionId === null &&
+        afterAuthorizedAt === null &&
+        afterTerminalOperationId === null) ||
+      (afterSessionId !== null &&
+        afterAuthorizedAt !== null &&
+        afterTerminalOperationId !== null),
+    code,
+  );
   ensure(
     numberIsSafeInteger(normalized.limit) &&
       normalized.limit >= 1 &&
       normalized.limit <= MAX_BATCH_SIZE,
     code,
   );
-  return exactFrozenRecord({ afterSessionId, limit: normalized.limit });
+  return supervisorStateGc
+    ? exactFrozenRecord({
+        afterAuthorizedAt,
+        afterSessionId,
+        afterTerminalOperationId,
+        limit: normalized.limit,
+      })
+    : exactFrozenRecord({ afterSessionId, limit: normalized.limit });
 }
 
 function hasOwnLifecycleLease(value, code) {
@@ -1044,19 +1132,33 @@ function hasOwnLifecycleLease(value, code) {
   return descriptor !== undefined;
 }
 
-function normalizeBatchRequest(value, code) {
+function normalizeBatchRequest(value, code, kind) {
   const guarded = hasOwnLifecycleLease(value, code);
+  const supervisorStateGc = kind === "supervisorStateGc";
   const normalized = exactDataObject(
     value,
-    guarded ? GUARDED_BATCH_REQUEST_KEYS : BATCH_REQUEST_KEYS,
+    supervisorStateGc
+      ? guarded
+        ? GUARDED_GC_BATCH_REQUEST_KEYS
+        : GC_BATCH_REQUEST_KEYS
+      : guarded
+        ? GUARDED_BATCH_REQUEST_KEYS
+        : BATCH_REQUEST_KEYS,
     code,
   );
   const lane = normalizeLaneRequest(
     {
+      ...(supervisorStateGc
+        ? {
+            afterAuthorizedAt: normalized.afterAuthorizedAt,
+            afterTerminalOperationId: normalized.afterTerminalOperationId,
+          }
+        : {}),
       afterSessionId: normalized.afterSessionId,
       limit: normalized.limit,
     },
     code,
+    supervisorStateGc,
   );
   signalIsAborted(normalized.signal, code);
   const lifecycleLease = guarded ? normalized.lifecycleLease : null;
@@ -1068,12 +1170,23 @@ function normalizeBatchRequest(value, code) {
       ]),
     code,
   );
-  return exactFrozenRecord({
-    afterSessionId: lane.afterSessionId,
-    lifecycleLease,
-    limit: lane.limit,
-    signal: normalized.signal,
-  });
+  return exactFrozenRecord(
+    supervisorStateGc
+      ? {
+          afterAuthorizedAt: lane.afterAuthorizedAt,
+          afterSessionId: lane.afterSessionId,
+          afterTerminalOperationId: lane.afterTerminalOperationId,
+          lifecycleLease,
+          limit: lane.limit,
+          signal: normalized.signal,
+        }
+      : {
+          afterSessionId: lane.afterSessionId,
+          lifecycleLease,
+          limit: lane.limit,
+          signal: normalized.signal,
+        },
+  );
 }
 
 function normalizeSweepRequest(value, code) {
@@ -1103,6 +1216,7 @@ function normalizeSweepRequest(value, code) {
     supervisorStateGc: normalizeLaneRequest(
       normalized.supervisorStateGc,
       code,
+      true,
     ),
   });
 }
@@ -1367,7 +1481,7 @@ function supervisorStateGcCandidate(value, code) {
   );
   canonicalSha256(authorization.authorizationSha256, code);
   canonicalSha256(authorization.terminalRecordSha256, code);
-  canonicalTimestamp(authorization.authorizedAt, code);
+  const authorizedAt = canonicalTimestamp(authorization.authorizedAt, code);
 
   let terminalRecord;
   let session;
@@ -1423,14 +1537,41 @@ function supervisorStateGcCandidate(value, code) {
     ensure(terminalRecord.stopOperationId === terminalOperationId, code);
   }
   return exactFrozenRecord({
+    authorizedAt,
     candidate: raw,
     operationId: terminalOperationId,
     sessionId,
   });
 }
 
+function recoveryPositionAfter(left, right) {
+  return (
+    right === null ||
+    left.sessionId > right.sessionId ||
+    (left.sessionId === right.sessionId &&
+      (left.authorizedAt > right.authorizedAt ||
+        (left.authorizedAt === right.authorizedAt &&
+          left.operationId > right.operationId)))
+  );
+}
+
+function supervisorStateGcRequestPosition(request) {
+  return request.afterSessionId === null
+    ? null
+    : exactFrozenRecord({
+        authorizedAt: request.afterAuthorizedAt,
+        operationId: request.afterTerminalOperationId,
+        sessionId: request.afterSessionId,
+      });
+}
+
 function normalizePage(value, request, kind, code) {
-  const raw = exactDataObject(value, PAGE_KEYS, code);
+  const supervisorStateGc = kind === "supervisorStateGc";
+  const raw = exactDataObject(
+    value,
+    supervisorStateGc ? GC_PAGE_KEYS : PAGE_KEYS,
+    code,
+  );
   const rawCandidates = clonePlainJson(raw.candidates, code);
   ensure(
     arrayIsArray(rawCandidates) &&
@@ -1448,27 +1589,65 @@ function normalizePage(value, request, kind, code) {
   }[kind];
   const candidates = [];
   let previousSessionId = request.afterSessionId;
+  let previousPosition = supervisorStateGc
+    ? supervisorStateGcRequestPosition(request)
+    : null;
   for (let index = 0; index < rawCandidates.length; index += 1) {
     const normalized = normalizeCandidate(rawCandidates[index], code);
     ensure(
-      previousSessionId === null || normalized.sessionId > previousSessionId,
+      supervisorStateGc
+        ? recoveryPositionAfter(normalized, previousPosition)
+        : previousSessionId === null ||
+            normalized.sessionId > previousSessionId,
       code,
     );
     defineArrayElement(candidates, candidates.length, normalized);
     previousSessionId = normalized.sessionId;
+    if (supervisorStateGc) previousPosition = normalized;
   }
   const nextAfterSessionId =
     raw.nextAfterSessionId === null
       ? null
       : canonicalSessionId(raw.nextAfterSessionId, code);
+  const nextAfterAuthorizedAt =
+    supervisorStateGc && raw.nextAfterAuthorizedAt !== null
+      ? canonicalTimestamp(raw.nextAfterAuthorizedAt, code)
+      : null;
+  const nextAfterTerminalOperationId =
+    supervisorStateGc && raw.nextAfterTerminalOperationId !== null
+      ? canonicalOpaqueId(raw.nextAfterTerminalOperationId, code)
+      : null;
   ensure(
-    nextAfterSessionId === null ||
-      (request.afterSessionId === null ||
-        nextAfterSessionId > request.afterSessionId),
+    supervisorStateGc
+      ? (nextAfterSessionId === null &&
+          nextAfterAuthorizedAt === null &&
+          nextAfterTerminalOperationId === null) ||
+          (nextAfterSessionId !== null &&
+            nextAfterAuthorizedAt !== null &&
+            nextAfterTerminalOperationId !== null &&
+            recoveryPositionAfter(
+              {
+                authorizedAt: nextAfterAuthorizedAt,
+                operationId: nextAfterTerminalOperationId,
+                sessionId: nextAfterSessionId,
+              },
+              supervisorStateGcRequestPosition(request),
+            ))
+      : nextAfterSessionId === null ||
+          (request.afterSessionId === null ||
+            nextAfterSessionId > request.afterSessionId),
     code,
   );
   if (nextAfterSessionId !== null) {
-    if (kind === "currentLaunch") {
+    if (supervisorStateGc) {
+      ensure(
+        candidates.length === request.limit &&
+          previousPosition.sessionId === nextAfterSessionId &&
+          previousPosition.authorizedAt === nextAfterAuthorizedAt &&
+          previousPosition.operationId === nextAfterTerminalOperationId,
+        code,
+      );
+    } else if (kind === "currentLaunch") {
       ensure(
         previousSessionId === null ||
           nextAfterSessionId >= previousSessionId,
@@ -1482,10 +1661,19 @@ function normalizePage(value, request, kind, code) {
       );
     }
   }
-  return exactFrozenRecord({
-    candidates: frozenArray(candidates),
-    nextAfterSessionId,
-  });
+  return exactFrozenRecord(
+    supervisorStateGc
+      ? {
+          candidates: frozenArray(candidates),
+          nextAfterAuthorizedAt,
+          nextAfterSessionId,
+          nextAfterTerminalOperationId,
+        }
+      : {
+          candidates: frozenArray(candidates),
+          nextAfterSessionId,
+        },
+  );
 }
 
 async function callListInternal(callback, request, kind, code) {
@@ -1493,6 +1681,12 @@ async function callListInternal(callback, request, kind, code) {
   try {
     value = callIntrinsic(callback, undefined, [
       exactFrozenRecord({
+        ...(kind === "supervisorStateGc"
+          ? {
+              afterAuthorizedAt: request.afterAuthorizedAt,
+              afterTerminalOperationId: request.afterTerminalOperationId,
+            }
+          : {}),
         afterSessionId: request.afterSessionId,
         limit: request.limit,
       }),
@@ -1583,13 +1777,26 @@ function assertRecoveryLeaseHeld(...args) {
   );
 }
 
-function batchResult(afterSessionId, nextAfterSessionId, results, status) {
-  return exactFrozenRecord({
-    afterSessionId,
-    nextAfterSessionId,
-    results: frozenArray(results),
-    status,
-  });
+function batchResult(kind, request, nextPosition, results, status) {
+  return exactFrozenRecord(
+    kind === "supervisorStateGc"
+      ? {
+          afterAuthorizedAt: request.afterAuthorizedAt,
+          afterSessionId: request.afterSessionId,
+          afterTerminalOperationId: request.afterTerminalOperationId,
+          nextAfterAuthorizedAt: nextPosition?.authorizedAt ?? null,
+          nextAfterSessionId: nextPosition?.sessionId ?? null,
+          nextAfterTerminalOperationId: nextPosition?.operationId ?? null,
+          results: frozenArray(results),
+          status,
+        }
+      : {
+          afterSessionId: request.afterSessionId,
+          nextAfterSessionId: nextPosition,
+          results: frozenArray(results),
+          status,
+        },
+  );
 }
 
 export class PostgresRestoreActivationRecoveryServiceError extends ErrorConstructor {
@@ -1683,21 +1890,22 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
   function mintBatchReceipt(
     kind,
     request,
-    nextAfterSessionId,
+    nextPosition,
     results,
     status,
   ) {
     ensure(serviceInstance !== null, outcomeCode);
-    const receipt = batchResult(
-      request.afterSessionId,
-      nextAfterSessionId,
-      results,
-      status,
-    );
+    const receipt = batchResult(kind, request, nextPosition, results, status);
     callIntrinsic(weakMapSetIntrinsic, recoveryBatchReceiptMetadata, [
       receipt,
       exactFrozenRecord({
         afterSessionId: request.afterSessionId,
+        afterAuthorizedAt:
+          kind === "supervisorStateGc" ? request.afterAuthorizedAt : null,
+        afterTerminalOperationId:
+          kind === "supervisorStateGc"
+            ? request.afterTerminalOperationId
+            : null,
         lane: kind,
         lifecycleLease: request.lifecycleLease,
         limit: request.limit,
@@ -1711,7 +1919,9 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
     return mintBatchReceipt(
       kind,
       request,
-      request.afterSessionId,
+      kind === "supervisorStateGc"
+        ? supervisorStateGcRequestPosition(request)
+        : request.afterSessionId,
       [],
       "aborted",
     );
@@ -1734,7 +1944,10 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
       return emptyAbortedBatch(kind, request);
     }
     const results = [];
-    let settledCursor = request.afterSessionId;
+    let settledCursor =
+      kind === "supervisorStateGc"
+        ? supervisorStateGcRequestPosition(request)
+        : request.afterSessionId;
     for (let index = 0; index < page.candidates.length; index += 1) {
       if (signalIsAborted(request.signal, requestCode)) {
         return mintBatchReceipt(
@@ -1760,12 +1973,22 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         results,
         results.length,
         exactFrozenRecord({
+          ...(kind === "supervisorStateGc"
+            ? { authorizedAt: normalized.authorizedAt }
+            : {}),
           operationId: normalized.operationId,
           sessionId: normalized.sessionId,
           status,
         }),
       );
-      settledCursor = normalized.sessionId;
+      settledCursor =
+        kind === "supervisorStateGc"
+          ? exactFrozenRecord({
+              authorizedAt: normalized.authorizedAt,
+              operationId: normalized.operationId,
+              sessionId: normalized.sessionId,
+            })
+          : normalized.sessionId;
       if (signalIsAborted(request.signal, requestCode)) {
         return mintBatchReceipt(
           kind,
@@ -1779,7 +2002,15 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
     return mintBatchReceipt(
       kind,
       request,
-      page.nextAfterSessionId,
+      kind === "supervisorStateGc"
+        ? page.nextAfterSessionId === null
+          ? null
+          : exactFrozenRecord({
+              authorizedAt: page.nextAfterAuthorizedAt,
+              operationId: page.nextAfterTerminalOperationId,
+              sessionId: page.nextAfterSessionId,
+            })
+        : page.nextAfterSessionId,
       results,
       page.nextAfterSessionId === null
         ? "sweep-complete"
@@ -1807,7 +2038,7 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
 
   async function publicBatchInternal(kind, argsValue) {
     ensure(argsValue.length === 1, requestCode);
-    const request = normalizeBatchRequest(argsValue[0], requestCode);
+    const request = normalizeBatchRequest(argsValue[0], requestCode, kind);
     return await withFlight(() => runLane(kind, request));
   }
 
@@ -1856,6 +2087,12 @@ export function createPostgresRestoreActivationRecoveryService(...args) {
         results[field] = await runLane(
           kind,
           exactFrozenRecord({
+            ...(kind === "supervisorStateGc"
+              ? {
+                  afterAuthorizedAt: lane.afterAuthorizedAt,
+                  afterTerminalOperationId: lane.afterTerminalOperationId,
+                }
+              : {}),
             afterSessionId: lane.afterSessionId,
             lifecycleLease: request.lifecycleLease,
             limit: lane.limit,

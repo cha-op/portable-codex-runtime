@@ -409,7 +409,9 @@ class ControllerAuthorityClient {
       this.transactionLane = lane;
       if (!this.fixture.cursors.has(lane)) {
         this.fixture.cursors.set(lane, {
+          after_authorized_at: null,
           after_session_id: null,
+          after_terminal_operation_id: null,
           cycle: "0",
           lane,
           last_request_sha256: null,
@@ -429,14 +431,16 @@ class ControllerAuthorityClient {
     if (text.startsWith("UPDATE session_authority.restore_recovery_cursors")) {
       const lane = values[1];
       const row = {
+        after_authorized_at: values[3],
         after_session_id: values[2],
-        cycle: values[3],
+        after_terminal_operation_id: values[4],
+        cycle: values[5],
         lane,
-        last_request_sha256: values[6],
-        last_transition_id: values[5],
+        last_request_sha256: values[8],
+        last_transition_id: values[7],
         recovery_scope_id: values[0],
-        revision: values[4],
-        updated_at: new Date(values[7]),
+        revision: values[6],
+        updated_at: new Date(values[9]),
       };
       this.fixture.cursors.set(lane, row);
       return { command: "UPDATE", rowCount: 1, rows: [{ ...row }] };

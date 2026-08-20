@@ -43,6 +43,13 @@ superseded_by:
   `{ stateOwnerId, terminalRecord }`, validates the version-2 receipt repeats
   that owner, and rechecks it before durable completion. Cold-start recovery
   and exact ledger readback preserve progress across process restart.
+- The fifth lane uses the complete
+  `(sessionId, authorizedAt, terminalOperationId)` key for authority pages,
+  service receipts, runner digests, and durable cursor compare-and-swap. It may
+  process multiple items from one session in a bounded page. A permanent
+  `pending` item no longer hides later same-session work; the current cycle
+  advances past it and a null-boundary wrap retries it. The other four lanes
+  retain their scalar session cursor and version-1 digest bytes.
 - Runtime derives its effective `recovery-owner:<64 hex>` cursor scope with
   domain-separated SHA-256 over the configured base `recoveryScopeId` and
   local owner marker. Reusing one base label across two roots no longer lets
@@ -110,6 +117,12 @@ superseded_by:
   record/pending sibling aliases. Held-FD link count can decrease monotonically
   within its prior bound but cannot increase, and every held artifact must
   reach zero links at the final absence proof.
+- Linux destructive lookups, unlinks, and absence proofs resolve artifact
+  basenames through a revalidated clone of the held state-root FD. A named-root
+  replacement therefore cannot redirect deletion to a bait directory. The
+  non-Linux path keeps held/named identity and access-policy brackets but does
+  not claim protection against an active same-UID ABA replacement because
+  Node exposes no portable directory-relative unlink API.
 - Pre-mutation I/O or unreadable state, canonical-chain or terminal conflict, and
   post-mutation outcome uncertainty are distinct fail-closed classes. A proved
   already-absent attempt is a successful replay, not uncertainty.

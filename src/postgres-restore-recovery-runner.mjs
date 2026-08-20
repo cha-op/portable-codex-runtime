@@ -111,9 +111,31 @@ const CURSOR_KEYS = objectFreeze([
   "revision",
   "updatedAt",
 ]);
+const GC_CURSOR_KEYS = objectFreeze([
+  "afterAuthorizedAt",
+  "afterSessionId",
+  "afterTerminalOperationId",
+  "cycle",
+  "lane",
+  "lastRequestSha256",
+  "lastTransitionId",
+  "recoveryScopeId",
+  "revision",
+  "updatedAt",
+]);
 const BATCH_KEYS = objectFreeze([
   "afterSessionId",
   "nextAfterSessionId",
+  "results",
+  "status",
+]);
+const GC_BATCH_KEYS = objectFreeze([
+  "afterAuthorizedAt",
+  "afterSessionId",
+  "afterTerminalOperationId",
+  "nextAfterAuthorizedAt",
+  "nextAfterSessionId",
+  "nextAfterTerminalOperationId",
   "results",
   "status",
 ]);
@@ -122,6 +144,14 @@ const BATCH_RESULT_KEYS = objectFreeze([
   "sessionId",
   "status",
 ]);
+const GC_BATCH_RESULT_KEYS = objectFreeze([
+  "authorizedAt",
+  "operationId",
+  "sessionId",
+  "status",
+]);
+const SUPERVISOR_STATE_GC_FIELD = "supervisorStateGc";
+const SUPERVISOR_STATE_GC_LANE = "supervisor-state-gc";
 const ADVANCE_RESULT_KEYS = objectFreeze(["advanced", "cursor"]);
 const LANE_ORDER = objectFreeze([
   objectFreeze(["generation", "generation", "runGenerationBatch"]),
@@ -685,11 +715,35 @@ function isLifecycleGuardBusyError(value) {
 }
 
 function normalizeCursor(value, recoveryScopeId, lane, code) {
-  const cursor = exactDataObject(value, CURSOR_KEYS, code, true);
+  const supervisorStateGc = lane === SUPERVISOR_STATE_GC_LANE;
+  const cursor = exactDataObject(
+    value,
+    supervisorStateGc ? GC_CURSOR_KEYS : CURSOR_KEYS,
+    code,
+    true,
+  );
   const afterSessionId =
     cursor.afterSessionId === null
       ? null
       : canonicalSessionId(cursor.afterSessionId, code);
+  const afterAuthorizedAt =
+    supervisorStateGc && cursor.afterAuthorizedAt !== null
+      ? canonicalTimestamp(cursor.afterAuthorizedAt, code)
+      : null;
+  const afterTerminalOperationId =
+    supervisorStateGc && cursor.afterTerminalOperationId !== null
+      ? canonicalOpaqueId(cursor.afterTerminalOperationId, code)
+      : null;
+  ensure(
+    !supervisorStateGc ||
+      (afterSessionId === null &&
+        afterAuthorizedAt === null &&
+        afterTerminalOperationId === null) ||
+      (afterSessionId !== null &&
+        afterAuthorizedAt !== null &&
+        afterTerminalOperationId !== null),
+    code,
+  );
   const lastTransitionId =
     cursor.lastTransitionId === null
       ? null
@@ -717,16 +771,31 @@ function normalizeCursor(value, recoveryScopeId, lane, code) {
   } else {
     ensure(lastTransitionId !== null, code);
   }
-  return exactFrozenRecord({
-    recoveryScopeId,
-    lane,
-    afterSessionId,
-    cycle: cycle.value,
-    revision: revision.value,
-    lastTransitionId,
-    lastRequestSha256,
-    updatedAt: canonicalTimestamp(cursor.updatedAt, code),
-  });
+  return exactFrozenRecord(
+    supervisorStateGc
+      ? {
+          recoveryScopeId,
+          lane,
+          afterAuthorizedAt,
+          afterSessionId,
+          afterTerminalOperationId,
+          cycle: cycle.value,
+          revision: revision.value,
+          lastTransitionId,
+          lastRequestSha256,
+          updatedAt: canonicalTimestamp(cursor.updatedAt, code),
+        }
+      : {
+          recoveryScopeId,
+          lane,
+          afterSessionId,
+          cycle: cycle.value,
+          revision: revision.value,
+          lastTransitionId,
+          lastRequestSha256,
+          updatedAt: canonicalTimestamp(cursor.updatedAt, code),
+        },
+  );
 }
 
 function normalizeFrozenArray(value, code) {
@@ -766,7 +835,153 @@ function normalizeFrozenArray(value, code) {
   return result;
 }
 
+function gcPositionIsCompleteOrNull(sessionId, authorizedAt, operationId) {
+  return (
+    (sessionId === null && authorizedAt === null && operationId === null) ||
+    (sessionId !== null && authorizedAt !== null && operationId !== null)
+  );
+}
+
+function gcPositionAfter(left, right) {
+  return (
+    right === null ||
+    left.sessionId > right.sessionId ||
+    (left.sessionId === right.sessionId &&
+      (left.authorizedAt > right.authorizedAt ||
+        (left.authorizedAt === right.authorizedAt &&
+          left.operationId > right.operationId)))
+  );
+}
+
+function gcCursorPosition(cursor) {
+  return cursor.afterSessionId === null
+    ? null
+    : exactFrozenRecord({
+        authorizedAt: cursor.afterAuthorizedAt,
+        operationId: cursor.afterTerminalOperationId,
+        sessionId: cursor.afterSessionId,
+      });
+}
+
+function normalizeGcBatch(value, cursor, limit, code) {
+  const batch = exactDataObject(value, GC_BATCH_KEYS, code, true);
+  const afterSessionId =
+    batch.afterSessionId === null
+      ? null
+      : canonicalSessionId(batch.afterSessionId, code);
+  const afterAuthorizedAt =
+    batch.afterAuthorizedAt === null
+      ? null
+      : canonicalTimestamp(batch.afterAuthorizedAt, code);
+  const afterTerminalOperationId =
+    batch.afterTerminalOperationId === null
+      ? null
+      : canonicalOpaqueId(batch.afterTerminalOperationId, code);
+  const nextAfterSessionId =
+    batch.nextAfterSessionId === null
+      ? null
+      : canonicalSessionId(batch.nextAfterSessionId, code);
+  const nextAfterAuthorizedAt =
+    batch.nextAfterAuthorizedAt === null
+      ? null
+      : canonicalTimestamp(batch.nextAfterAuthorizedAt, code);
+  const nextAfterTerminalOperationId =
+    batch.nextAfterTerminalOperationId === null
+      ? null
+      : canonicalOpaqueId(batch.nextAfterTerminalOperationId, code);
+  ensure(
+    gcPositionIsCompleteOrNull(
+      afterSessionId,
+      afterAuthorizedAt,
+      afterTerminalOperationId,
+    ) &&
+      gcPositionIsCompleteOrNull(
+        nextAfterSessionId,
+        nextAfterAuthorizedAt,
+        nextAfterTerminalOperationId,
+      ) &&
+      afterSessionId === cursor.afterSessionId &&
+      afterAuthorizedAt === cursor.afterAuthorizedAt &&
+      afterTerminalOperationId === cursor.afterTerminalOperationId &&
+      (batch.status === "aborted" ||
+        batch.status === "limit-reached" ||
+        batch.status === "sweep-complete"),
+    code,
+  );
+  const values = normalizeFrozenArray(batch.results, code);
+  ensure(values.length <= limit, code);
+  const results = [];
+  let previousPosition = gcCursorPosition(cursor);
+  for (let index = 0; index < values.length; index += 1) {
+    const normalized = exactDataObject(
+      values[index],
+      GC_BATCH_RESULT_KEYS,
+      code,
+      true,
+    );
+    const result = exactFrozenRecord({
+      authorizedAt: canonicalTimestamp(normalized.authorizedAt, code),
+      operationId: canonicalOpaqueId(normalized.operationId, code),
+      sessionId: canonicalSessionId(normalized.sessionId, code),
+      status: normalized.status,
+    });
+    ensure(
+      gcPositionAfter(result, previousPosition) &&
+        (result.status === "pending" || result.status === "reconciled"),
+      code,
+    );
+    defineArrayElement(results, index, result);
+    previousPosition = result;
+  }
+  const nextPosition =
+    nextAfterSessionId === null
+      ? null
+      : exactFrozenRecord({
+          authorizedAt: nextAfterAuthorizedAt,
+          operationId: nextAfterTerminalOperationId,
+          sessionId: nextAfterSessionId,
+        });
+  if (batch.status === "sweep-complete") {
+    ensure(nextPosition === null, code);
+  } else if (batch.status === "limit-reached") {
+    ensure(
+      nextPosition !== null &&
+        results.length === limit &&
+        gcPositionAfter(nextPosition, gcCursorPosition(cursor)) &&
+        previousPosition.sessionId === nextPosition.sessionId &&
+        previousPosition.authorizedAt === nextPosition.authorizedAt &&
+        previousPosition.operationId === nextPosition.operationId,
+      code,
+    );
+  } else {
+    const expected =
+      results.length === 0 ? gcCursorPosition(cursor) : previousPosition;
+    ensure(
+      (nextPosition === null && expected === null) ||
+        (nextPosition !== null &&
+          expected !== null &&
+          nextPosition.sessionId === expected.sessionId &&
+          nextPosition.authorizedAt === expected.authorizedAt &&
+          nextPosition.operationId === expected.operationId),
+      code,
+    );
+  }
+  return exactFrozenRecord({
+    afterAuthorizedAt,
+    afterSessionId,
+    afterTerminalOperationId,
+    nextAfterAuthorizedAt,
+    nextAfterSessionId,
+    nextAfterTerminalOperationId,
+    results: frozenArray(results),
+    status: batch.status,
+  });
+}
+
 function normalizeBatch(value, cursor, field, limit, code) {
+  if (field === SUPERVISOR_STATE_GC_FIELD) {
+    return normalizeGcBatch(value, cursor, limit, code);
+  }
   const batch = exactDataObject(value, BATCH_KEYS, code, true);
   const afterSessionId =
     batch.afterSessionId === null
@@ -852,6 +1067,50 @@ function normalizeBatch(value, cursor, field, limit, code) {
   });
 }
 
+function canonicalGcRequestSha256({
+  batch,
+  cursor,
+  lane,
+  limit,
+  recoveryScopeId,
+}) {
+  let serialized;
+  let hash;
+  try {
+    const digestBatch = exactFrozenRecord({
+      afterAuthorizedAt: batch.afterAuthorizedAt,
+      afterSessionId: batch.afterSessionId,
+      afterTerminalOperationId: batch.afterTerminalOperationId,
+      nextAfterAuthorizedAt: batch.nextAfterAuthorizedAt,
+      nextAfterSessionId: batch.nextAfterSessionId,
+      nextAfterTerminalOperationId: batch.nextAfterTerminalOperationId,
+      results: frozenNullPrototypeArray(batch.results),
+      status: batch.status,
+    });
+    const payload = exactFrozenRecord({
+      contractVersion: 2,
+      recoveryScopeId,
+      lane,
+      expectedRevision: cursor.revision,
+      expectedCycle: cursor.cycle,
+      expectedAfterAuthorizedAt: cursor.afterAuthorizedAt,
+      expectedAfterSessionId: cursor.afterSessionId,
+      expectedAfterTerminalOperationId: cursor.afterTerminalOperationId,
+      nextAfterAuthorizedAt: batch.nextAfterAuthorizedAt,
+      nextAfterSessionId: batch.nextAfterSessionId,
+      nextAfterTerminalOperationId: batch.nextAfterTerminalOperationId,
+      limit,
+      batch: digestBatch,
+    });
+    serialized = callIntrinsic(jsonStringifyIntrinsic, JSON, [payload]);
+    hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
+    callIntrinsic(hashUpdateIntrinsic, hash, [serialized, "utf8"]);
+    return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+  } catch {
+    fail("postgres_restore_recovery_runner_outcome_uncertain");
+  }
+}
+
 function canonicalRequestSha256({
   batch,
   cursor,
@@ -859,6 +1118,15 @@ function canonicalRequestSha256({
   limit,
   recoveryScopeId,
 }) {
+  if (lane === SUPERVISOR_STATE_GC_LANE) {
+    return canonicalGcRequestSha256({
+      batch,
+      cursor,
+      lane,
+      limit,
+      recoveryScopeId,
+    });
+  }
   // This payload is the stable identity of one settled lane result. The UUID
   // distinguishes attempts, while the cursor CAS decides durability: after an
   // ambiguous advance, a restarted runner reads the row instead of trusting
@@ -927,8 +1195,13 @@ function normalizeAdvance(
     lane,
     code,
   );
+  const supervisorStateGc = lane === SUPERVISOR_STATE_GC_LANE;
   ensure(
     cursor.afterSessionId === batch.nextAfterSessionId &&
+      (!supervisorStateGc ||
+        (cursor.afterAuthorizedAt === batch.nextAfterAuthorizedAt &&
+          cursor.afterTerminalOperationId ===
+            batch.nextAfterTerminalOperationId)) &&
       cursor.revision === incrementCanonicalDecimal(cursorBefore.revision, code) &&
       cursor.cycle ===
         (batch.nextAfterSessionId === null
@@ -939,6 +1212,14 @@ function normalizeAdvance(
     code,
   );
   return exactFrozenRecord({ advanced: advance.advanced, cursor });
+}
+
+function gcBatchNextMatchesCursor(batch, cursor) {
+  return (
+    batch.nextAfterSessionId === cursor.afterSessionId &&
+    batch.nextAfterAuthorizedAt === cursor.afterAuthorizedAt &&
+    batch.nextAfterTerminalOperationId === cursor.afterTerminalOperationId
+  );
 }
 
 function emptyResult(recoveryScopeId) {
@@ -1064,6 +1345,7 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       const laneSpecification = LANE_ORDER[index];
       const field = laneSpecification[0];
       const lane = laneSpecification[1];
+      const supervisorStateGc = field === SUPERVISOR_STATE_GC_FIELD;
       if (signalIsAborted(signal, outcomeCode)) {
         status = "aborted";
         break;
@@ -1088,24 +1370,47 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       const rawBatch = await callCollaborator(
         frozenRecoveryMethods[field],
         recoveryService,
-        exactFrozenRecord({
-          afterSessionId: cursorBefore.afterSessionId,
-          lifecycleLease,
-          limit: limits[field],
-          signal,
-        }),
+        exactFrozenRecord(
+          supervisorStateGc
+            ? {
+                afterAuthorizedAt: cursorBefore.afterAuthorizedAt,
+                afterSessionId: cursorBefore.afterSessionId,
+                afterTerminalOperationId:
+                  cursorBefore.afterTerminalOperationId,
+                lifecycleLease,
+                limit: limits[field],
+                signal,
+              }
+            : {
+                afterSessionId: cursorBefore.afterSessionId,
+                lifecycleLease,
+                limit: limits[field],
+                signal,
+              },
+        ),
         outcomeCode,
       );
       await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);
       ensure(
-        consumePostgresRestoreActivationRecoveryBatchReceipt(
-          recoveryService,
-          field,
-          cursorBefore.afterSessionId,
-          limits[field],
-          lifecycleLease,
-          rawBatch,
-        ),
+        supervisorStateGc
+          ? consumePostgresRestoreActivationRecoveryBatchReceipt(
+              recoveryService,
+              field,
+              cursorBefore.afterSessionId,
+              cursorBefore.afterAuthorizedAt,
+              cursorBefore.afterTerminalOperationId,
+              limits[field],
+              lifecycleLease,
+              rawBatch,
+            )
+          : consumePostgresRestoreActivationRecoveryBatchReceipt(
+              recoveryService,
+              field,
+              cursorBefore.afterSessionId,
+              limits[field],
+              lifecycleLease,
+              rawBatch,
+            ),
         outcomeCode,
       );
       const batch = normalizeBatch(
@@ -1117,7 +1422,9 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       );
       if (
         batch.status === "aborted" &&
-        batch.nextAfterSessionId === cursorBefore.afterSessionId
+        (supervisorStateGc
+          ? gcBatchNextMatchesCursor(batch, cursorBefore)
+          : batch.nextAfterSessionId === cursorBefore.afterSessionId)
       ) {
         laneReceipts[field] = exactFrozenRecord({
           cursorBefore,
@@ -1161,16 +1468,35 @@ export function createPostgresRestoreRecoveryRunner(...args) {
       const rawAdvance = await callCollaborator(
         advanceLane,
         cursorStore,
-        exactFrozenRecord({
-          recoveryScopeId,
-          lane,
-          transitionId,
-          expectedRevision: cursorBefore.revision,
-          expectedCycle: cursorBefore.cycle,
-          expectedAfterSessionId: cursorBefore.afterSessionId,
-          nextAfterSessionId: batch.nextAfterSessionId,
-          requestSha256,
-        }),
+        exactFrozenRecord(
+          supervisorStateGc
+            ? {
+                recoveryScopeId,
+                lane,
+                transitionId,
+                expectedRevision: cursorBefore.revision,
+                expectedCycle: cursorBefore.cycle,
+                expectedAfterAuthorizedAt: cursorBefore.afterAuthorizedAt,
+                expectedAfterSessionId: cursorBefore.afterSessionId,
+                expectedAfterTerminalOperationId:
+                  cursorBefore.afterTerminalOperationId,
+                nextAfterAuthorizedAt: batch.nextAfterAuthorizedAt,
+                nextAfterSessionId: batch.nextAfterSessionId,
+                nextAfterTerminalOperationId:
+                  batch.nextAfterTerminalOperationId,
+                requestSha256,
+              }
+            : {
+                recoveryScopeId,
+                lane,
+                transitionId,
+                expectedRevision: cursorBefore.revision,
+                expectedCycle: cursorBefore.cycle,
+                expectedAfterSessionId: cursorBefore.afterSessionId,
+                nextAfterSessionId: batch.nextAfterSessionId,
+                requestSha256,
+              },
+        ),
         outcomeCode,
       );
       await assertRecoveryLeaseHeld(lifecycleLease, outcomeCode);

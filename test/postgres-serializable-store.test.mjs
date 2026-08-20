@@ -2861,7 +2861,15 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     latestMigration.sql,
-    /CREATE INDEX writer_supervisor_state_gc_pending_page[\s\S]+\(\s*state_owner_id,[\s\S]+session_id,[\s\S]+authorized_at,[\s\S]+terminal_operation_id[\s\S]+WHERE collected_at IS NULL/u,
+    new RegExp(
+      [
+        "CREATE INDEX writer_supervisor_state_gc_pending_page[\\s\\S]+",
+        "\\(\\s*state_owner_id,[\\s\\S]+session_id,[\\s\\S]+",
+        "authorized_at,[\\s\\S]+terminal_operation_id COLLATE ",
+        'pg_catalog\\."C"[\\s\\S]+WHERE collected_at IS NULL',
+      ].join(""),
+      "u",
+    ),
   );
   assert.match(
     latestMigration.sql,
@@ -2870,6 +2878,36 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.match(
     latestMigration.sql,
     /ADD CONSTRAINT restore_recovery_cursors_lane_allowed[\s\S]+'supervisor-state-gc'/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    new RegExp(
+      [
+        "ADD COLUMN after_authorized_at timestamp with time zone,",
+        "[\\s\\S]+ADD COLUMN after_terminal_operation_id[\\s\\S]+",
+        'character varying\\(128\\) COLLATE pg_catalog\\."C"',
+      ].join(""),
+      "u",
+    ),
+  );
+  assert.match(
+    latestMigration.sql,
+    new RegExp(
+      [
+        "restore_recovery_cursors_gc_position_shape[\\s\\S]+",
+        "lane = 'supervisor-state-gc'[\\s\\S]+",
+        "after_session_id IS NULL[\\s\\S]+",
+        "after_authorized_at IS NULL[\\s\\S]+",
+        "after_terminal_operation_id IS NULL[\\s\\S]+",
+        "after_session_id IS NOT NULL[\\s\\S]+",
+        "after_authorized_at IS NOT NULL[\\s\\S]+",
+        "after_terminal_operation_id IS NOT NULL[\\s\\S]+",
+        "lane <> 'supervisor-state-gc'[\\s\\S]+",
+        "after_authorized_at IS NULL[\\s\\S]+",
+        "after_terminal_operation_id IS NULL",
+      ].join(""),
+      "u",
+    ),
   );
   client.assertExhausted();
 });

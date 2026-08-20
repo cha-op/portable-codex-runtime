@@ -647,6 +647,14 @@ the exact terminal anchor. Collection then performs two durable phases:
    Prove all revision and sidecar names absent and `fsync` the held directory
    again.
 
+On Linux, every artifact lookup, unlink, and final absence proof resolves its
+basename through a revalidated clone of the held state-root FD at
+`/proc/self/fd/<fd>`. A same-UID replacement of the named root therefore cannot
+redirect deletion into a bait directory. Non-Linux builds keep held/named root
+identity and access-policy brackets; because Node has no portable
+`openat`/`unlinkat`, that fallback does not claim protection from an active
+same-UID ABA swap.
+
 A retry may begin from that durable phase-1 prefix. If collection completed but
 its acknowledgement was lost, the next exact attempt returns `absent`; the
 outer PostgreSQL completion ledger can therefore accept a `collected` to

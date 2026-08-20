@@ -366,6 +366,11 @@ Restore and launcher authority are now split into eight serial pull requests:
      domain-separated SHA-256 over the caller's base `recoveryScopeId` and the
      owner marker: equal base labels remain isolated across roots, while a
      same-root restart is stable. The base label is not reused as owner.
+     The first four lanes retain scalar session cursors. The fifth lane stores
+     the full `(sessionId, authorizedAt, terminalOperationId)` boundary and may
+     process several items from one session in one bounded page. A pending item
+     advances only the current cycle, so later same-session work is not hidden
+     and the item is retried after wrap.
      Runtime fixes the same owner into its private foreground composition, whose
      launch-attempt read uses exact `{ operationId, stateOwnerId }`; public
      restore admission has no owner selector.

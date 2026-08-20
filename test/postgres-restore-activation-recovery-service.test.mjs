@@ -407,9 +407,14 @@ function supervisorStateGcOperation({
   };
 }
 
-function supervisorStateGcCandidate(sessionId = SESSION_ID) {
+function supervisorStateGcCandidate(
+  sessionId = SESSION_ID,
+  {
+    authorizedAt = "2026-08-05T00:06:00.000Z",
+    terminalOperationId = `stop-${sessionId}`,
+  } = {},
+) {
   const launchAttemptId = `launch-${sessionId}`;
-  const terminalOperationId = `stop-${sessionId}`;
   const request = launchRequest(sessionId);
   const terminalRecord = {
     containerId: "abcdef012345",
@@ -428,7 +433,7 @@ function supervisorStateGcCandidate(sessionId = SESSION_ID) {
   return {
     authorization: {
       authorizationSha256: "a".repeat(64),
-      authorizedAt: "2026-08-05T00:06:00.000Z",
+      authorizedAt,
       contractVersion: 2,
       launchAttemptId,
       sessionId,
@@ -457,6 +462,20 @@ function page(candidates, nextAfterSessionId = null) {
   return { candidates, nextAfterSessionId };
 }
 
+function gcPage(candidates, nextCandidate = null) {
+  return {
+    candidates,
+    nextAfterAuthorizedAt:
+      nextCandidate === null ? null : nextCandidate.authorization.authorizedAt,
+    nextAfterSessionId:
+      nextCandidate === null ? null : nextCandidate.authorization.sessionId,
+    nextAfterTerminalOperationId:
+      nextCandidate === null
+        ? null
+        : nextCandidate.authorization.terminalOperationId,
+  };
+}
+
 function callbacks(overrides = {}) {
   const calls = [];
   return {
@@ -480,7 +499,7 @@ function callbacks(overrides = {}) {
       },
       async listWriterSupervisorStateGcCandidates(request) {
         calls.push(["list-supervisor-state-gc", request]);
-        return page([supervisorStateGcCandidate()]);
+        return gcPage([supervisorStateGcCandidate()]);
       },
       async collectWriterSupervisorStateGc(candidate) {
         calls.push(["collect-supervisor-state-gc", candidate]);
@@ -508,8 +527,60 @@ function request(overrides = {}) {
   };
 }
 
+function gcRequest(overrides = {}) {
+  return {
+    afterAuthorizedAt: null,
+    afterSessionId: null,
+    afterTerminalOperationId: null,
+    limit: 10,
+    signal: null,
+    ...overrides,
+  };
+}
+
 function lane(afterSessionId = null, limit = 10) {
   return { afterSessionId, limit };
+}
+
+function gcLane(afterSessionId = null, limit = 10) {
+  return {
+    afterAuthorizedAt:
+      afterSessionId === null ? null : "2026-08-05T00:06:00.000Z",
+    afterSessionId,
+    afterTerminalOperationId:
+      afterSessionId === null ? null : `stop-${afterSessionId}`,
+    limit,
+  };
+}
+
+function consumeGcReceipt(
+  service,
+  afterSessionId,
+  limit,
+  lifecycleLeaseOrReceipt,
+  guardedReceipt,
+) {
+  const cursor = gcLane(afterSessionId, limit);
+  return arguments.length === 5
+    ? consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "supervisorStateGc",
+        cursor.afterSessionId,
+        cursor.afterAuthorizedAt,
+        cursor.afterTerminalOperationId,
+        cursor.limit,
+        lifecycleLeaseOrReceipt,
+        guardedReceipt,
+      )
+    : consumePostgresRestoreActivationRecoveryBatchReceipt(
+        service,
+        "supervisorStateGc",
+        cursor.afterSessionId,
+        cursor.afterAuthorizedAt,
+        cursor.afterTerminalOperationId,
+        cursor.limit,
+        lifecycleLeaseOrReceipt,
+      );
 }
 
 function assertDeepFrozen(value, seen = new Set()) {
@@ -635,7 +706,7 @@ test("runs five bounded recovery lanes without treating current launches as adop
   const launch = await service.runLaunchAttemptBatch(request());
   const current = await service.scanCurrentLaunchBatch(request());
   const supervisorStateGc = await service.runSupervisorStateGcBatch(
-    request(),
+    gcRequest(),
   );
 
   assert.deepEqual(plainBatch(generation), {
@@ -650,9 +721,25 @@ test("runs five bounded recovery lanes without treating current launches as adop
     ],
     status: "sweep-complete",
   });
+  assert.deepEqual(plainBatch(supervisorStateGc), {
+    afterAuthorizedAt: null,
+    afterSessionId: null,
+    afterTerminalOperationId: null,
+    nextAfterAuthorizedAt: null,
+    nextAfterSessionId: null,
+    nextAfterTerminalOperationId: null,
+    results: [
+      {
+        authorizedAt: "2026-08-05T00:06:00.000Z",
+        operationId: `stop-${SESSION_ID}`,
+        sessionId: SESSION_ID,
+        status: "reconciled",
+      },
+    ],
+    status: "sweep-complete",
+  });
   assert.equal(activation.results[0].status, "pending");
   assert.equal(launch.results[0].status, "reconciled");
-  assert.equal(supervisorStateGc.results[0].status, "reconciled");
   assert.deepEqual(current.results.map((entry) => ({ ...entry })), [
     {
       operationId: `launch-${SESSION_ID}`,
@@ -677,6 +764,10 @@ test("runs five bounded recovery lanes without treating current launches as adop
     "runSweep",
     "scanCurrentLaunchBatch",
   ]);
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt.length,
+    6,
+  );
   assertDeepFrozen(service);
 });
 
@@ -697,7 +788,7 @@ test("supervisor-state GC candidates require an exact persistent state owner", a
     let collections = 0;
     const fixture = callbacks({
       async listWriterSupervisorStateGcCandidates() {
-        return page([candidate]);
+        return gcPage([candidate]);
       },
       async collectWriterSupervisorStateGc() {
         collections += 1;
@@ -707,13 +798,85 @@ test("supervisor-state GC candidates require an exact persistent state owner", a
       fixture.options,
     );
     await assert.rejects(
-      service.runSupervisorStateGcBatch(request()),
+      service.runSupervisorStateGcBatch(gcRequest()),
       assertCode(
         "postgres_restore_activation_recovery_service_outcome_uncertain",
       ),
     );
     assert.equal(collections, 0);
   }
+});
+
+test("supervisor-state GC advances past pending and retries after wrap", async () => {
+  const first = supervisorStateGcCandidate(SESSION_ID, {
+    terminalOperationId: "stop-same-session-001",
+  });
+  const second = supervisorStateGcCandidate(SESSION_ID, {
+    terminalOperationId: "stop-same-session-002",
+  });
+  const attempts = [];
+  const fixture = callbacks({
+    async listWriterSupervisorStateGcCandidates(input) {
+      if (input.afterSessionId === null) {
+        return gcPage([first], first);
+      }
+      assert.deepEqual({ ...input }, {
+        afterAuthorizedAt: first.authorization.authorizedAt,
+        afterSessionId: SESSION_ID,
+        afterTerminalOperationId:
+          first.authorization.terminalOperationId,
+        limit: 1,
+      });
+      return gcPage([second]);
+    },
+    async collectWriterSupervisorStateGc(candidate) {
+      attempts.push(candidate.authorization.terminalOperationId);
+      if (
+        candidate.authorization.terminalOperationId ===
+        first.authorization.terminalOperationId
+      ) {
+        throw new Error("permanent collection conflict");
+      }
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+
+  const firstBatch = await service.runSupervisorStateGcBatch(
+    gcRequest({ limit: 1 }),
+  );
+  const secondBatch = await service.runSupervisorStateGcBatch(
+    gcRequest({
+      afterAuthorizedAt: firstBatch.nextAfterAuthorizedAt,
+      afterSessionId: firstBatch.nextAfterSessionId,
+      afterTerminalOperationId: firstBatch.nextAfterTerminalOperationId,
+      limit: 1,
+    }),
+  );
+  const wrappedBatch = await service.runSupervisorStateGcBatch(
+    gcRequest({ limit: 1 }),
+  );
+
+  assert.deepEqual(
+    firstBatch.results.map(({ operationId, status }) => ({
+      operationId,
+      status,
+    })),
+    [{ operationId: "stop-same-session-001", status: "pending" }],
+  );
+  assert.equal(firstBatch.status, "limit-reached");
+  assert.equal(firstBatch.nextAfterSessionId, SESSION_ID);
+  assert.equal(secondBatch.results[0].operationId, "stop-same-session-002");
+  assert.equal(secondBatch.results[0].status, "reconciled");
+  assert.equal(secondBatch.status, "sweep-complete");
+  assert.equal(secondBatch.nextAfterSessionId, null);
+  assert.equal(wrappedBatch.results[0].status, "pending");
+  assert.deepEqual(attempts, [
+    "stop-same-session-001",
+    "stop-same-session-002",
+    "stop-same-session-001",
+  ]);
 });
 
 test(
@@ -902,7 +1065,7 @@ test("guarded sweep probes around every list and candidate action", async () => 
     },
     async listWriterSupervisorStateGcCandidates() {
       events.push("list:supervisorStateGc");
-      return page([supervisorStateGcCandidate()]);
+      return gcPage([supervisorStateGcCandidate()]);
     },
     async collectWriterSupervisorStateGc() {
       events.push("collect:supervisorStateGc");
@@ -932,7 +1095,7 @@ test("guarded sweep probes around every list and candidate action", async () => 
       launchAttempt: lane(),
       lifecycleLease,
       signal: null,
-      supervisorStateGc: lane(),
+      supervisorStateGc: gcLane(),
     });
     for (const laneReceipt of [
       ["generation", result.generation],
@@ -942,14 +1105,22 @@ test("guarded sweep probes around every list and candidate action", async () => 
       ["supervisorStateGc", result.supervisorStateGc],
     ]) {
       assert.equal(
-        consumePostgresRestoreActivationRecoveryBatchReceipt(
-          service,
-          laneReceipt[0],
-          null,
-          10,
-          lifecycleLease,
-          laneReceipt[1],
-        ),
+        laneReceipt[0] === "supervisorStateGc"
+          ? consumeGcReceipt(
+              service,
+              null,
+              10,
+              lifecycleLease,
+              laneReceipt[1],
+            )
+          : consumePostgresRestoreActivationRecoveryBatchReceipt(
+              service,
+              laneReceipt[0],
+              null,
+              10,
+              lifecycleLease,
+              laneReceipt[1],
+            ),
         true,
       );
     }
@@ -1586,7 +1757,7 @@ test("guarded requests reject fake leases without reading their properties", asy
       launchAttempt: lane(),
       lifecycleLease: fakeLease,
       signal: null,
-      supervisorStateGc: lane(),
+      supervisorStateGc: gcLane(),
     }),
     assertCode(
       "invalid_postgres_restore_activation_recovery_service_request",
@@ -1717,6 +1888,54 @@ test("authentic sweep-complete receipts bind issuer, lane, input, and identity o
       10,
       receipt,
     ),
+    false,
+  );
+});
+
+test("supervisor-state GC receipts bind the complete input position", async () => {
+  const fixture = callbacks({
+    async listWriterSupervisorStateGcCandidates() {
+      return gcPage([]);
+    },
+  });
+  const service = createPostgresRestoreActivationRecoveryService(
+    fixture.options,
+  );
+  const position = gcLane(SESSION_ID, 10);
+  const receipt = await service.runSupervisorStateGcBatch(
+    gcRequest(position),
+  );
+
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "supervisorStateGc",
+      position.afterSessionId,
+      "2026-08-05T00:06:01.000Z",
+      position.afterTerminalOperationId,
+      position.limit,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumePostgresRestoreActivationRecoveryBatchReceipt(
+      service,
+      "supervisorStateGc",
+      position.afterSessionId,
+      position.afterAuthorizedAt,
+      "stop-crossed",
+      position.limit,
+      receipt,
+    ),
+    false,
+  );
+  assert.equal(
+    consumeGcReceipt(service, SESSION_ID, 10, receipt),
+    true,
+  );
+  assert.equal(
+    consumeGcReceipt(service, SESSION_ID, 10, receipt),
     false,
   );
 });
@@ -1985,7 +2204,7 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
     async listWriterSupervisorStateGcCandidates(input) {
       order.push("supervisor-state-gc");
       assert.equal(input.afterSessionId, THIRD_SESSION_ID);
-      return page([]);
+      return gcPage([]);
     },
   });
   const service = createPostgresRestoreActivationRecoveryService(
@@ -1998,7 +2217,7 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
     generation: lane(null, 1),
     launchAttempt: lane(OTHER_SESSION_ID, 1),
     signal: null,
-    supervisorStateGc: lane(THIRD_SESSION_ID, 5),
+    supervisorStateGc: gcLane(THIRD_SESSION_ID, 5),
   });
 
   assert.deepEqual(order, [
@@ -2055,9 +2274,8 @@ test("runSweep preserves independent cursors and fixed lane order", async () => 
     true,
   );
   assert.equal(
-    consumePostgresRestoreActivationRecoveryBatchReceipt(
+    consumeGcReceipt(
       service,
-      "supervisorStateGc",
       THIRD_SESSION_ID,
       5,
       result.supervisorStateGc,
@@ -2138,7 +2356,7 @@ test(
       },
       listWriterSupervisorStateGcCandidates() {
         recordOrder("supervisor-state-gc");
-        return page([]);
+        return gcPage([]);
       },
     });
     const service = createPostgresRestoreActivationRecoveryService(
@@ -2150,7 +2368,7 @@ test(
       generation: lane(null, 1),
       launchAttempt: lane(OTHER_SESSION_ID, 3),
       signal: null,
-      supervisorStateGc: lane(THIRD_SESSION_ID, 5),
+      supervisorStateGc: gcLane(THIRD_SESSION_ID, 5),
     };
     let result;
     let runError;
@@ -2185,9 +2403,8 @@ test(
       true,
     );
     assert.equal(
-      consumePostgresRestoreActivationRecoveryBatchReceipt(
+      consumeGcReceipt(
         service,
-        "supervisorStateGc",
         THIRD_SESSION_ID,
         5,
         result.supervisorStateGc,

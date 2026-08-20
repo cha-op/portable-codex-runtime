@@ -215,6 +215,12 @@ const RECOVERY_LIST_REQUEST_KEYS = objectFreeze([
   "afterSessionId",
   "limit",
 ]);
+const SUPERVISOR_STATE_GC_RECOVERY_LIST_REQUEST_KEYS = objectFreeze([
+  "afterAuthorizedAt",
+  "afterSessionId",
+  "afterTerminalOperationId",
+  "limit",
+]);
 const RECOVERY_LAUNCH_ATTEMPT_CANDIDATE_KEYS = objectFreeze([
   "launchAttemptId",
   "request",
@@ -804,13 +810,18 @@ function createRecoveryService(
   const listWriterSupervisorStateGcCandidates =
     function listWriterSupervisorStateGcCandidates(...args) {
       ensure(args.length === 1);
-      const request = exactDataObject(args[0], RECOVERY_LIST_REQUEST_KEYS);
+      const request = exactDataObject(
+        args[0],
+        SUPERVISOR_STATE_GC_RECOVERY_LIST_REQUEST_KEYS,
+      );
       return callIntrinsic(
         listWriterSupervisorStateGcCandidatesIntrinsic,
         authority,
         [
           exactFrozenRecord({
+            afterAuthorizedAt: request.afterAuthorizedAt,
             afterSessionId: request.afterSessionId,
+            afterTerminalOperationId: request.afterTerminalOperationId,
             limit: request.limit,
             stateOwnerId,
           }),

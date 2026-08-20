@@ -657,7 +657,9 @@ const WRITER_SUPERVISOR_STATE_GC_READ_KEYS = Object.freeze([
   "terminalOperationId",
 ]);
 const WRITER_SUPERVISOR_STATE_GC_LIST_KEYS = Object.freeze([
+  "afterAuthorizedAt",
   "afterSessionId",
+  "afterTerminalOperationId",
   "limit",
   "stateOwnerId",
 ]);
@@ -1334,22 +1336,27 @@ const READ_WRITER_SUPERVISOR_STATE_GC_FOR_UPDATE_QUERY = Object.freeze({
 const LIST_WRITER_SUPERVISOR_STATE_GC_FIRST_PAGE_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
-    `SELECT DISTINCT ON (session_id) ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
+    `SELECT ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
     "FROM session_authority.writer_supervisor_state_gc",
     "WHERE state_owner_id = $1 AND collected_at IS NULL",
-    "ORDER BY session_id ASC, authorized_at ASC, terminal_operation_id ASC",
+    "ORDER BY session_id ASC, authorized_at ASC,",
+    'terminal_operation_id COLLATE pg_catalog."C" ASC',
     "LIMIT $2::integer",
   ].join(" "),
 });
 const LIST_WRITER_SUPERVISOR_STATE_GC_AFTER_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
-    `SELECT DISTINCT ON (session_id) ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
+    `SELECT ${WRITER_SUPERVISOR_STATE_GC_RETURNING_COLUMNS}`,
     "FROM session_authority.writer_supervisor_state_gc",
     "WHERE state_owner_id = $1 AND collected_at IS NULL",
-    "AND session_id > $2::uuid",
-    "ORDER BY session_id ASC, authorized_at ASC, terminal_operation_id ASC",
-    "LIMIT $3::integer",
+    "AND (session_id, authorized_at,",
+    'terminal_operation_id COLLATE pg_catalog."C") >',
+    "($2::uuid, $3::timestamp with time zone,",
+    '$4::character varying(128) COLLATE pg_catalog."C")',
+    "ORDER BY session_id ASC, authorized_at ASC,",
+    'terminal_operation_id COLLATE pg_catalog."C" ASC',
+    "LIMIT $5::integer",
   ].join(" "),
 });
 const READ_RESERVATION_BY_OPERATION_QUERY = Object.freeze({
@@ -5836,6 +5843,30 @@ function writerSupervisorStateGcListInput(options) {
           normalized.afterSessionId,
           "invalid_operation_request",
         );
+  const afterAuthorizedAt =
+    normalized.afterAuthorizedAt === null
+      ? null
+      : canonicalTimestampString(
+          normalized.afterAuthorizedAt,
+          "invalid_operation_request",
+        );
+  const afterTerminalOperationId =
+    normalized.afterTerminalOperationId === null
+      ? null
+      : canonicalOpaqueId(
+          normalized.afterTerminalOperationId,
+          128,
+          "invalid_operation_request",
+        );
+  ensure(
+    (afterSessionId === null &&
+      afterAuthorizedAt === null &&
+      afterTerminalOperationId === null) ||
+      (afterSessionId !== null &&
+        afterAuthorizedAt !== null &&
+        afterTerminalOperationId !== null),
+    "invalid_operation_request",
+  );
   ensure(
     numberIsSafeInteger(normalized.limit) &&
       normalized.limit >= 1 &&
@@ -5843,13 +5874,34 @@ function writerSupervisorStateGcListInput(options) {
     "invalid_operation_request",
   );
   return deepFreeze({
+    afterAuthorizedAt,
     afterSessionId,
+    afterTerminalOperationId,
     limit: normalized.limit,
     stateOwnerId: canonicalWriterSupervisorStateOwnerId(
       normalized.stateOwnerId,
       "invalid_operation_request",
     ),
   });
+}
+
+function writerSupervisorStateGcPositionFromAuthorization(authorization) {
+  return deepFreeze({
+    authorizedAt: authorization.authorizedAt,
+    sessionId: authorization.sessionId,
+    terminalOperationId: authorization.terminalOperationId,
+  });
+}
+
+function writerSupervisorStateGcPositionAfter(left, right) {
+  return (
+    right === null ||
+    left.sessionId > right.sessionId ||
+    (left.sessionId === right.sessionId &&
+      (left.authorizedAt > right.authorizedAt ||
+        (left.authorizedAt === right.authorizedAt &&
+          left.terminalOperationId > right.terminalOperationId)))
+  );
 }
 
 function writerSupervisorStateGcRecordSha256(record) {
@@ -16033,7 +16085,14 @@ export class PostgresSessionAuthority {
     const listInput = writerSupervisorStateGcListInput(options);
     return runSerializable(this.#store, async (transaction) => {
       const maximumRows = listInput.limit + 1;
-      const afterCursor = listInput.afterSessionId;
+      const afterCursor =
+        listInput.afterSessionId === null
+          ? null
+          : deepFreeze({
+              authorizedAt: listInput.afterAuthorizedAt,
+              sessionId: listInput.afterSessionId,
+              terminalOperationId: listInput.afterTerminalOperationId,
+            });
       const query =
         afterCursor === null
           ? LIST_WRITER_SUPERVISOR_STATE_GC_FIRST_PAGE_QUERY
@@ -16041,7 +16100,13 @@ export class PostgresSessionAuthority {
       const values =
         afterCursor === null
           ? [listInput.stateOwnerId, maximumRows]
-          : [listInput.stateOwnerId, afterCursor, maximumRows];
+          : [
+              listInput.stateOwnerId,
+              afterCursor.sessionId,
+              afterCursor.authorizedAt,
+              afterCursor.terminalOperationId,
+              maximumRows,
+            ];
       const rows = pageRowsFromResult(
         await transaction.query(query.text, values),
         maximumRows,
@@ -16051,8 +16116,8 @@ export class PostgresSessionAuthority {
         rows.length > listInput.limit ? listInput.limit : rows.length;
       const candidates = new ArrayConstructor(candidateCount);
       objectSetPrototypeOf(candidates, null);
-      let previousSessionId = afterCursor;
-      let lastCandidateSessionId = null;
+      let previousPosition = afterCursor;
+      let lastCandidatePosition = null;
       for (let index = 0; index < rows.length; index += 1) {
         const snapshot = writerSupervisorStateGcSnapshotFromRow(
           ownDataValue(
@@ -16065,8 +16130,12 @@ export class PostgresSessionAuthority {
           snapshot.collectionStatus === null &&
             snapshot.authorization.stateOwnerId ===
               listInput.stateOwnerId &&
-            (previousSessionId === null ||
-              snapshot.authorization.sessionId > previousSessionId),
+            writerSupervisorStateGcPositionAfter(
+              writerSupervisorStateGcPositionFromAuthorization(
+                snapshot.authorization,
+              ),
+              previousPosition,
+            ),
           "operation_state_invalid",
         );
         const candidate = await writerSupervisorStateGcCandidateForSnapshot(
@@ -16075,15 +16144,30 @@ export class PostgresSessionAuthority {
         );
         if (index < candidateCount) {
           candidates[index] = candidate;
-          lastCandidateSessionId = snapshot.authorization.sessionId;
+          lastCandidatePosition =
+            writerSupervisorStateGcPositionFromAuthorization(
+              snapshot.authorization,
+            );
         }
-        previousSessionId = snapshot.authorization.sessionId;
+        previousPosition = writerSupervisorStateGcPositionFromAuthorization(
+          snapshot.authorization,
+        );
       }
       objectSetPrototypeOf(candidates, arrayPrototype);
       return frozenNullPrototypeRecord({
         candidates,
+        nextAfterAuthorizedAt:
+          rows.length > listInput.limit
+            ? lastCandidatePosition.authorizedAt
+            : null,
         nextAfterSessionId:
-          rows.length > listInput.limit ? lastCandidateSessionId : null,
+          rows.length > listInput.limit
+            ? lastCandidatePosition.sessionId
+            : null,
+        nextAfterTerminalOperationId:
+          rows.length > listInput.limit
+            ? lastCandidatePosition.terminalOperationId
+            : null,
       });
     });
   }

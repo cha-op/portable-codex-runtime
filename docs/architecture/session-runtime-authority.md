@@ -1059,8 +1059,13 @@ exact stopped revision 4 record and its SHA-256, an authorization digest and
 database timestamp, then optionally one `collected` or `absent` receipt digest
 and completion timestamp. A partial index pages only incomplete rows. The same
 migration extends durable recovery cursors with the fifth
-`supervisor-state-gc` lane. No local file deletion removes or weakens this
-PostgreSQL evidence, and this slice exposes no ledger-retirement API.
+`supervisor-state-gc` lane plus nullable `after_authorized_at` and
+`after_terminal_operation_id` fields. Those fields are always null for the
+other four lanes; the GC lane stores either an entirely null boundary or the
+complete `(session_id, authorized_at, terminal_operation_id)` tuple. Its
+owner-first partial index and page query use the same C-collated total order.
+No local file deletion removes or weakens this PostgreSQL evidence, and this
+slice exposes no ledger-retirement API.
 
 These constraints are necessary but not sufficient authority. The typed
 restore-generation layer now retains the backend's exact
@@ -1491,6 +1496,12 @@ immediate parent at `0700`, and safe ownership/write/sticky constraints on
 traversal ancestors. Child-entry or generic `stat` churn triggers revalidation
 but is not change evidence. Pre-mutation I/O or unreadable state, exact-chain
 conflict, and post-mutation outcome uncertainty stay distinct.
+On Linux, artifact lookups, unlinks, and final absence checks resolve each
+basename through a revalidated clone of the held state-root FD under
+`/proc/self/fd`; replacing the named root cannot redirect a destructive call.
+Non-Linux builds retain held/named root and access-policy brackets, but Node's
+lack of portable `openat`/`unlinkat` means that bracket does not exclude an
+active same-UID ABA replacement.
 For a same-authorization cold overlap, the sole additional benign transition is
 removal of a prevalidated record/pending sibling alias. Held-FD `nlink` may
 decrease monotonically within the previously proven bound, never increase, and
@@ -1893,7 +1904,13 @@ Generation, activation, and launch-attempt failures remain `pending`; current
 launches are reported only as `requires-stop-or-fence`; a completed GC
 callback is `reconciled`, while any callback failure remains `pending` without
 changing the already committed terminal operation. The permanent GC ledger
-separately records the collector's `collected` or `absent` status. The service
+separately records the collector's `collected` or `absent` status. GC pages
+admit repeated session IDs only when `authorizedAt` and terminal operation ID
+make the full tuple strictly increase. A pending result advances that cycle's
+tuple boundary, allowing later authorizations from the same session to run;
+the null-boundary wrap retries it. This provides bounded progress for a finite
+snapshot or a workload whose arrival rate remains below drain capacity, not a
+claim of fairness under infinite arrivals. The service
 accepts no image resolver, launch callback, writer handle, publication
 callback, or opaque capability and can neither relaunch nor adopt a running
 process. Its internal rest arrays are
@@ -1911,8 +1928,12 @@ storage under an effective recovery scope. Runtime treats the configured
 and the configured supervisor/collector `stateOwnerId`. Two private roots may
 therefore reuse one base label without their owner-filtered third/fifth lanes
 skipping each other's rows; a restart with the same marker derives the same
-scope. Revision, cycle, and prior
-keyset cursor form one serializable compare-and-swap; the committed row also
+scope. Revision, cycle, and prior keyset cursor form one serializable
+compare-and-swap. The first four lanes use only `afterSessionId`; the GC lane
+compares and writes its full three-field boundary atomically. Its version-2
+runner transition digest includes both expected and next tuples plus every
+result's `authorizedAt`, while the other four lanes retain their version-1
+digest bytes. The committed row also
 binds the transition UUID and canonical request digest so exact replay after a
 lost commit acknowledgement cannot advance twice. Null continuation wraps the
 lane to a new cycle. `PostgresRestoreRecoveryRunner` reads, reconciles, and
@@ -2631,7 +2652,9 @@ canonical constraints, owner-only authorization, exact revision 4 retirement
 and observer-only reconciliation separation, exact candidate paging and
 completion replay, cold-start fifth-
 lane collection, independent settlement, two-phase local deletion, protected-
-property revalidation, and `collected` to `absent` acknowledgement loss.
+property revalidation, held-root-anchored Linux deletion, same-session
+composite pagination without oldest-item starvation, and `collected` to
+`absent` acknowledgement loss.
 Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential
 export/compression, encryption, provider-state retention, and registry trust
 remain unproved or unimplemented by design.

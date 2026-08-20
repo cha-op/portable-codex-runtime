@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import crypto, { createHash } from "node:crypto";
+import fs from "node:fs";
 import {
   chmod,
   link,
@@ -169,6 +170,22 @@ function collectionUncertain(error) {
     error instanceof PodmanWriterSupervisorStateError &&
     error.code === "podman_writer_state_collection_outcome_uncertain"
   );
+}
+
+async function withFsOpenOverride(createReplacement, callback) {
+  const descriptor = Object.getOwnPropertyDescriptor(fs.promises, "open");
+  assert.equal(typeof descriptor?.value, "function");
+  Object.defineProperty(fs.promises, "open", {
+    ...descriptor,
+    value: createReplacement(descriptor.value),
+  });
+  syncBuiltinESMExports();
+  try {
+    return await callback();
+  } finally {
+    Object.defineProperty(fs.promises, "open", descriptor);
+    syncBuiltinESMExports();
+  }
 }
 
 test("creates an exact owner-private append-only state surface", async (t) => {
@@ -789,6 +806,62 @@ test("an absent retry fsyncs the state root before completing", async (t) => {
   assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
 });
 
+test(
+  "Linux clone close failure overrides a missing collection entry",
+  { concurrency: false, skip: process.platform !== "linux" },
+  async (t) => {
+    const parent = await mkdtemp(
+      join(await realpath(tmpdir()), "podman-writer-state-close-race-test-"),
+    );
+    const root = join(parent, "state");
+    t.after(() => rm(parent, { force: true, recursive: true }));
+    const writer = await stateBundle(root);
+    const records = await createStoppedChain(writer.state);
+    await collect(writer, records[4]);
+    const replay = await stateBundle(root);
+    let cloneOpens = 0;
+    let closeFailures = 0;
+
+    await withFsOpenOverride(
+      (originalOpen) => async function openWithCloneCloseFailure(...args) {
+        const handle = await Reflect.apply(originalOpen, this, args);
+        if (
+          typeof args[0] === "string" &&
+          /^\/proc\/self\/fd\/\d+$/u.test(args[0])
+        ) {
+          cloneOpens += 1;
+          // Four clone lookups validate/open/revalidate the owner marker. The
+          // fifth callback lstats the first absent future revision.
+          if (cloneOpens === 5) {
+            const closeDescriptor = Object.getOwnPropertyDescriptor(
+              handle,
+              "close",
+            );
+            assert.equal(typeof closeDescriptor?.value, "function");
+            Object.defineProperty(handle, "close", {
+              ...closeDescriptor,
+              async value() {
+                await Reflect.apply(closeDescriptor.value, handle, []);
+                closeFailures += 1;
+                const error = new Error("simulated clone close failure");
+                error.code = "ENOENT";
+                throw error;
+              },
+            });
+          }
+        }
+        return handle;
+      },
+      () => assert.rejects(collect(replay, records[4]), stateIoError),
+    );
+
+    assert.equal(cloneOpens >= 5, true);
+    assert.equal(closeFailures, 1);
+    assert.deepEqual(await readdir(root), [".state-owner-v1.json"]);
+    assert.equal((await collect(replay, records[4])).status, "absent");
+  },
+);
+
 test("a missing-root collection rejects parent replacement before reporting absence", async (t) => {
   const sandbox = await mkdtemp(
     join(await realpath(tmpdir()), "podman-writer-state-missing-root-race-test-"),
@@ -974,6 +1047,55 @@ test("collection allows benign directory churn and serializes same-instance read
   assert.equal((await pendingCollection).status, "collected");
   assert.equal(await pendingRead, null);
 });
+
+test(
+  "Linux collection unlinks stay anchored when the named state root is replaced",
+  { skip: process.platform !== "linux" },
+  async (t) => {
+    const parent = await mkdtemp(
+      join(await realpath(tmpdir()), "podman-writer-state-root-swap-test-"),
+    );
+    const root = join(parent, "state");
+    const displacedRoot = join(parent, "displaced-state");
+    t.after(() => rm(parent, { force: true, recursive: true }));
+    const writer = await stateBundle(root);
+    const records = await createStoppedChain(writer.state);
+    const before = (await readdir(root)).sort();
+    const firstRecord = before.find((entry) => entry.endsWith(".0.json"));
+    assert.equal(typeof firstRecord, "string");
+    const bait = Buffer.from("replacement-root-bait\n", "utf8");
+    let replacements = 0;
+    const collector = await stateBundle(root, exact({
+      async beforeCollectionArtifactUnlink() {
+        if (replacements !== 0) return;
+        await rename(root, displacedRoot);
+        await mkdir(root, { mode: 0o700 });
+        await writeFile(join(root, firstRecord), bait, {
+          flag: "wx",
+          mode: 0o600,
+        });
+        replacements += 1;
+      },
+    }));
+
+    await assert.rejects(collect(collector, records[4]), collectionUncertain);
+    assert.equal(replacements, 1);
+    assert.deepEqual(await readFile(join(root, firstRecord)), bait);
+    await assert.rejects(
+      lstat(join(displacedRoot, firstRecord)),
+      (error) => error?.code === "ENOENT",
+    );
+    assert.deepEqual(
+      (await readdir(displacedRoot)).sort(),
+      before.filter((entry) => entry !== firstRecord),
+    );
+
+    const recovery = await stateBundle(displacedRoot);
+    assert.equal((await collect(recovery, records[4])).status, "collected");
+    assert.deepEqual(await readdir(displacedRoot), [".state-owner-v1.json"]);
+    assert.deepEqual(await readFile(join(root, firstRecord)), bait);
+  },
+);
 
 test("collection fails closed when marker content changes during the operation", async (t) => {
   const parent = await mkdtemp(
@@ -1448,6 +1570,121 @@ test("cross-instance recovery cleanup preserves the publishing claim winner", as
   const stat = await lstat(join(root, entry), { bigint: true });
   assert.equal(stat.nlink, 1n);
 });
+
+test(
+  "concurrent readers adopt a completed pending-alias cleanup",
+  { concurrency: false },
+  async (t) => {
+    const { root, state } = await fixture(t);
+    const initial = record("preparing");
+    await state.claim(exact({ record: initial }));
+    const [entry] = await readdir(root);
+    const publishedPath = join(root, entry);
+    const pendingPath = `${publishedPath}.pending`;
+    const expected = await readFile(publishedPath);
+    await link(publishedPath, pendingPath);
+    const left = createPodmanWriterSupervisorState(exact({ root }));
+    const right = createPodmanWriterSupervisorState(exact({ root }));
+    let firstBlocked;
+    const firstAtCleanup = new Promise((resolve) => {
+      firstBlocked = resolve;
+    });
+    let releaseFirst;
+    const firstGate = new Promise((resolve) => {
+      releaseFirst = resolve;
+    });
+    let pendingOpens = 0;
+
+    await withFsOpenOverride(
+      (originalOpen) => async function openWithFirstReaderPaused(...args) {
+        if (
+          typeof args[0] === "string" &&
+          args[0].endsWith(`/${entry}.pending`)
+        ) {
+          pendingOpens += 1;
+          if (pendingOpens === 3) {
+            firstBlocked();
+            await firstGate;
+          }
+        }
+        return Reflect.apply(originalOpen, this, args);
+      },
+      async () => {
+        const firstRead = left.read(exact({
+          launchAttemptId: initial.launchAttemptId,
+        }));
+        await firstAtCleanup;
+        try {
+          assert.deepEqual(
+            await right.read(exact({
+              launchAttemptId: initial.launchAttemptId,
+            })),
+            initial,
+          );
+        } finally {
+          releaseFirst();
+        }
+        assert.deepEqual(await firstRead, initial);
+      },
+    );
+
+    assert.equal(pendingOpens >= 6, true);
+    await assert.rejects(
+      lstat(pendingPath),
+      (error) => error?.code === "ENOENT",
+    );
+    const publishedStat = await lstat(publishedPath, { bigint: true });
+    assert.equal(publishedStat.nlink, 1n);
+    assert.deepEqual(await readFile(publishedPath), expected);
+  },
+);
+
+test(
+  "publication cleanup retains the final pending link after alias loss",
+  { concurrency: false },
+  async (t) => {
+    const { root, state } = await fixture(t);
+    const initial = record("preparing");
+    await state.claim(exact({ record: initial }));
+    const [entry] = await readdir(root);
+    const publishedPath = join(root, entry);
+    const pendingPath = `${publishedPath}.pending`;
+    const expected = await readFile(publishedPath);
+    await link(publishedPath, pendingPath);
+    let pendingOpens = 0;
+    let aliasRemovals = 0;
+
+    await withFsOpenOverride(
+      (originalOpen) => async function openWithAliasLoss(...args) {
+        if (
+          typeof args[0] === "string" &&
+          args[0].endsWith(`/${entry}.pending`)
+        ) {
+          pendingOpens += 1;
+          if (pendingOpens === 3) {
+            await rm(publishedPath);
+            aliasRemovals += 1;
+          }
+        }
+        return Reflect.apply(originalOpen, this, args);
+      },
+      () => assert.rejects(
+        state.read(exact({ launchAttemptId: initial.launchAttemptId })),
+        stateIoError,
+      ),
+    );
+
+    assert.equal(pendingOpens >= 3, true);
+    assert.equal(aliasRemovals, 1);
+    await assert.rejects(
+      lstat(publishedPath),
+      (error) => error?.code === "ENOENT",
+    );
+    const pendingStat = await lstat(pendingPath, { bigint: true });
+    assert.equal(pendingStat.nlink, 1n);
+    assert.deepEqual(await readFile(pendingPath), expected);
+  },
+);
 
 test("every publication crash prefix exposes only the old or complete new revision", async (t) => {
   const crashPrefixes = [

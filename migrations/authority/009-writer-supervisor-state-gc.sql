@@ -202,12 +202,17 @@ CREATE INDEX writer_supervisor_state_gc_pending_page
     state_owner_id,
     session_id,
     authorized_at,
-    terminal_operation_id
+    terminal_operation_id COLLATE pg_catalog."C"
   )
   WHERE collected_at IS NULL;
 
 ALTER TABLE session_authority.restore_recovery_cursors
   DROP CONSTRAINT restore_recovery_cursors_lane_allowed;
+
+ALTER TABLE session_authority.restore_recovery_cursors
+  ADD COLUMN after_authorized_at timestamp with time zone,
+  ADD COLUMN after_terminal_operation_id
+    character varying(128) COLLATE pg_catalog."C";
 
 ALTER TABLE session_authority.restore_recovery_cursors
   ADD CONSTRAINT restore_recovery_cursors_lane_allowed
@@ -218,5 +223,28 @@ ALTER TABLE session_authority.restore_recovery_cursors
       'launch-attempt',
       'current-launch',
       'supervisor-state-gc'
+    )
+  ),
+  ADD CONSTRAINT restore_recovery_cursors_gc_position_shape
+  CHECK (
+    (
+      lane = 'supervisor-state-gc'
+      AND (
+        (
+          after_session_id IS NULL
+          AND after_authorized_at IS NULL
+          AND after_terminal_operation_id IS NULL
+        )
+        OR (
+          after_session_id IS NOT NULL
+          AND after_authorized_at IS NOT NULL
+          AND after_terminal_operation_id IS NOT NULL
+        )
+      )
+    )
+    OR (
+      lane <> 'supervisor-state-gc'
+      AND after_authorized_at IS NULL
+      AND after_terminal_operation_id IS NULL
     )
   );

@@ -136,6 +136,7 @@ const FAULT_HOOK_KEYS = Object.freeze([
   "afterCollectionTerminalRevalidation",
   "afterCollectionTerminalUnlink",
   "afterCollectionFinalDirectorySync",
+  "beforeCollectionArtifactUnlink",
   "afterPrivateParentHold",
 ]);
 const STATUS_REVISION = Object.freeze({
@@ -842,13 +843,34 @@ function stateOwnerMarkerPath(root) {
   return `${root}/${STATE_OWNER_MARKER_NAME}`;
 }
 
-async function withStateOwnerMarkerLookupPath(root, held, callback) {
+// Linux entry operations are resolved through a validated clone of the held
+// state-root fd. The clone keeps the lookup bound to the original directory
+// object even if its absolute name is replaced after validation. The held and
+// clone dev+ino pairs protect directory identity; safeDirectoryStat plus the
+// named ancestor checks protect uid/mode/link/traversal policy. File callers
+// separately bind dev+ino, uid/mode/nlink, and exact bytes read positionally.
+//
+// Node exposes no portable openat/fstatat/unlinkat. Non-Linux hosts therefore
+// retain the held-versus-named root/ancestor brackets around the pathname
+// operation. This detects one-way replacement, but does not claim to exclude
+// an active same-uid ABA. In particular, /dev/fd is not assumed traversable.
+async function withHeldDirectoryEntryPath(root, held, entryPath, callback) {
   let descriptorHandle = null;
+  let callbackMissing = false;
   let primaryError = null;
   let result;
+  const name = pathBasenameIntrinsic(entryPath);
+  ensure(
+    name.length > 0 &&
+      name !== "." &&
+      name !== ".." &&
+      pathDirnameIntrinsic(entryPath) === root &&
+      entryPath === `${root}/${name}`,
+    "podman_writer_state_io_failed",
+  );
   try {
     await assertDirectoryHeld(root, held);
-    let path = stateOwnerMarkerPath(root);
+    let path = entryPath;
     if (runtimePlatform === "linux") {
       const descriptor = held.handle.fd;
       ensure(
@@ -874,38 +896,90 @@ async function withStateOwnerMarkerLookupPath(root, held, callback) {
           anchoredDescriptor >= 0,
         "podman_writer_state_io_failed",
       );
-      path = `/proc/self/fd/${anchoredDescriptor}/${STATE_OWNER_MARKER_NAME}`;
+      path = `/proc/self/fd/${anchoredDescriptor}/${name}`;
     }
-    result = await callback(path);
+    try {
+      result = await callback(path);
+    } catch (error) {
+      primaryError = error;
+      callbackMissing = errorCode(error) === "ENOENT";
+    }
+    // A post-operation identity or policy failure is authoritative even when
+    // the entry callback also failed: its result cannot be trusted outside the
+    // validated directory bracket.
     if (descriptorHandle !== null) {
-      const descriptorStat = await descriptorHandle.stat({ bigint: true });
-      ensure(
-        safeDirectoryStat(descriptorStat) &&
-          sameIdentity(held.identity, descriptorStat),
-        "podman_writer_state_io_failed",
-      );
+      try {
+        const descriptorStat = await descriptorHandle.stat({ bigint: true });
+        const rootStat = await held.handle.stat({ bigint: true });
+        ensure(
+          safeDirectoryStat(descriptorStat) &&
+            safeDirectoryStat(rootStat) &&
+            sameIdentity(held.identity, descriptorStat) &&
+            sameIdentity(held.identity, rootStat),
+          "podman_writer_state_io_failed",
+        );
+      } catch (error) {
+        primaryError = isStateError(error)
+          ? error
+          : new PodmanWriterSupervisorStateError(
+              "podman_writer_state_io_failed",
+            );
+        callbackMissing = false;
+      }
     }
-    // Node has no portable openat/fstatat API. Non-Linux marker lookup is
-    // therefore bracketed by held-versus-named root and parent identity/policy
-    // validation. This detects one-way replacement but does not claim to
-    // exclude an active same-uid ABA between the pathname operation and the
-    // second bracket.
-    await assertDirectoryHeld(root, held);
+    try {
+      await assertDirectoryHeld(root, held);
+    } catch (error) {
+      primaryError = isStateError(error)
+        ? error
+        : new PodmanWriterSupervisorStateError(
+            "podman_writer_state_io_failed",
+          );
+      callbackMissing = false;
+    }
   } catch (error) {
-    primaryError = error;
+    primaryError = isStateError(error)
+      ? error
+      : new PodmanWriterSupervisorStateError(
+          "podman_writer_state_io_failed",
+        );
+    callbackMissing = false;
   }
   if (descriptorHandle !== null) {
     try {
       await descriptorHandle.close();
     } catch (error) {
-      primaryError ??= error;
+      // A callback ENOENT is an expected missing-entry signal, not a stronger
+      // failure than losing the clone-fd close acknowledgement. Preserve every
+      // other callback/post-bracket error; normalize close fallout so an
+      // ENOENT-shaped close error cannot be mistaken for entry absence.
+      if (primaryError === null || callbackMissing) {
+        primaryError = isStateError(error)
+          ? error
+          : new PodmanWriterSupervisorStateError(
+              "podman_writer_state_io_failed",
+            );
+      }
     }
   }
   if (primaryError !== null) {
-    if (isStateError(primaryError)) throw primaryError;
-    fail("podman_writer_state_io_failed");
+    throw primaryError;
   }
   return result;
+}
+
+async function withStateOwnerMarkerLookupPath(root, held, callback) {
+  try {
+    return await withHeldDirectoryEntryPath(
+      root,
+      held,
+      stateOwnerMarkerPath(root),
+      callback,
+    );
+  } catch (error) {
+    if (isStateError(error)) throw error;
+    fail("podman_writer_state_io_failed");
+  }
 }
 
 function lstatStateOwnerMarker(root, held) {
@@ -1237,16 +1311,38 @@ async function readPlainSafeFile(path, maximumLinks = 1n) {
   }
 }
 
+function readPlainSafeFileHeld(
+  root,
+  held,
+  path,
+  maximumLinks = 1n,
+) {
+  return withHeldDirectoryEntryPath(root, held, path, (lookupPath) =>
+    readPlainSafeFile(lookupPath, maximumLinks));
+}
+
 async function openCollectionFile(
+  root,
+  held,
   path,
   maximumLinks,
   faultHooks,
 ) {
   let handle;
   try {
-    const before = await lstat(path, { bigint: true });
+    const before = await withHeldDirectoryEntryPath(
+      root,
+      held,
+      path,
+      (lookupPath) => lstat(lookupPath, { bigint: true }),
+    );
     ensure(safeFileStat(before, maximumLinks), "podman_writer_state_io_failed");
-    handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    await withHeldDirectoryEntryPath(root, held, path, async (lookupPath) => {
+      handle = await open(
+        lookupPath,
+        fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+      );
+    });
     const opened = await handle.stat({ bigint: true });
     ensure(
       safeFileStat(opened, maximumLinks) && sameIdentity(before, opened),
@@ -1270,7 +1366,12 @@ async function openCollectionFile(
       0,
     );
     const finalHeld = await handle.stat({ bigint: true });
-    const current = await readPlainSafeFile(path, maximumLinks);
+    const current = await readPlainSafeFileHeld(
+      root,
+      held,
+      path,
+      maximumLinks,
+    );
     ensure(
       current !== null &&
         safeFileStat(finalHeld, maximumLinks) &&
@@ -1367,15 +1468,29 @@ async function openCollectionRevision(
   faultHooks,
 ) {
   const path = recordPath(root, launchAttemptId, revision);
-  const record = await openCollectionFile(path, 2n, faultHooks);
+  const record = await openCollectionFile(
+    root,
+    held,
+    path,
+    2n,
+    faultHooks,
+  );
   if (record !== null) files[files.length] = record;
   const pending = await openCollectionFile(
+    root,
+    held,
     pendingRecordPath(path),
     2n,
     faultHooks,
   );
   if (pending !== null) files[files.length] = pending;
-  const ready = await openCollectionFile(`${path}.ready`, 1n, faultHooks);
+  const ready = await openCollectionFile(
+    root,
+    held,
+    `${path}.ready`,
+    1n,
+    faultHooks,
+  );
   if (ready !== null) files[files.length] = ready;
 
   if (record === null) {
@@ -1471,24 +1586,48 @@ async function unlinkCollectionArtifact(
 ) {
   if (artifact === null) return false;
   let removed = false;
-  await assertDirectoryHeld(root, held);
-  const current = await readPlainSafeFile(artifact.path, 2n);
-  if (current === null) return false;
-  ensure(
-    sameIdentity(current.stat, artifact.stat) &&
-      callIntrinsic(bufferEqualsIntrinsic, current.bytes, [artifact.bytes]),
-    "podman_writer_state_io_failed",
-  );
+  let current = null;
+  let disappeared = false;
   try {
-    await unlink(artifact.path);
-    removed = true;
+    // The Linux clone remains open across exact named-file revalidation, the
+    // final race hook, and unlink. `removed` survives a post-bracket or clone
+    // close failure so the caller reports an uncertain destructive outcome.
+    await withHeldDirectoryEntryPath(
+      root,
+      held,
+      artifact.path,
+      async (lookupPath) => {
+        current = await readPlainSafeFile(lookupPath, 2n);
+        if (current === null) return;
+        ensure(
+          sameIdentity(current.stat, artifact.stat) &&
+            callIntrinsic(bufferEqualsIntrinsic, current.bytes, [artifact.bytes]),
+          "podman_writer_state_io_failed",
+        );
+        await runFaultHook(faultHooks, "beforeCollectionArtifactUnlink");
+        try {
+          await unlink(lookupPath);
+          removed = true;
+        } catch (error) {
+          if (errorCode(error) === "ENOENT") {
+            disappeared = true;
+            return;
+          }
+          throw error;
+        }
+      },
+    );
   } catch (error) {
-    if (errorCode(error) === "ENOENT") return false;
+    if (removed) fail("podman_writer_state_collection_outcome_uncertain");
     throw error;
   }
+  if (current === null || disappeared) return false;
   try {
     await runFaultHook(faultHooks, "afterCollectionArtifactUnlink");
-    ensure(await collectionPathAbsent(artifact.path), "podman_writer_state_io_failed");
+    ensure(
+      await collectionPathAbsent(root, held, artifact.path),
+      "podman_writer_state_io_failed",
+    );
     await revalidateUnlinkedCollectionArtifact(
       artifact,
       current.stat.nlink - 1n,
@@ -1522,9 +1661,14 @@ function collectionReceipt(stateOwnerId, terminalRecord, status) {
   });
 }
 
-async function collectionPathAbsent(path) {
+async function collectionPathAbsent(root, held, path) {
   try {
-    await lstat(path, { bigint: true });
+    await withHeldDirectoryEntryPath(
+      root,
+      held,
+      path,
+      (lookupPath) => lstat(lookupPath, { bigint: true }),
+    );
   } catch (error) {
     if (errorCode(error) === "ENOENT") return true;
     throw error;
@@ -1532,43 +1676,40 @@ async function collectionPathAbsent(path) {
   return false;
 }
 
-async function assertCollectionRevisionAbsent(root, launchAttemptId, revision) {
+async function assertCollectionRevisionAbsent(
+  root,
+  launchAttemptId,
+  revision,
+  held,
+) {
   const path = recordPath(root, launchAttemptId, revision);
   ensure(
-    (await collectionPathAbsent(path)) &&
-      (await collectionPathAbsent(pendingRecordPath(path))) &&
-      (await collectionPathAbsent(`${path}.ready`)),
+    (await collectionPathAbsent(root, held, path)) &&
+      (await collectionPathAbsent(root, held, pendingRecordPath(path))) &&
+      (await collectionPathAbsent(root, held, `${path}.ready`)),
     "podman_writer_state_io_failed",
   );
 }
 
-async function assertFutureCollectionRevisionsAbsent(root, launchAttemptId) {
+async function assertFutureCollectionRevisionsAbsent(
+  root,
+  launchAttemptId,
+  held,
+) {
   for (let revision = 5; revision <= 9; revision += 1) {
     const path = recordPath(root, launchAttemptId, revision);
     ensure(
-      (await collectionPathAbsent(path)) &&
-        (await collectionPathAbsent(pendingRecordPath(path))) &&
-        (await collectionPathAbsent(`${path}.ready`)),
+      (await collectionPathAbsent(root, held, path)) &&
+        (await collectionPathAbsent(root, held, pendingRecordPath(path))) &&
+        (await collectionPathAbsent(root, held, `${path}.ready`)),
       "podman_writer_state_conflict",
     );
   }
 }
 
 async function assertCollectionFilesUnlinked(files) {
-  const uid = effectiveUid();
   for (let index = 0; index < files.length; index += 1) {
-    const stat = await files[index].handle.stat({ bigint: true });
-    ensure(
-      stat.isFile() &&
-        !stat.isSymbolicLink() &&
-        stat.nlink === 0n &&
-        uid !== null &&
-        stat.uid === uid &&
-        Number(stat.mode & 0o7777n) === 0o600 &&
-        stat.size > 0n &&
-        stat.size <= BigInt(MAX_RECORD_BYTES),
-      "podman_writer_state_io_failed",
-    );
+    await revalidateUnlinkedCollectionArtifact(files[index], 0n);
   }
 }
 
@@ -1577,8 +1718,13 @@ async function assertCollectionFilesUnlinked(files) {
 // this owner-private directory. Link-count churn alone is not content mutation,
 // but an unrecognized alias is an access-policy expansion and fails closed.
 async function cleanupPublishedAlias(path, published, held) {
-  await assertDirectoryHeld(pathDirnameIntrinsic(path), held);
-  const currentPublished = await readPlainSafeFile(path, 2n);
+  const root = pathDirnameIntrinsic(path);
+  const currentPublished = await readPlainSafeFileHeld(
+    root,
+    held,
+    path,
+    2n,
+  );
   ensure(
     currentPublished !== null &&
       sameIdentity(published.stat, currentPublished.stat) &&
@@ -1588,9 +1734,18 @@ async function cleanupPublishedAlias(path, published, held) {
   if (currentPublished.stat.nlink === 1n) return currentPublished;
 
   const pendingPath = pendingRecordPath(path);
-  const currentPending = await readPlainSafeFile(pendingPath, 2n);
+  const currentPending = await readPlainSafeFileHeld(
+    root,
+    held,
+    pendingPath,
+    2n,
+  );
   if (currentPending === null) {
-    const concurrentlyCleaned = await readPlainSafeFile(path);
+    const concurrentlyCleaned = await readPlainSafeFileHeld(
+      root,
+      held,
+      path,
+    );
     ensure(
       concurrentlyCleaned !== null &&
         sameIdentity(published.stat, concurrentlyCleaned.stat) &&
@@ -1609,17 +1764,65 @@ async function cleanupPublishedAlias(path, published, held) {
       ]),
     "podman_writer_state_io_failed",
   );
+  let concurrentlyCleaned = null;
   try {
-    await unlink(pendingPath);
+    concurrentlyCleaned = await withHeldDirectoryEntryPath(
+      root,
+      held,
+      pendingPath,
+      async (lookupPath) => {
+        const lookupRoot = pathDirnameIntrinsic(lookupPath);
+        const publishedLookupPath =
+          `${lookupRoot}/${pathBasenameIntrinsic(path)}`;
+        const bracketPublished = await readPlainSafeFile(
+          publishedLookupPath,
+          2n,
+        );
+        const bracketPending = await readPlainSafeFile(lookupPath, 2n);
+        if (bracketPending === null) {
+          const cleanedPublished = await readPlainSafeFile(
+            publishedLookupPath,
+          );
+          ensure(
+            cleanedPublished !== null &&
+              cleanedPublished.stat.nlink === 1n &&
+              sameIdentity(currentPublished.stat, cleanedPublished.stat) &&
+              callIntrinsic(bufferEqualsIntrinsic, currentPublished.bytes, [
+                cleanedPublished.bytes,
+              ]),
+            "podman_writer_state_io_failed",
+          );
+          return cleanedPublished;
+        }
+        ensure(
+          bracketPublished !== null &&
+            bracketPublished.stat.nlink === 2n &&
+            bracketPending.stat.nlink === 2n &&
+            sameIdentity(currentPublished.stat, bracketPublished.stat) &&
+            sameIdentity(currentPending.stat, bracketPending.stat) &&
+            sameIdentity(bracketPublished.stat, bracketPending.stat) &&
+            callIntrinsic(bufferEqualsIntrinsic, currentPublished.bytes, [
+              bracketPublished.bytes,
+            ]) &&
+            callIntrinsic(bufferEqualsIntrinsic, currentPending.bytes, [
+              bracketPending.bytes,
+            ]),
+          "podman_writer_state_io_failed",
+        );
+        await unlink(lookupPath);
+        return null;
+      },
+    );
   } catch (error) {
     if (errorCode(error) !== "ENOENT") fail("podman_writer_state_io_failed");
   }
+  if (concurrentlyCleaned !== null) return concurrentlyCleaned;
   try {
     await held.handle.sync();
   } catch {
     fail("podman_writer_state_io_failed");
   }
-  const cleaned = await readPlainSafeFile(path);
+  const cleaned = await readPlainSafeFileHeld(root, held, path);
   ensure(
     cleaned !== null &&
       sameIdentity(published.stat, cleaned.stat) &&
@@ -1630,16 +1833,22 @@ async function cleanupPublishedAlias(path, published, held) {
 }
 
 async function readPublishedRecordFile(path, held) {
-  const published = await readPlainSafeFile(path, 2n);
+  const root = pathDirnameIntrinsic(path);
+  const published = await readPlainSafeFileHeld(root, held, path, 2n);
   if (published === null || published.stat.nlink === 1n) return published;
 
-  const pending = await readPlainSafeFile(pendingRecordPath(path), 2n);
+  const pending = await readPlainSafeFileHeld(
+    root,
+    held,
+    pendingRecordPath(path),
+    2n,
+  );
   if (
     pending !== null &&
     sameIdentity(published.stat, pending.stat) &&
     callIntrinsic(bufferEqualsIntrinsic, published.bytes, [pending.bytes])
   ) {
-    const revalidated = await readPlainSafeFile(path, 2n);
+    const revalidated = await readPlainSafeFileHeld(root, held, path, 2n);
     ensure(
       revalidated !== null &&
         sameIdentity(published.stat, revalidated.stat) &&
@@ -1652,7 +1861,7 @@ async function readPublishedRecordFile(path, held) {
   }
 
   // The publisher may have removed the pending alias between observations.
-  const revalidated = await readPlainSafeFile(path, 2n);
+  const revalidated = await readPlainSafeFileHeld(root, held, path, 2n);
   ensure(
     revalidated !== null &&
       revalidated.stat.nlink === 1n &&
@@ -1905,28 +2114,38 @@ async function writeExclusive(root, record, held, faultHooks) {
     await held.handle.sync();
     await runFaultHook(faultHooks, "afterPublishDirectorySync");
 
-    let pendingAlreadyCleaned = false;
-    try {
-      const currentPendingStat = await lstat(pendingPath, { bigint: true });
-      ensure(
-        safeFileStat(currentPendingStat, 2n) &&
-          currentPendingStat.nlink === 2n &&
-          sameIdentity(publishedStat, currentPendingStat),
-        "podman_writer_state_io_failed",
-      );
-    } catch (error) {
-      if (errorCode(error) !== "ENOENT") throw error;
-      pendingAlreadyCleaned = true;
-    }
-    if (!pendingAlreadyCleaned) {
-      try {
-        await unlink(pendingPath);
-      } catch (error) {
-        if (errorCode(error) !== "ENOENT") throw error;
-      }
-    }
+    await withHeldDirectoryEntryPath(
+      root,
+      held,
+      pendingPath,
+      async (lookupPath) => {
+        let currentPendingStat;
+        try {
+          currentPendingStat = await lstat(lookupPath, { bigint: true });
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") throw error;
+          return;
+        }
+        ensure(
+          safeFileStat(currentPendingStat, 2n) &&
+            currentPendingStat.nlink === 2n &&
+            sameIdentity(publishedStat, currentPendingStat),
+          "podman_writer_state_io_failed",
+        );
+        try {
+          await unlink(lookupPath);
+        } catch (error) {
+          if (errorCode(error) !== "ENOENT") throw error;
+        }
+      },
+    );
     const cleanedStat = await handle.stat({ bigint: true });
-    const namedPublishedStat = await lstat(path, { bigint: true });
+    const namedPublishedStat = await withHeldDirectoryEntryPath(
+      root,
+      held,
+      path,
+      (lookupPath) => lstat(lookupPath, { bigint: true }),
+    );
     ensure(
       safeFileStat(cleanedStat) &&
         safeFileStat(namedPublishedStat) &&
@@ -2203,6 +2422,7 @@ function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBindin
         await assertFutureCollectionRevisionsAbsent(
           root,
           terminalRecord.launchAttemptId,
+          held,
         );
         const revisions = [];
         for (let revision = 0; revision <= 4; revision += 1) {
@@ -2234,6 +2454,7 @@ function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBindin
               root,
               terminalRecord.launchAttemptId,
               revision,
+              held,
             );
           }
           await assertDirectoryHeld(root, held);
@@ -2318,6 +2539,7 @@ function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBindin
               root,
               terminalRecord.launchAttemptId,
               revision,
+              held,
             );
           }
           await assertDirectoryHeld(root, held);
@@ -2330,7 +2552,12 @@ function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBindin
 
           let terminalPathStat;
           try {
-            terminalPathStat = await lstat(terminal.path, { bigint: true });
+            terminalPathStat = await withHeldDirectoryEntryPath(
+              root,
+              held,
+              terminal.path,
+              (lookupPath) => lstat(lookupPath, { bigint: true }),
+            );
           } catch (error) {
             if (errorCode(error) !== "ENOENT") throw error;
             terminalPathStat = null;
@@ -2339,7 +2566,11 @@ function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBindin
             const terminalHandleStat = await terminal.record.handle.stat({
               bigint: true,
             });
-            const terminalCurrent = await readPlainSafeFile(terminal.path);
+            const terminalCurrent = await readPlainSafeFileHeld(
+              root,
+              held,
+              terminal.path,
+            );
             ensure(
               terminalCurrent !== null &&
                 safeFileStat(terminalPathStat) &&
@@ -2376,6 +2607,7 @@ function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBindin
               root,
               terminalRecord.launchAttemptId,
               revision,
+              held,
             );
           }
           await assertCollectionFilesUnlinked(files);
@@ -2390,6 +2622,12 @@ function createPodmanWriterSupervisorStateInternal(root, faultHooks, ownerBindin
         }
       } catch (error) {
         primaryError = error;
+        if (
+          isStateError(error) &&
+          error.code === "podman_writer_state_collection_outcome_uncertain"
+        ) {
+          mutationStarted = true;
+        }
       }
 
       if (await closeCollectionFiles(files)) {

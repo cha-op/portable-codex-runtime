@@ -185,7 +185,13 @@
   remains an explicit cleanup case. The collector deletes exact stopped
   revisions in two directory-
   synced phases and accepts acknowledgement-loss replay from `collected` to
-  `absent`. Production deployment accepts only the exact process-local
+  `absent`. Its fifth-lane cursor persists
+  `(sessionId, authorizedAt, terminalOperationId)` rather than collapsing each
+  session to its oldest item, so a pending item cannot starve later work from
+  that session before the next wrap. On Linux, destructive artifact operations
+  resolve through a revalidated held-root FD clone; non-Linux retains explicit
+  pathname brackets without claiming active same-UID ABA resistance.
+  Production deployment accepts only the exact process-local
   supervisor/collector pair returned by
   `createPodmanWriterSupervisorBundle()`; matching IDs and owner strings are
   necessary but insufficient, and direct `createPodmanWriterSupervisor()` is
