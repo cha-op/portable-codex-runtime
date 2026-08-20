@@ -338,10 +338,12 @@ and the immutable
 `session_authority.writer_supervisor_state_owners` launch-attempt route. Each
 private supervisor state root supplies one persistent high-entropy marker with
 the exact form `state-owner:<64 lowercase hex>`. The authority binds that
-`stateOwnerId` before physical launch dispatch, and only the owner launch or stop
-finalizer that commits exact `complete-stopped` evidence can insert an
-authorization; stopped-only reconciliation remains a pure read and cannot
-mint one. In the assembled production runner, the fifth lane runs last during
+`stateOwnerId` before physical launch dispatch, and only an owner-bound
+finalizer that commits exact `complete-stopped` evidence with its stopped
+revision 4 `terminalRecord` can insert an authorization. Immediate launch/stop
+and durable revision 4 cold retirement use that finalizer; observer-only
+reconciliation returns a null terminal record and cannot mint one. In the
+assembled production runner, the fifth lane runs last during
 the initial cold-start sweep and later passes while that runner holds the
 database-global exclusive restore lifecycle lease. It passes the
 authorization's exact revision 4 `terminalRecord` through its own settled
@@ -477,10 +479,10 @@ settled session lifecycle backend's capability tuple used by registration and
 writer detach, not the private stopped-directory checkpoint overlay's tuple.
 The complete assembled
 physical graph has method-specific settlement and operational lease admission.
-The completed safety-matrix slice classifies all
-twenty deployment-owned settlement leaves, divides the fifteen leaves on
-the private protocol surface into eight mutators and seven observations, binds
-the eight mutators to real-PostgreSQL durable-cut and
+The completed version 2 safety-matrix slice classifies all twenty
+deployment-owned settlement leaves, divides the fifteen leaves on the private
+protocol surface into nine mutators and six observations, binds the nine
+mutators to real-PostgreSQL durable-cut and
 acknowledgement-loss evidence, and combines a same-database/stable-plan retry
 through fresh physical bindings, image binding, runtime, and controller with
 separate registry rehydration plus representative settlement timer and drain
@@ -511,12 +513,15 @@ facets, stops the scheduler, and drains admitted calls; the caller closes the
 four borrowed pools after that barrier. The exclusive scheduler continues
 bounded no-relaunch recovery.
 
-The eighth safety-matrix mutator is
+The supervisor-state collector remains a safety-matrix mutator at
 `supervisorStateCollector.collectTerminalState`; its durable cut is
 `supervisor-state-gc`, its durable key is
 `authorization.terminalOperationId`, and its independent acknowledgement-loss
-overlay is `supervisor-state-mutator`. These identities keep the physical
-collector, PostgreSQL authorization, and stopped-only reconciler separate.
+overlay is `supervisor-state-mutator`. The ninth mutator is
+`supervisor.reconcileWriterLaunch`: the entire leaf is conservatively in
+`supervisor-mutator`, with cut `writer-launch-retirement` and durable key
+`attempt.launchAttemptId`. Only its durable revision 4 branch retires a stopped
+container; observer-only branches remain null-record observations.
 
 A PostgreSQL deployment factory now owns the production connection boundary
 above that controller. It accepts one exact explicit host, database, user,
@@ -568,28 +573,31 @@ methods, four publication methods, and restore-destination resolution. Each
 method has its own result deadline and settlement grace. Transient invocation
 identities and abort signals reach only the raw physical collaborator; the
 runtime keeps its existing durable request, result, hash, and version contracts.
-Fresh launch, dynamic writer stop, terminal-state collection, detach/fence,
-activation, and publication still require their existing durable grants, while
-reconciliation and committed-only verification remain read-only. A deadline,
-late settlement, or grace breach therefore cannot authorize a retry or a
-second physical dispatch. Shutdown closes admission, requests every one of the
+Fresh launch, dynamic writer stop, terminal-state collection, exact revision 4
+writer retirement, detach/fence, activation, and publication still require
+their existing durable grants, while observer-only reconciliation branches and
+committed-only verification remain read-only. A deadline, late settlement, or
+grace breach therefore cannot authorize a retry or a second physical dispatch.
+Shutdown closes admission, requests every one of the
 twenty deployment-owned settlement stops, drains them and admitted work, and
 only then closes the four PostgreSQL pools; any failure remains a sticky failed
 deployment rather than a clean stop.
 
-The fifteen private protocol-surface leaves divide into eight grant-bearing
-mutators and seven repeatable observations. The mutators are returned writer
-stop, exact terminal supervisor-state collection, fresh checkpoint publication,
-fresh restore-destination publication, release detach, force fence, restore-
-attachment preparation, and writer launch.
-The seven dispatch mutators remain at-most-once for their exact durable grant.
+The fifteen private protocol-surface leaves divide into nine mutators and six
+repeatable observations. The mutators are returned writer stop, exact terminal
+supervisor-state collection, fresh checkpoint publication, fresh restore-
+destination publication, release detach, force fence, restore-attachment
+preparation, writer launch, and exact writer-launch retirement. The seven
+one-shot dispatch mutators remain at-most-once for their exact durable grant.
 Supervisor-state GC instead authorizes one exact terminal chain: an
 acknowledgement-loss retry may call the collector again and prove it `absent`,
-but cannot select different local state or perform a second deletion. Launch and
-attachment reconciliation, committed checkpoint and restore-destination
-verification, restore-destination resolution, image-plan resolution, and Codex
-inspection may run again in a distinct recovery attempt, but they remain
-read-only and cannot create a durable grant. A deadline never automatically
+but cannot select different local state or perform a second deletion. Exact
+writer retirement may repeat only `rm --ignore` plus the same name/ID absence
+proofs while revision 4 remains. Attachment reconciliation, committed
+checkpoint and restore-destination verification, restore-destination
+resolution, image-plan resolution, and Codex inspection may run again in a
+distinct recovery attempt, but they remain read-only and cannot create a
+durable grant. A deadline never automatically
 redispatches the same settlement invocation. Preparing an image again creates
 a new process-local observation and opaque reservation for the same fixed plan;
 it is not replay of a durable mutation. The generic lifecycle methods
@@ -662,10 +670,13 @@ not a pathname or attempt ID, but does not attest that record's provenance. It
 uses the marker-backed state bundle's persistent `stateOwnerId`. Production
 derives both raw capabilities through `createPodmanWriterSupervisorBundle()`;
 equal IDs and owner text on independently constructed objects do not substitute
-for that exact process-local pair. The raw supervisor is contract version 4,
-its logical facade is version 3, the collector and its receipt are version 2,
-and the aggregate physical binding is version 3. The durable launch request
-remains version 1 and does not embed the marker.
+for that exact process-local pair. The raw Podman and physical supervisor
+boundary is version 5; its launch receipt remains version 2, while its
+reconciliation receipt is now version 2. The physical adapter facade and
+logical supervisor are version 4, the logical reconciliation receipt is
+version 2, the collector and its receipt remain version 2, and the aggregate
+physical binding is version 4. The durable launch request remains version 1
+and does not embed the marker.
 The state-root marker must already be present and valid when the production
 state and supervisor bundles are assembled; an unmarked root is not assigned
 an identity from its path or from `recoveryScopeId`. It first validates exact
@@ -679,6 +690,21 @@ and bytes with the held file before unlink, then unlinks it and positionally
 rereads the exact canonical bytes through that held descriptor while
 revalidating object identity and access policy. It finally proves the complete
 attempt absent and syncs the directory again.
+
+Cold reconciliation retires a container only when the local journal already
+holds the exact stopped revision 4 record. It first runs idempotent
+`podman rm --ignore` by the bound container ID, then proves absence twice with
+exact anchored-name and exact-ID `podman ps -a --no-trunc` filters. Only after
+both proofs does raw reconciliation return that revision 4 `terminalRecord`,
+allowing the logical launcher to use the owner-bound GC finalizer. Ambiguity in
+`rm`, either absence query, physical adaptation, or a pre-commit finalizer
+failure preserves revision 4 and commits no database finalization. A
+post-COMMIT acknowledgement loss may instead follow an atomic commit of the
+operation and owner-bound GC authorization; exact authorization readback
+determines whether that commit exists. In either case, revision 4 remains until
+the authorized collector removes it. Observer-only `complete-stopped` and
+`not-started` results instead return `terminalRecord: null` and retain the
+legacy no-GC finalizer.
 
 The collector keeps protected properties separate: object identity is
 `dev`/`ino` plus held descriptors, content stability includes the post-unlink
@@ -902,7 +928,7 @@ not a callback available to injected runtime collaborators. Production restore
 is exposed only through the deployment-controlled checkpoint backend. The
 settlement foundation, complete deployment-owned physical binding graph, and
 operational lease admission are assembled;
-the safety matrix now binds the eight real-PostgreSQL durable cuts, separate
+the safety matrix now binds the nine real-PostgreSQL durable cuts, separate
 new-object physical/runtime/controller retry and registry rehydration, and
 representative settlement timer/drain evidence. The Linux ext4 physical slice
 now supplies the clean/manual-fencing storage and rootless Podman collaborators

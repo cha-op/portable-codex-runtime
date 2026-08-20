@@ -142,9 +142,10 @@
   Deployment now derives the two database-clock critical-window bounds from
   those method policies, an explicit aggregate database allowance, and a
   positive safety margin; stable-plan provision and every resolution enforce
-  the exact admitted lease. The completed safety matrix classifies all twenty
-  settlement leaves, maps the eight protocol-surface mutators to eight
-  real-PostgreSQL acknowledgement-loss paths, and binds a
+  the exact admitted lease. The completed version 2 safety matrix classifies
+  all twenty settlement leaves as nine protocol-surface mutators, six
+  observations, and five contract-only leaves; it maps the nine mutators to
+  nine real-PostgreSQL acknowledgement-loss paths and binds a
   same-database/stable-plan retry
   through fresh physical bindings, image binding, runtime, and controller plus
   separate registry rehydration, an explicit test-only publication-seam router,
@@ -189,8 +190,17 @@
   construction fail closed before physical dispatch. Runtime fixes that owner
   into foreground launch-attempt reads as exact
   `{ operationId, stateOwnerId }`, outside public restore admission.
-  The stopped-only reconciler remains read-only and cannot authorize this
-  mutation. This marker is routing identity, not cryptographic host
+  Only the exact durable revision 4 cold-reconciliation branch may retire its
+  stopped container with idempotent removal plus exact name/ID absence proofs,
+  return the terminal record, and use the owner-bound GC finalizer. Ambiguous
+  removal, proof, adaptation, or a pre-commit finalizer failure preserves
+  revision 4 and commits no database finalization. A post-COMMIT
+  acknowledgement loss may instead follow an atomic commit of the operation
+  and owner-bound GC authorization; exact authorization readback determines
+  whether that commit exists. Revision 4 remains until the authorized collector
+  removes it in either case. Observer-only `complete-stopped`/`not-started`
+  remains null-record and no-GC. This marker is routing identity, not
+  cryptographic host
   attestation or protection against an administrator cloning both root and
   marker.
 - [pending] Third, define an authority-safe provider-state exact-replay

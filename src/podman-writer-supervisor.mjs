@@ -157,9 +157,9 @@ function firstPromiseOfThree(first, second, third) {
   });
 }
 
-export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 4;
+export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 5;
 export const PODMAN_WRITER_LAUNCH_RECEIPT_VERSION = 2;
-export const PODMAN_WRITER_RECONCILE_RECEIPT_VERSION = 1;
+export const PODMAN_WRITER_RECONCILE_RECEIPT_VERSION = 2;
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
@@ -3279,40 +3279,52 @@ export function createPodmanWriterSupervisor(...args) {
       record.status === "stopped" && record.containerId !== null,
       "podman_writer_supervisor_outcome_uncertain",
     );
-    const removed = await runPodman(
-      ["rm", "--ignore", record.containerId],
-      signal,
-    );
-    ensure(
-      removed.stderr === "" &&
-        (removed.stdout === "" || removed.stdout === `${record.containerId}\n`),
-      "podman_writer_output_invalid",
-    );
-    const filters = [
-      `name=^${expected.containerName}$`,
-      `id=${record.containerId}`,
-    ];
-    for (let index = 0; index < filters.length; index += 1) {
-      const listed = await runPodman(
-        [
-          "ps",
-          "-a",
-          "--no-trunc",
-          "--filter",
-          filters[index],
-          "--format=json",
-        ],
+    ensureNotAborted(signal);
+    try {
+      const removed = await runPodman(
+        ["rm", "--ignore", record.containerId],
         signal,
       );
-      ensure(listed.stderr === "", "podman_writer_output_invalid");
-      const candidates = parsedJson(
-        listed.stdout,
-        "podman_writer_supervisor_outcome_uncertain",
-      );
       ensure(
-        arrayIsArrayIntrinsic(candidates) && candidates.length === 0,
+        removed.stderr === "" &&
+          (removed.stdout === "" ||
+            removed.stdout === `${record.containerId}\n`),
         "podman_writer_supervisor_outcome_uncertain",
       );
+      const filters = [
+        `name=^${expected.containerName}$`,
+        `id=${record.containerId}`,
+      ];
+      for (let index = 0; index < filters.length; index += 1) {
+        const listed = await runPodman(
+          [
+            "ps",
+            "-a",
+            "--no-trunc",
+            "--filter",
+            filters[index],
+            "--format=json",
+          ],
+          signal,
+        );
+        ensure(
+          listed.stderr === "",
+          "podman_writer_supervisor_outcome_uncertain",
+        );
+        const candidates = parsedJson(
+          listed.stdout,
+          "podman_writer_supervisor_outcome_uncertain",
+        );
+        ensure(
+          arrayIsArrayIntrinsic(candidates) && candidates.length === 0,
+          "podman_writer_supervisor_outcome_uncertain",
+        );
+      }
+    } catch {
+      // After the separate pre-dispatch abort check, conservatively assume an
+      // rm may have executed. Keep rev4 durable and require an idempotent cold
+      // retry to re-establish both absence proofs.
+      fail("podman_writer_supervisor_outcome_uncertain");
     }
   }
 
@@ -3774,6 +3786,7 @@ export function createPodmanWriterSupervisor(...args) {
       });
       const record = await readState(expected);
       if (record?.status === "stopped") {
+        await proveNoStoppedContainer(record, expected, input.signal);
         return frozenRecord({
           evidence: evidence(
             supervisorId,
@@ -3782,6 +3795,7 @@ export function createPodmanWriterSupervisor(...args) {
             record.stopProofId,
           ),
           receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+          terminalRecord: record,
         });
       }
       if (record === null || record.status === "preparing") {
@@ -3816,6 +3830,7 @@ export function createPodmanWriterSupervisor(...args) {
               digestOfRequest,
             ),
             receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+            terminalRecord: null,
           });
         }
         ensure(
@@ -3922,6 +3937,7 @@ export function createPodmanWriterSupervisor(...args) {
             ),
           ),
           receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+          terminalRecord: null,
         });
       }
       ensure(
@@ -3995,6 +4011,7 @@ export function createPodmanWriterSupervisor(...args) {
           stoppedProofId(launchAttemptId, digestOfRequest, record.containerId),
         ),
         receiptVersion: PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+        terminalRecord: null,
       });
     },
   );

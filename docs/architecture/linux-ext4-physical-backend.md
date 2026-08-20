@@ -67,10 +67,11 @@ The physical implementation remains split into small authorities:
   restore-destination publication, and source-free committed verification.
   The ext4 inspector supplies its atomic filesystem/object observation, while
   provider state supplies the expected destination control identity.
-- `PodmanWriterSupervisor` implements the raw version 4 writer-supervisor
+- `PodmanWriterSupervisor` implements the raw version 5 writer-supervisor
   surface with a digest-pinned image reference, rootless execution, a private
-  bind, immutable revision publication, stop/join, and stopped-only read-only
-  launch reconciliation. Every Podman child invocation is explicitly local
+  bind, immutable revision publication, stop/join, observer-only launch
+  reconciliation, and exact stopped-revision retirement. Every Podman child
+  invocation is explicitly local
   through `--remote=false`, and a new launch proves the local rootless ABI with
   the exact `unshare /usr/bin/true` command before it publishes a claim. The
   supervisor also requires matching non-root real and effective user IDs. Its
@@ -583,14 +584,22 @@ namespace holder is coupled to the built-in command runner; a deployment that
 injects a different runner must also inject its matching trusted filesystem
 authority instead of mixing execution domains.
 
-`reconcileWriterLaunch()` is a repeatable stopped-only observation. It may
-enumerate and inspect the exact container and prove the live bind identity, but
-it cannot adopt a new started writer, stop or remove a container, or mutate the
-private supervisor journal. A live or configured ambiguous attempt therefore
-remains uncertain and blocks successor authority until an explicit owner stop
-or physical fence resolves it. Container retirement occurs only after the
-grant-bearing returned stop callback has durably reached its private stopped
-record.
+`reconcileWriterLaunch()` has one effectful cold-retirement branch and otherwise
+remains a stopped-only observation. Only an exact durable stopped revision 4
+record authorizes idempotent `podman rm --ignore` by its bound container ID,
+followed by two independent empty `podman ps -a --no-trunc` results filtered by
+the exact anchored container name and exact container ID. Only then does its raw
+reconciliation receipt, now version 2, carry the revision 4 `terminalRecord`;
+the raw launch receipt remains version 2. Ambiguity in `rm`, either absence
+proof, physical adaptation, or a pre-commit PostgreSQL finalizer failure
+preserves revision 4 and commits no database finalization. A post-COMMIT
+acknowledgement loss may instead follow an atomic commit of the operation and
+owner-bound GC authorization; exact authorization readback determines whether
+that commit exists. Revision 4 remains until the authorized collector removes
+it in either case. Observer-only `complete-stopped` and `not-started` receipts
+carry a null terminal record and retain the legacy no-GC finalizer. A live or
+otherwise ambiguous attempt remains uncertain and blocks successor authority
+until an explicit owner stop or physical fence resolves it.
 
 ## Terminal Supervisor-State Collection
 
@@ -619,8 +628,9 @@ sufficient input. Its exact version-2 request also carries the bundle's
 attempt ID, status, and terminal-record collection digest. The raw collector
 validates the canonical record but cannot
 attest its provenance. Production authorization obtains it from the owner
-launch or returned stop receipt, while `reconcileWriterLaunch()` remains a pure
-stopped-only observation and receives no collection authority.
+launch, returned stop receipt, or the exact durable revision 4 retirement
+receipt. Observer-only reconciliation remains null-record and receives no
+collection authority.
 
 An intact first collection validates the complete revision 0 through 4 chain,
 every present publication sidecar, the exact terminal record, and the absence of
@@ -698,9 +708,10 @@ branded state bundle, and passes that bundle through
 deployment rejects independently assembled lookalikes before its physical
 adapter is constructed. It maps the accepted pair as follows:
 
-- the physical binding consumes the Podman raw-v4 surface constructed with the
-  binding's `filesystemAuthority` and exposes the logical version-3 supervisor
-  to `runtime.launch.supervisor`;
+- the physical binding consumes the Podman raw-v5 surface and raw version-2
+  reconciliation receipt constructed with the binding's `filesystemAuthority`,
+  then exposes the version-4 facade and logical supervisor plus version-2
+  logical reconciliation receipt to `runtime.launch.supervisor`;
 - `runtime.launch.supervisorStateCollector` receives the matching contract
   version 2 collector with the identical `stateOwnerId`, and deployment gives
   `collectTerminalState()` its own deadline/grace settlement policy;

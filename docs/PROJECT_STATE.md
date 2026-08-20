@@ -286,9 +286,11 @@
   attempt, plus one immutable pre-dispatch owner binding in
   `writer_supervisor_state_owners`. Each private state root supplies a
   persistent high-entropy marker matching `state-owner:<64 lowercase hex>`.
-  Only the owner launch/stop finalizers that commit exact
-  `complete-stopped` evidence may create that authorization; stopped-only
-  reconciliation remains read-only. In the assembled production runner, the
+  Only an owner-bound finalizer that commits exact `complete-stopped` evidence
+  with its stopped revision 4 `terminalRecord` may create that authorization.
+  Immediate launch/stop and exact revision 4 cold retirement use that path;
+  observer-only reconciliation returns a null terminal record and remains
+  no-GC. In the assembled production runner, the
   fifth lane pages pending rows last while that runner holds the database-global
   exclusive lifecycle lease, invokes the separately settled physical collector
   with exact `{ stateOwnerId, terminalRecord }`, verifies the version-2 receipt
@@ -426,10 +428,13 @@
   storage-lifecycle methods, four publication methods, and restore-destination
   resolution. Together with image resolution and inspection, deployment owns
   twenty method-specific settlement stops.
-  The raw supervisor, logical facade, collection surface/receipt, and aggregate
-  binding are now versions 4, 3, 2, and 3 respectively. Supervisor and
-  collector exact surfaces both expose the same `stateOwnerId`; the durable
-  launch request remains version 1 and owner-free. Production additionally
+  The raw Podman/physical supervisor, physical adapter facade, logical
+  supervisor, logical reconcile receipt, collection surface/receipt, and
+  aggregate binding are now versions 5, 4, 4, 2, 2, and 4 respectively. The raw
+  launch receipt remains version 2, while the raw reconciliation receipt is now
+  version 2; the durable launch request remains version 1 and owner-free.
+  Supervisor and collector exact surfaces expose the same `stateOwnerId`.
+  Production additionally
   requires their marker-backed process-local pair provenance; structural
   equality alone does not establish it.
   Transient invocation identities and abort signals remain outside durable
@@ -437,15 +442,17 @@
   committed-only verification, and no-second-dispatch rules remain authoritative.
   Stop requests every settlement drain before awaiting them and closes pools
   only after controller and settlement drain; any failure is sticky.
-- The completed assembled-restore safety matrix fixes the distinction
-  between all twenty settlement contracts and the fifteen leaves on the
-  private restore protocol surface. Seven dispatch mutators remain at-most-once
-  per durable operation; terminal-state GC authorizes one exact chain whose
+- The completed assembled-restore safety matrix is version 2 and fixes the
+  distinction between all twenty settlement contracts and the fifteen leaves
+  on the private restore protocol surface: nine mutators, six observations,
+  and five contract-only leaves. Seven one-shot dispatch mutators remain
+  at-most-once per durable operation; terminal-state GC authorizes one exact
+  chain whose
   acknowledgement-loss retry may prove it absent but cannot perform a second
-  deletion. Seven resolver, verifier, inspector, or
-  reconciler observations may repeat across independent recovery attempts but
-  cannot manufacture a grant. The five remaining generic lifecycle contracts
-  stay outside the current saga. The evidence shape combines eight
+  deletion. Six resolver, verifier, inspector, or observer-only reconciliation
+  leaves may repeat across independent recovery attempts but cannot manufacture
+  a grant. The five remaining generic lifecycle contracts
+  stay outside the current saga. The evidence shape combines nine
   real-PostgreSQL durable-cut and commit-acknowledgement-loss paths, separate
   same-database/stable-plan retry through fresh physical bindings, image
   binding, runtime, and controller, stable-plan-registry rehydration, and
@@ -454,11 +461,14 @@
   callback seam. The immutable public backend now owns that routing in
   production without accepting a caller callback. The matrix does not claim
   one whole-saga deployment restart or operating-system crash coverage.
-  The eighth mutator is
+  The collector mutator remains
   `supervisorStateCollector.collectTerminalState`; its cut is
   `supervisor-state-gc`, durable key is
   `authorization.terminalOperationId`, and independent overlay is
-  `supervisor-state-mutator`.
+  `supervisor-state-mutator`. The ninth mutator is the complete
+  `supervisor.reconcileWriterLaunch` leaf, conservatively assigned to
+  `supervisor-mutator`; its cut is `writer-launch-retirement` and its durable
+  key is `attempt.launchAttemptId`.
 - Restore activation now obtains and consumes its PostgreSQL one-shot dispatch
   grant entirely inside one coordinator-owned per-operation guard. The storage
   backend exposes a separate version 1 read-only reconciliation contract keyed
@@ -542,6 +552,18 @@
   session remains live; same-authorization monotonic collection handles the
   explicitly non-quiescent session-loss overlap. The collector does not mint
   either outer property.
+- Cold reconciliation physically retires a container only from an exact durable
+  stopped revision 4 record. It completes idempotent `podman rm --ignore`, then
+  proves exact anchored-name and exact-ID absence with two independent
+  `podman ps -a --no-trunc` queries before returning that record to the
+  owner-bound GC finalizer. Ambiguous removal, either absence query, physical
+  adaptation, or a pre-commit finalizer failure preserves revision 4 and
+  commits no database finalization. A post-COMMIT acknowledgement loss may
+  instead follow an atomic commit of the operation and owner-bound GC
+  authorization; exact authorization readback determines whether that commit
+  exists. Revision 4 remains until the authorized collector removes it in
+  either case. Observer-only `complete-stopped` and `not-started` return a null
+  terminal record and retain the legacy no-GC path.
 - Per-workstream implementation state lives under `docs/project_journal/`.
 
 ## Recovery Pointers

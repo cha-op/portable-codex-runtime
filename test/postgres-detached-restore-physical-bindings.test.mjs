@@ -9,6 +9,7 @@ import { createPhysicalCollaboratorSettlement } from "../src/physical-collaborat
 import {
   POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION,
   POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION,
+  POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
   POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION,
   POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
   POSTGRES_RESTORE_DESTINATION_RESOLVER_PHYSICAL_CONTRACT_VERSION,
@@ -198,7 +199,9 @@ async function fixture(overrides = {}) {
           supervisorId: "supervisor-001",
           writerIncarnationId: null,
         }),
-        receiptVersion: 1,
+        receiptVersion:
+          POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+        terminalRecord: null,
       });
     },
   };
@@ -415,12 +418,13 @@ async function physicalPublicationFixture(t) {
   };
 }
 
-test("constructs exact branded facades and maps physical supervisor v4 to launcher v3", async () => {
+test("constructs exact branded facades and maps physical supervisor v5 to launcher v4", async () => {
   const { binding, events } = await fixture();
-  assert.equal(POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION, 3);
-  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION, 4);
-  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION, 3);
+  assert.equal(POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION, 4);
+  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION, 5);
+  assert.equal(POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION, 4);
   assert.equal(POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION, 2);
+  assert.equal(POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION, 2);
   assert.equal(
     POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION,
     2,
@@ -445,7 +449,7 @@ test("constructs exact branded facades and maps physical supervisor v4 to launch
     "stateOwnerId",
     "supervisorId",
   ]);
-  assert.equal(binding.supervisor.contractVersion, 3);
+  assert.equal(binding.supervisor.contractVersion, 4);
   assert.equal(binding.supervisor.stateOwnerId, STATE_OWNER_ID);
   assertFrozenNullRecord(binding.supervisorStateCollector, [
     "collectTerminalState",
@@ -510,12 +514,12 @@ test("constructs exact branded facades and maps physical supervisor v4 to launch
     "terminalRecord",
   ]);
   assert.equal(stopped.confirmation, STOPPED_WRITER_STOP_CONFIRMED);
-  assert.equal(stopped.contractVersion, 3);
+  assert.equal(stopped.contractVersion, 4);
   assert.equal(stopped.terminalRecord.status, "stopped");
   assert.equal(stopped.terminalRecord.revision, 4);
   const stopEvent = events.find((event) => event.method === "stopWriter");
   assert.equal(stopEvent.argumentsLength, 1);
-  assert.equal(stopEvent.input.contractVersion, 4);
+  assert.equal(stopEvent.input.contractVersion, 5);
   assertFrozenNullRecord(stopEvent.input, [
     "attachment",
     "contractVersion",
@@ -563,6 +567,11 @@ test("constructs exact branded facades and maps physical supervisor v4 to launch
   );
   assert.equal(reconcile.evidence.contractVersion, 1);
   assert.equal(reconcile.evidence.status, "not-started");
+  assert.equal(
+    reconcile.receiptVersion,
+    POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+  );
+  assert.equal(reconcile.terminalRecord, null);
   assert.equal(events.find((event) => event.method === "reconcileWriterLaunch").argumentsLength, 1);
 
   const lifecycle = await binding.lifecycleBackend.provisionSession(exact({ operationId: "op-001" }));
@@ -694,6 +703,92 @@ test("classifies launch terminal records only for owner complete-stopped receipt
     await assert.rejects(
       invalid.binding.supervisor.launchWriter(exact({
         attempt: exact({ launchAttemptId: "attempt-invalid" }),
+        contractVersion: 1,
+      })),
+      { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },
+    );
+  }
+});
+
+test("forwards reconciliation terminal records only for matching owner complete-stopped receipts", async () => {
+  const base = await fixture();
+  const completeRecord = terminalRecord({
+    launchAttemptId: "attempt-reconcile-complete",
+  });
+  const complete = await fixture({
+    supervisor: Object.freeze({
+      ...base.options.supervisor,
+      async reconcileWriterLaunch(input) {
+        return exact({
+          evidence: exact({
+            contractVersion:
+              POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+            launchAttemptId: input.attempt.launchAttemptId,
+            processIncarnationId: completeRecord.processIncarnationId,
+            proofId: completeRecord.stopProofId,
+            status: "complete-stopped",
+            supervisorId: "supervisor-001",
+            writerIncarnationId: completeRecord.writerIncarnationId,
+          }),
+          receiptVersion:
+            POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+          terminalRecord: completeRecord,
+        });
+      },
+    }),
+  });
+  const completed = await complete.binding.supervisor.reconcileWriterLaunch(
+    exact({
+      attempt: exact({ launchAttemptId: completeRecord.launchAttemptId }),
+      contractVersion: 1,
+    }),
+  );
+  assert.equal(completed.evidence.status, "complete-stopped");
+  assert.deepEqual(completed.terminalRecord, completeRecord);
+
+  for (const { evidenceStatus, terminal } of [
+    { evidenceStatus: "not-started", terminal: completeRecord },
+    {
+      evidenceStatus: "complete-stopped",
+      terminal: terminalRecord({ launchAttemptId: "attempt-other" }),
+    },
+  ]) {
+    const invalid = await fixture({
+      supervisor: Object.freeze({
+        ...base.options.supervisor,
+        async reconcileWriterLaunch(input) {
+          return exact({
+            evidence: exact({
+              contractVersion:
+                POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION,
+              launchAttemptId: input.attempt.launchAttemptId,
+              processIncarnationId:
+                evidenceStatus === "complete-stopped"
+                  ? completeRecord.processIncarnationId
+                  : null,
+              proofId:
+                evidenceStatus === "complete-stopped"
+                  ? completeRecord.stopProofId
+                  : "not-started-proof",
+              status: evidenceStatus,
+              supervisorId: "supervisor-001",
+              writerIncarnationId:
+                evidenceStatus === "complete-stopped"
+                  ? completeRecord.writerIncarnationId
+                  : null,
+            }),
+            receiptVersion:
+              POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+            terminalRecord: terminal,
+          });
+        },
+      }),
+    });
+    await assert.rejects(
+      invalid.binding.supervisor.reconcileWriterLaunch(exact({
+        attempt: exact({
+          launchAttemptId: "attempt-reconcile-complete",
+        }),
         contractVersion: 1,
       })),
       { code: "postgres_detached_restore_physical_bindings_outcome_uncertain" },

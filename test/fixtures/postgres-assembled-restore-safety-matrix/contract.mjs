@@ -186,8 +186,8 @@ const leaves = frozen([
     "supervisorSettlement",
   ),
   leaf(
-    "observation",
-    null,
+    "mutator",
+    "writer-launch-retirement",
     "supervisor.reconcileWriterLaunch",
     "reconcileWriterLaunch",
     "supervisorSettlement",
@@ -308,6 +308,11 @@ const cutKeys = frozen([
     "writer-launch",
     "supervisor.launchWriter",
   ),
+  cut(
+    "attempt.launchAttemptId",
+    "writer-launch-retirement",
+    "supervisor.reconcileWriterLaunch",
+  ),
 ]);
 
 const overlayFamilies = frozen([
@@ -315,8 +320,9 @@ const overlayFamilies = frozen([
     "supervisorStateCollector.collectTerminalState",
   ]),
   overlay("supervisor-mutator", [
-    "supervisor.stopWriter",
     "supervisor.launchWriter",
+    "supervisor.reconcileWriterLaunch",
+    "supervisor.stopWriter",
   ]),
   overlay("storage-mutator", [
     "lifecycle.detachAttachment",
@@ -328,7 +334,6 @@ const overlayFamilies = frozen([
     "publication.publishRestoreDestination",
   ]),
   overlay("repeatable-observation", [
-    "supervisor.reconcileWriterLaunch",
     "lifecycle.reconcileRestoreAttachment",
     "publication.verifyCommittedCheckpointArtifact",
     "publication.verifyCommittedRestoreDestination",
@@ -341,7 +346,7 @@ const overlayFamilies = frozen([
 ]);
 
 export const POSTGRES_ASSEMBLED_RESTORE_SAFETY_MATRIX = exact({
-  contractVersion: 1,
+  contractVersion: 2,
   cutKeys,
   leaves,
   overlayFamilies,

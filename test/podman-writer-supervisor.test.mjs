@@ -29,6 +29,7 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import {
   PODMAN_WRITER_LAUNCH_RECEIPT_VERSION,
+  PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PodmanWriterSupervisorError,
   createPodmanWriterFilesystemAuthorityComposition,
@@ -768,6 +769,7 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
   let running = false;
   let name = null;
   let mountSource = settings.inspectionSource ?? attachmentRoot;
+  let psCalls = 0;
   return async function commandRunner(executable, arguments_, options) {
     assert.equal(Object.isFrozen(arguments_), true);
     assert.equal(arguments_[0], "--remote=false");
@@ -843,12 +845,24 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
         settings.rmRejectAfterRemove = false;
         throw new Error("simulated ambiguous rm");
       }
+      const rmOutputOnce = settings.rmOutputOnce;
+      const stdout = rmOutputOnce ??
+        settings.rmOutput ??
+        `${CONTAINER_ID}\n`;
+      if (rmOutputOnce !== undefined) settings.rmOutputOnce = undefined;
       return {
         stderr: "",
-        stdout: settings.rmOutput ?? `${CONTAINER_ID}\n`,
+        stdout,
       };
     }
     if (arguments_[0] === "ps") {
+      psCalls += 1;
+      if (settings.psRejectAt === psCalls) {
+        throw new Error("simulated ps failure");
+      }
+      if (settings.psStderrAt === psCalls) {
+        return { stderr: "simulated ps diagnostic\n", stdout: "[]\n" };
+      }
       const filter = arguments_[arguments_.indexOf("--filter") + 1];
       const filteredName = filter.startsWith("name=^")
         ? filter.slice("name=^".length, -1)
@@ -1239,7 +1253,7 @@ test("launches with the fixed rootless digest-pinned argv and joins the containe
     "stateOwnerId",
     "supervisorId",
   ]);
-  assert.equal(supervisor.contractVersion, 4);
+  assert.equal(supervisor.contractVersion, 5);
   assert.equal(supervisor.stateOwnerId, base.stateBundle.stateOwnerId);
   assert.equal(supervisor.launchWriter.length, 1);
   assert.equal(supervisor.reconcileWriterLaunch.length, 1);
@@ -1488,7 +1502,7 @@ test("constructs an atomic supervisor/state-collector bundle and collects only i
     "stateOwnerId",
     "supervisorId",
   ]);
-  assert.equal(bundle.supervisor.contractVersion, 4);
+  assert.equal(bundle.supervisor.contractVersion, 5);
   assert.equal(bundle.supervisorStateCollector.contractVersion, 2);
   assert.equal(
     bundle.supervisorStateCollector.stateOwnerId,
@@ -1808,10 +1822,14 @@ test("stop is exact-owner idempotent and persists complete-stopped reconciliatio
     reconcileInput(base.input),
   );
   assert.equal(reconciled.evidence.status, "complete-stopped");
-  assert.equal(Object.hasOwn(reconciled, "terminalRecord"), false);
+  assert.equal(
+    reconciled.receiptVersion,
+    PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+  );
+  assert.deepEqual(reconciled.terminalRecord, firstStop.terminalRecord);
   assert.deepEqual(
     base.events.slice(afterReplay).map((event) => event.arguments_[0]),
-    [],
+    ["rm", "ps", "ps"],
   );
 });
 
@@ -1854,6 +1872,122 @@ test("durable stopped cleanup retries after rm acknowledgement loss on cold repl
   );
 });
 
+for (const [name, runnerSettings, expectedFailedEvents] of [
+  ["rm acknowledgement loss", { rmRejectAfterRemove: true }, ["rm"]],
+  [
+    "malformed rm acknowledgement",
+    { rmOutputOnce: "unexpected\n" },
+    ["rm"],
+  ],
+  ["first absence proof failure", { psRejectAt: 1 }, ["rm", "ps"]],
+  ["first absence proof diagnostic", { psStderrAt: 1 }, ["rm", "ps"]],
+  ["second absence proof failure", { psRejectAt: 2 }, ["rm", "ps", "ps"]],
+]) {
+  test(`rev4 reconciliation retries after ${name}`, async (t) => {
+    const base = await fixture(t);
+    const launch = await base.supervisor.launchWriter(base.input);
+    const stopped = await launch.stopWriter(stopInput(base.input, launch));
+    const events = [];
+    const restarted = createPodmanWriterSupervisor(exact({
+      ...base.options,
+      commandRunner: successfulRunner(
+        base.attachmentRoot,
+        events,
+        runnerSettings,
+      ),
+    }));
+
+    await assert.rejects(
+      restarted.reconcileWriterLaunch(reconcileInput(base.input)),
+      assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+    );
+    assert.deepEqual(
+      events.map((event) => event.arguments_[0]),
+      expectedFailedEvents,
+    );
+    assert.deepEqual(
+      await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+      stopped.terminalRecord,
+    );
+
+    const retryStart = events.length;
+    const reconciled = await restarted.reconcileWriterLaunch(
+      reconcileInput(base.input),
+    );
+    assert.deepEqual(reconciled.terminalRecord, stopped.terminalRecord);
+    assert.deepEqual(
+      events.slice(retryStart).map((event) => event.arguments_[0]),
+      ["rm", "ps", "ps"],
+    );
+  });
+}
+
+test("rev4 reconciliation treats abort after rm dispatch as uncertain", async (t) => {
+  const base = await fixture(t);
+  const launch = await base.supervisor.launchWriter(base.input);
+  const stopped = await launch.stopWriter(stopInput(base.input, launch));
+  const controller = new AbortController();
+  const events = [];
+  const restarted = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    commandRunner: successfulRunner(base.attachmentRoot, events, {
+      async onRm() {
+        controller.abort();
+      },
+    }),
+  }));
+
+  await assert.rejects(
+    restarted.reconcileWriterLaunch(
+      reconcileInput(base.input, controller.signal),
+    ),
+    assertSupervisorError("podman_writer_supervisor_outcome_uncertain"),
+  );
+  assert.deepEqual(
+    events.map((event) => event.arguments_[0]),
+    ["rm"],
+  );
+  assert.deepEqual(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    stopped.terminalRecord,
+  );
+
+  const retryStart = events.length;
+  const reconciled = await restarted.reconcileWriterLaunch(
+    reconcileInput(base.input),
+  );
+  assert.deepEqual(reconciled.terminalRecord, stopped.terminalRecord);
+  assert.deepEqual(
+    events.slice(retryStart).map((event) => event.arguments_[0]),
+    ["rm", "ps", "ps"],
+  );
+});
+
+test("rev4 reconciliation preserves pre-dispatch abort classification", async (t) => {
+  const base = await fixture(t);
+  const launch = await base.supervisor.launchWriter(base.input);
+  const stopped = await launch.stopWriter(stopInput(base.input, launch));
+  const controller = new AbortController();
+  controller.abort();
+  const events = [];
+  const restarted = createPodmanWriterSupervisor(exact({
+    ...base.options,
+    commandRunner: successfulRunner(base.attachmentRoot, events),
+  }));
+
+  await assert.rejects(
+    restarted.reconcileWriterLaunch(
+      reconcileInput(base.input, controller.signal),
+    ),
+    assertSupervisorError("podman_writer_supervisor_aborted"),
+  );
+  assert.deepEqual(events, []);
+  assert.deepEqual(
+    await base.state.read(exact({ launchAttemptId: "launch-attempt-001" })),
+    stopped.terminalRecord,
+  );
+});
+
 test("successive launch attempts retire every durable stopped container", async (t) => {
   const base = await fixture(t);
   for (let index = 1; index <= 3; index += 1) {
@@ -1879,11 +2013,16 @@ test("successive launch attempts retire every durable stopped container", async 
   const reconciled = await base.supervisor.reconcileWriterLaunch(
     reconcileInput(absent),
   );
-  assert.deepEqual(Reflect.ownKeys(reconciled), ["evidence", "receiptVersion"]);
+  assert.deepEqual(Reflect.ownKeys(reconciled), [
+    "evidence",
+    "receiptVersion",
+    "terminalRecord",
+  ]);
   assert.equal(reconciled.evidence.status, "not-started");
+  assert.equal(reconciled.terminalRecord, null);
 });
 
-test("reconcile is a repeatable stopped-only observation", async (t) => {
+test("reconcile observes non-rev4 stopped states without mutation", async (t) => {
   const missing = await fixture(t);
   const other = launchInput(missing.attachmentRoot, {
     launchAttemptId: "launch-attempt-missing",
@@ -1891,6 +2030,7 @@ test("reconcile is a repeatable stopped-only observation", async (t) => {
   const observed = await missing.supervisor.reconcileWriterLaunch(reconcileInput(other));
   assert.equal(observed.evidence.status, "not-started");
   assert.equal(observed.evidence.processIncarnationId, null);
+  assert.equal(observed.terminalRecord, null);
   assert.deepEqual(missing.events.map((event) => event.arguments_[0]), ["ps"]);
 
   const running = await fixture(t);
@@ -1914,6 +2054,7 @@ test("reconcile is a repeatable stopped-only observation", async (t) => {
     reconcileInput(running.input),
   );
   assert.equal(observedStopped.evidence.status, "complete-stopped");
+  assert.equal(observedStopped.terminalRecord, null);
   assert.equal(
     (await running.state.read(exact({ launchAttemptId: "launch-attempt-001" })))
       .status,
@@ -1941,6 +2082,7 @@ test("reconcile is a repeatable stopped-only observation", async (t) => {
   const recovery = createPodmanWriterSupervisor(recoveryOptions);
   const recovered = await recovery.reconcileWriterLaunch(reconcileInput(crashed.input));
   assert.equal(recovered.evidence.status, "complete-stopped");
+  assert.equal(recovered.terminalRecord, null);
   const durable = await crashed.state.read(exact({ launchAttemptId: "launch-attempt-001" }));
   assert.equal(durable.status, "created");
   assert.deepEqual(
@@ -2023,6 +2165,8 @@ test("missing-state stopped evidence replays identically without premature retir
     reconcileInput(stopped.input),
   );
   assert.equal(first.evidence.status, "complete-stopped");
+  assert.equal(first.terminalRecord, null);
+  assert.equal(replay.terminalRecord, null);
   assert.deepEqual(replay.evidence, first.evidence);
   assert.deepEqual(
     stopped.events.map((event) => event.arguments_[0]),
@@ -2051,6 +2195,7 @@ test("preparing reconciliation proves absence by exact read-only enumeration", a
     reconcileInput(base.input),
   );
   assert.equal(receipt.evidence.status, "not-started");
+  assert.equal(receipt.terminalRecord, null);
   assert.deepEqual(events.map((event) => event.arguments_[0]), ["ps"]);
   assert.deepEqual(events[0].arguments_, [
     "ps",
@@ -2081,6 +2226,8 @@ test("preparing reconciliation observes stopped state without mutation", async (
   const first = await supervisor.reconcileWriterLaunch(reconcileInput(base.input));
   const replay = await supervisor.reconcileWriterLaunch(reconcileInput(base.input));
   assert.equal(first.evidence.status, "complete-stopped");
+  assert.equal(first.terminalRecord, null);
+  assert.equal(replay.terminalRecord, null);
   assert.deepEqual(replay.evidence, first.evidence);
   assert.deepEqual(
     events.map((event) => event.arguments_[0]),

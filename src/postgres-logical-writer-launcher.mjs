@@ -111,9 +111,9 @@ const {
 } = utilTypes;
 
 export const LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION = 1;
-export const LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION = 3;
+export const LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION = 4;
 export const LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION = 2;
-export const LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION = 1;
+export const LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION = 2;
 const MAX_DATA_TREE_DEPTH = 24;
 const MAX_DATA_TREE_NODES = 16_384;
 const NATIVE_FUNCTION_SOURCE_PATTERN =
@@ -528,6 +528,7 @@ const LAUNCH_CALLBACK_RECEIPT_KEYS = objectFreeze([
 const RECONCILE_CALLBACK_RECEIPT_KEYS = objectFreeze([
   "evidence",
   "receiptVersion",
+  "terminalRecord",
 ]);
 const ATTACHMENT_KEYS = objectFreeze([
   "attachmentId",
@@ -3146,14 +3147,35 @@ function normalizeReconcileCallbackReceipt(value, attempt, code) {
     receipt.receiptVersion === LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION,
     code,
   );
-  return exactFrozenRecord({
-    evidence: normalizeTerminalEvidence(
-      receipt.evidence,
-      attempt,
-      ["complete-stopped", "not-started"],
+  const evidence = normalizeTerminalEvidence(
+    receipt.evidence,
+    attempt,
+    ["complete-stopped", "not-started"],
+    code,
+  );
+  let terminalRecord = null;
+  if (receipt.terminalRecord !== null) {
+    ensure(evidence.status === "complete-stopped", code);
+    try {
+      terminalRecord = assertPodmanWriterSupervisorStateRecord(
+        receipt.terminalRecord,
+      );
+    } catch {
+      fail(code);
+    }
+    ensure(
+      terminalRecord.status === "stopped" &&
+        terminalRecord.revision === 4 &&
+        terminalRecord.launchAttemptId === attempt.launchAttemptId &&
+        terminalRecord.processIncarnationId ===
+          evidence.processIncarnationId &&
+        terminalRecord.stopProofId === evidence.proofId &&
+        terminalRecord.writerIncarnationId ===
+          evidence.writerIncarnationId,
       code,
-    ),
-  });
+    );
+  }
+  return exactFrozenRecord({ evidence, terminalRecord });
 }
 
 function assertOpaqueWriterHandle(value, code) {
@@ -3945,11 +3967,16 @@ export function createPostgresLogicalWriterLauncher(...args) {
     if (local !== undefined && local.state === "provisional") {
       local.state = "lost";
     }
+    const authorizeSupervisorStateGc =
+      callbackReceipt.terminalRecord !== null;
     return finalizeWithReadback(
       read,
       callbackReceipt.evidence,
-      "finalizeWriterLaunchAttemptStopped",
+      authorizeSupervisorStateGc
+        ? "finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc"
+        : "finalizeWriterLaunchAttemptStopped",
       uncertaintyState,
+      callbackReceipt.terminalRecord,
     );
   }
 

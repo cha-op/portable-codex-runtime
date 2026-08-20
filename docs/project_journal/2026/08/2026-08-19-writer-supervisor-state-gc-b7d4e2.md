@@ -19,20 +19,22 @@ superseded_by:
   quiescence.
 - Added migration 009's permanent authorization/completion ledger and the
   immutable state-owner route plus the fifth recovery lane, including
-  owner-filtered cold-start paging, without granting mutation authority to the
-  stopped-only reconciler.
+  owner-filtered cold-start paging and the exact durable revision 4 retirement
+  path without granting authority to observer-only reconciliation.
 
 ## Current State
 
-- Only owner launch/stop finalizers that commit exact `complete-stopped`
-  evidence may insert or replay a supervisor-state GC authorization. Migration
+- Only owner-bound finalizers that commit exact `complete-stopped` evidence
+  with a stopped revision 4 terminal record may insert or replay a
+  supervisor-state GC authorization. Immediate launch/stop and exact durable
+  revision 4 cold retirement use that path. Migration
   009 first binds each launch attempt immutably to the private root's persistent
   high-entropy `stateOwnerId` (`state-owner:<64 lowercase hex>`), then binds GC
   authorization to that owner, the terminal operation, and launch attempt. It
   retains the exact stopped revision 4 `terminalRecord` and digests and
-  permanently records `collected` or `absent` completion. The stopped-only
-  launch reconciler remains a pure read and ordinary callers cannot choose a
-  foreign owner.
+  permanently records `collected` or `absent` completion. Observer-only launch
+  reconciliation returns a null terminal record, remains no-GC, and ordinary
+  callers cannot choose a foreign owner.
 - In the assembled production runner, the fifth `supervisor-state-gc` recovery
   lane runs last while that runner holds the database-global exclusive restore
   lifecycle lease. Private wrappers inject the local owner into the third and
@@ -67,15 +69,31 @@ superseded_by:
   attempt artifacts absent and syncs the directory again. A lost `collected`
   acknowledgement may retry as `absent`; PostgreSQL completion remains exact
   and idempotent.
-- The assembled physical graph now has twenty settlement leaves. The collector
-  is the eighth protocol mutator, with leaf
+- Exact durable revision 4 cold reconciliation first completes idempotent
+  `podman rm --ignore`, then proves both anchored-name and exact-ID absence with
+  separate `podman ps -a --no-trunc` queries. Only then does its version-2
+  receipt carry the terminal record to the owner-bound GC finalizer. Ambiguity
+  in removal, either proof, physical adaptation, or a pre-commit finalizer
+  failure preserves revision 4 and commits no database finalization. A
+  post-COMMIT acknowledgement loss may instead follow an atomic commit of the
+  operation and owner-bound GC authorization; exact authorization readback
+  determines whether that commit exists. Revision 4 remains until the
+  authorized collector removes it in either case. Observer-only
+  `complete-stopped` and `not-started` remain null-record and no-GC.
+- The assembled version 2 safety matrix still has twenty settlement leaves:
+  nine mutators, six observations, five contract-only leaves, nine durable
+  cuts, and six overlays. The collector mutator retains leaf
   `supervisorStateCollector.collectTerminalState`, cut
   `supervisor-state-gc`, durable key
   `authorization.terminalOperationId`, and independent overlay
-  `supervisor-state-mutator`.
-- The transient raw Podman supervisor is version 4, its launch receipt remains
-  version 2, the logical facade is version 3, the collection surface/receipt is
-  version 2, and the aggregate physical binding is version 3. The durable
+  `supervisor-state-mutator`. The complete reconciliation leaf is
+  conservatively in `supervisor-mutator`, with cut
+  `writer-launch-retirement` and durable key `attempt.launchAttemptId`.
+- The transient raw Podman and physical supervisor is version 5; its launch
+  receipt remains version 2, while its reconciliation receipt is now version 2.
+  The physical facade and logical supervisor are version 4, the logical
+  reconcile receipt is version 2, the collection surface/receipt remains
+  version 2, and the aggregate physical binding is version 4. The durable
   logical launch request, evidence projection, and local revision records
   remain version 1, so owner routing does not change existing request hashes.
 

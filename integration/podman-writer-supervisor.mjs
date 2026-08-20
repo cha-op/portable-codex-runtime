@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import test from "node:test";
 
 import {
+  PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
   createPodmanWriterSupervisorBundle,
 } from "../src/podman-writer-supervisor.mjs";
@@ -2419,6 +2420,11 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     phase = "reconcile";
     const reconciled = await restarted.reconcileWriterLaunch(reconcileInput(input));
     assert.equal(reconciled.evidence.status, "complete-stopped");
+    assert.equal(
+      reconciled.receiptVersion,
+      PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
+    );
+    assert.deepEqual(reconciled.terminalRecord, terminalRecord);
     phase = "external-ps";
     const retired = await execFileAsync(
       PODMAN,

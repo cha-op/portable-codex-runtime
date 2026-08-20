@@ -45,11 +45,11 @@ const weakSetHasIntrinsic = WeakSet.prototype.has;
 const WeakSetConstructor = WeakSet;
 const { isGeneratorFunction, isPromise, isProxy } = utilTypes;
 
-export const POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION = 3;
-export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION = 4;
-export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION = 3;
+export const POSTGRES_DETACHED_RESTORE_PHYSICAL_BINDINGS_CONTRACT_VERSION = 4;
+export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_PHYSICAL_CONTRACT_VERSION = 5;
+export const POSTGRES_LOGICAL_WRITER_SUPERVISOR_FACADE_CONTRACT_VERSION = 4;
 export const POSTGRES_LOGICAL_WRITER_LAUNCH_PHYSICAL_RECEIPT_VERSION = 2;
-export const POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION = 1;
+export const POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION = 2;
 export const POSTGRES_WRITER_SUPERVISOR_STATE_COLLECTION_PHYSICAL_CONTRACT_VERSION =
   2;
 export const POSTGRES_SESSION_STORAGE_PHYSICAL_INVOCATION_CONTRACT_VERSION = 1;
@@ -146,6 +146,7 @@ const LAUNCH_RECEIPT_KEYS = objectFreeze([
 const RECONCILE_RECEIPT_KEYS = objectFreeze([
   "evidence",
   "receiptVersion",
+  "terminalRecord",
 ]);
 const STOP_RECEIPT_KEYS = objectFreeze([
   "contractVersion",
@@ -1190,14 +1191,37 @@ export function createPostgresDetachedRestorePhysicalBindings(...args) {
             POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
           outcomeCode,
         );
-        return exactFrozenRecord({
-          evidence: facadeEvidence(
-            receipt.evidence,
-            objectFreeze(["complete-stopped", "not-started"]),
+        const evidence = facadeEvidence(
+          receipt.evidence,
+          objectFreeze(["complete-stopped", "not-started"]),
+          outcomeCode,
+        );
+        let terminalRecord = null;
+        if (
+          evidence.status === "complete-stopped" &&
+          receipt.terminalRecord !== null
+        ) {
+          terminalRecord = terminalStateRecord(
+            receipt.terminalRecord,
+            evidence.launchAttemptId,
             outcomeCode,
-          ),
+          );
+          ensure(
+            terminalRecord.processIncarnationId ===
+                evidence.processIncarnationId &&
+              terminalRecord.stopProofId === evidence.proofId &&
+              terminalRecord.writerIncarnationId ===
+                evidence.writerIncarnationId,
+            outcomeCode,
+          );
+        } else {
+          ensure(receipt.terminalRecord === null, outcomeCode);
+        }
+        return exactFrozenRecord({
+          evidence,
           receiptVersion:
             POSTGRES_LOGICAL_WRITER_RECONCILE_PHYSICAL_RECEIPT_VERSION,
+          terminalRecord,
         });
       },
     );

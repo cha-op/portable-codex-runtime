@@ -57,6 +57,10 @@ const EXPECTED_CUTS = Object.freeze({
     "supervisor.launchWriter",
     "plan.launchAttemptId",
   ]),
+  "writer-launch-retirement": Object.freeze([
+    "supervisor.reconcileWriterLaunch",
+    "attempt.launchAttemptId",
+  ]),
   "writer-release": Object.freeze([
     "lifecycle.detachAttachment",
     "plan.detachOperationId",
@@ -80,7 +84,6 @@ const EXPECTED_OVERLAYS = Object.freeze({
     "publication.verifyCommittedCheckpointArtifact",
     "publication.verifyCommittedRestoreDestination",
     "resolver.resolveRestoreDestination",
-    "supervisor.reconcileWriterLaunch",
   ]),
   "storage-mutator": Object.freeze([
     "lifecycle.detachAttachment",
@@ -89,6 +92,7 @@ const EXPECTED_OVERLAYS = Object.freeze({
   ]),
   "supervisor-mutator": Object.freeze([
     "supervisor.launchWriter",
+    "supervisor.reconcileWriterLaunch",
     "supervisor.stopWriter",
   ]),
   "supervisor-state-mutator": Object.freeze([
@@ -182,7 +186,7 @@ test("assembled restore safety matrix fixes twenty exact settlement leaves", () 
     "leaves",
     "overlayFamilies",
   ]);
-  assert.equal(contract.contractVersion, 1);
+  assert.equal(contract.contractVersion, 2);
   assert.equal(Object.isFrozen(contract.leaves), true);
   assert.equal(contract.leaves.length, 20);
 
@@ -209,17 +213,17 @@ test("assembled restore safety matrix fixes twenty exact settlement leaves", () 
 
   assert.deepEqual(counts, {
     "contract-only": 5,
-    mutator: 8,
-    observation: 7,
+    mutator: 9,
+    observation: 6,
   });
   assert.deepEqual(sorted(leafKeys), EXPECTED_LEAF_KEYS);
 });
 
-test("eight durable cut keys map one-to-one to effectful mutators", () => {
+test("nine durable cut keys map one-to-one to effectful mutators", () => {
   const { cutKeys } = POSTGRES_ASSEMBLED_RESTORE_SAFETY_MATRIX;
   const mutators = leavesByClassification("mutator");
   assert.equal(Object.isFrozen(cutKeys), true);
-  assert.equal(cutKeys.length, 8);
+  assert.equal(cutKeys.length, 9);
 
   const observedCutKeys = new Set();
   const observedLeafKeys = new Set();

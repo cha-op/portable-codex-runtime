@@ -1234,16 +1234,18 @@ fails before `reserveOperation` can create durable state. The remaining
 and `logical_writer_launch_outcome_uncertain` codes are non-retryable.
 
 The durable logical launch request remains contract version 1 and does not
-embed local-root identity, while the transient supervisor facade is version 3
+embed local-root identity, while the transient logical supervisor is version 4
 and carries the configured `stateOwnerId`. `launchWriter` must return exact
 `{ receiptVersion: 2, evidence, stopWriter, terminalRecord }`: a `started`
 result requires one trusted asynchronous `stopWriter` and a null terminal
 record, `not-started` requires both fields to be null, and
 `complete-stopped` requires a null callback plus the exact stopped revision 4
-record. `reconcileWriterLaunch` still returns exact
-`{ receiptVersion: 1, evidence }` and accepts only `not-started` or
-`complete-stopped`; recovery cannot report a newly adopted started writer or
-authorize supervisor-state collection.
+record. `reconcileWriterLaunch` returns exact
+`{ receiptVersion: 2, evidence, terminalRecord }` and accepts only
+`not-started` or `complete-stopped`. Only exact durable revision 4 retirement
+may return the stopped record and authorize supervisor-state collection;
+observer-only results return `terminalRecord: null`. Recovery still cannot
+report a newly adopted started writer.
 
 Before the first physical dispatch, authority atomically binds the launch
 attempt to that persistent owner marker. Public `reconcileLaunchAttempt()`
@@ -1387,7 +1389,8 @@ boundary.
 ## Implemented Terminal Supervisor-State Collection Authority
 
 Terminal-state collection is authorized only inside the owner finalizer that
-commits an exact stopped result. A complete-stopped launch attempt uses
+commits an exact stopped result with its revision 4 terminal record. A
+complete-stopped launch attempt or durable revision 4 cold retirement uses
 `finalizeWriterLaunchAttemptStoppedAndAuthorizeSupervisorStateGc()`. A V1/V2
 owner stop uses
 `finalizeWriterLaunchStoppedAndAuthorizeSupervisorStateGc()`, while the V3
@@ -1403,8 +1406,9 @@ owner with its SHA-256, PostgreSQL authorization time, terminal and launch
 operation identities, terminal kind, exact revision 4 `terminalRecord`, and
 its SHA-256.
 
-The logical launcher obtains that terminal record only from the owner launch
-or returned physical stop receipt. The record must be exact stopped revision 4
+The logical launcher obtains that terminal record only from the owner launch,
+returned physical stop receipt, or exact durable revision 4 cold-retirement
+receipt. The record must be exact stopped revision 4
 state for the same attempt, process/writer incarnations, start and stop proofs,
 and stop operation where the terminal kind requires it. The raw collector
 validates canonically exact record data but does not attest its provenance;
@@ -1420,9 +1424,19 @@ path. Owner preparation and state/supervisor bundle construction fail closed
 before physical dispatch. The marker is a persistent routing identity, not
 cryptographic host attestation, and does not detect an administrator cloning
 both the private root and marker. An already-complete owner replay reads the
-exact authorization. By contrast,
-`reconcileWriterLaunch()` remains a pure stopped-only observation: it cannot
-return or insert a collection authorization and never calls the collector.
+exact authorization. `reconcileWriterLaunch()` remains observer-only unless it
+starts from that durable revision 4 record. That one branch completes
+idempotent `podman rm --ignore` and two exact empty `podman ps -a --no-trunc`
+queries, filtered independently by anchored name and container ID, before it
+returns the terminal record. The logical launcher then invokes the owner-bound
+GC finalizer; it does not call the collector directly. Ambiguity in removal,
+either absence proof, physical adaptation, or a pre-commit finalizer failure
+preserves revision 4 and commits no database finalization. A post-COMMIT
+acknowledgement loss may instead follow an atomic commit of the operation and
+owner-bound GC authorization; exact authorization readback determines whether
+that commit exists. Revision 4 remains until the authorized collector removes
+it in either case. Other `complete-stopped` and `not-started` observations
+return a null terminal record and use the legacy no-GC finalizer.
 
 `listWriterLaunchAttemptRecoveryCandidates()` and
 `listWriterSupervisorStateGcCandidates()` require the local owner and return
@@ -2283,20 +2297,24 @@ and method shapes do not recreate this provenance. The direct raw
 `createPodmanWriterSupervisor()` factory validates only a caller-asserted owner
 and is therefore excluded from production deployment.
 
-The aggregate physical binding is version 3. The raw supervisor boundary is
-transient contract version 4: launch,
+The aggregate physical binding is version 4. The raw supervisor boundary is
+transient contract version 5: launch,
 reconciliation, and returned stop receive fresh opaque invocation identity and
 authentic abort signal fields. Its adapter exposes the logical launcher's
-version 3 facade, including the configured `stateOwnerId`, and translates
+version 4 facade, including the configured `stateOwnerId`, and translates
 successful physical receipts without
 changing any pre-existing durable attempt, operation, reservation, or evidence
 shape. A returned physical stop capability succeeds only with exact transient
-receipt `{ contractVersion: 4, status: "stopped", terminalRecord }`; the
+receipt `{ contractVersion: 5, status: "stopped", terminalRecord }`; the
 adapter returns exact facade result
-`{ confirmation, contractVersion: 3, terminalRecord }`, where confirmation is
+`{ confirmation, contractVersion: 4, terminalRecord }`, where confirmation is
 the existing opaque sentinel and the stopped revision 4 record is passed to
 the owner finalizer. The capability is itself wrapped by the shared stop
 settlement boundary before it becomes the launcher's one-shot local callback.
+The raw launch receipt remains version 2; raw and logical reconciliation
+receipts are now version 2. Only the raw receipt for proved durable revision 4
+retirement carries a non-null `terminalRecord`; the adapter preserves that
+distinction exactly.
 
 The matching `supervisorStateCollector` is a separate transient contract
 version 2 boundary with the same owner marker and its own deadline/grace
@@ -2317,29 +2335,32 @@ and restore-destination resolution are likewise bounded at their lowest
 external Promise. Fresh checkpoint/restore publication remains distinct from
 committed-only verification, and activation preparation remains distinct from
 read-only reconciliation under the same guarded one-shot grant. Settlement
-cannot promote a verifier or reconciler into mutation authority.
+cannot promote a verifier or an observer-only reconciler branch into mutation
+authority; exact revision 4 retirement is already a separately keyed mutator.
 
 The safety matrix classifies these contracts before measuring reachability.
 The fifteen leaves on the private assembled protocol surface are:
 
-- grant-bearing mutators: supervisor `stopWriter()`, collector
+- mutators: supervisor `stopWriter()` and `reconcileWriterLaunch()`, collector
   `supervisorStateCollector.collectTerminalState`, publication
   `publishFreshCheckpointArtifact()` and `publishRestoreDestination()`,
   lifecycle `detachAttachment()`, `forceFence()`, and
   `prepareRestoreAttachment()`, and supervisor `launchWriter()`;
-- repeatable observations: supervisor `reconcileWriterLaunch()`, lifecycle
-  `reconcileRestoreAttachment()`, publication
+- repeatable observations: lifecycle `reconcileRestoreAttachment()`, publication
   `verifyCommittedCheckpointArtifact()` and
   `verifyCommittedRestoreDestination()`, restore-destination resolution,
   image-plan resolution, and trusted Codex inspection.
 
-The collector is the eighth mutator. Its safety-matrix durable cut is
+The collector retains safety-matrix durable cut
 `supervisor-state-gc`, keyed by `authorization.terminalOperationId`, and its
 independent acknowledgement-loss overlay is `supervisor-state-mutator`.
-Together the matrix now has twenty settlement leaves, fifteen protocol leaves,
-eight mutators, eight durable cuts, and six independent overlays. This naming
-keeps the PostgreSQL authorization boundary distinct from the local physical
-leaf and from the read-only supervisor reconciler.
+The complete supervisor reconciliation leaf is conservatively a mutator in
+`supervisor-mutator`, with cut `writer-launch-retirement` keyed by
+`attempt.launchAttemptId`. Together the version 2 matrix has twenty settlement
+leaves, fifteen protocol leaves, nine mutators, six observations, five
+contract-only leaves, nine durable cuts, and six independent overlays. This
+naming keeps both PostgreSQL authorization boundaries distinct from their local
+physical leaves and preserves observer-only reconciliation semantics.
 
 The five remaining lifecycle leaves, `captureCheckpoint()`, `destroySession()`,
 `prepareWritableAttachment()`, `provisionSession()`, and `restoreCheckpoint()`,
@@ -2349,13 +2370,16 @@ not aliases for the stopped-directory publication paths.
 
 "No second dispatch" is not a ban on every later physical observation. The
 same settlement invocation is never automatically reissued after deadline,
-and the seven dispatch mutators remain at-most-once for the exact operation
+and the seven one-shot mutators remain at-most-once for the exact operation
 grant. Terminal-state GC instead authorizes one exact terminal chain; after
 acknowledgement loss, another settled invocation may prove the already-deleted
 chain `absent` but cannot select different state or perform a second deletion.
-A later recovery attempt may repeat a trusted read-only resolver, verifier,
-inspector, or reconciler, including image resolution and inspection that mint a
-new process-local reservation for one fixed prepared plan. Those observations
+Exact revision 4 retirement may repeat only its idempotent removal and exact
+name/ID absence proofs while the stopped record remains durable. A later
+recovery attempt may repeat a trusted read-only resolver, verifier, inspector,
+or observer-only reconciliation branch, including image resolution and
+inspection that mint a new process-local reservation for one fixed prepared
+plan. Those observations
 must not change durable state, reconstruct a writer handle, or authorize a
 mutator.
 
@@ -2397,7 +2421,7 @@ construction failure has no deployment handle. Neither failed nor stopped
 deployments can reopen admission.
 
 Deployment now admits the explicit operational lease budget across the bounded
-critical path. The completed assembled matrix binds eight real-PostgreSQL
+critical path. The completed assembled matrix binds nine real-PostgreSQL
 durable cuts to their existing acknowledgement-loss/replay evidence, adds a
 same-database/stable-plan retry through fresh physical bindings, image binding,
 runtime, and controller, references separate stable-plan-registry rehydration,
@@ -2427,9 +2451,10 @@ repeating the request.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
-The injected Podman v4 supervisor holds the sole session-directory bind,
+The injected Podman v5 supervisor holds the sole session-directory bind,
 requires rootless execution and a digest-pinned image, publishes immutable
-local revisions, and supports stop/join plus read-only cold reconciliation.
+local revisions, and supports stop/join plus observer-only reconciliation and
+exact durable revision 4 retirement.
 The generic PostgreSQL deployment still constructs neither collaborator; a
 production host injects them and owns their additional provider-state pool and
 shutdown order.
@@ -2584,7 +2609,7 @@ collaborator settlement foundation and the complete assembled image,
 supervisor, supervisor-state collector, storage-lifecycle, publication, and
 restore-destination resolver binding graph and operational lease admission also
 exist. The completed safety matrix has an exact twenty-contract/fifteen-
-protocol-surface scope and binds its eight durable-cut aggregation, six
+protocol-surface scope and binds its nine durable-cut aggregation, six
 independent acknowledgement-loss overlays, same-database/stable-plan fresh-
 object retry, separate registry rehydration, and representative settlement
 timer/drain evidence. The final public backend is wired through controller and
@@ -2599,8 +2624,9 @@ binding, and the consumer verifies its transferred marker. The ext4 producer
 additionally gates whether live child-namespace mounts propagate to its parent
 namespace under the required host-owned long-lived namespace contract.
 Terminal supervisor-state validation covers migration 009 relational and
-canonical constraints, owner-only authorization, stopped-only reconciliation
-non-authority, exact candidate paging and completion replay, cold-start fifth-
+canonical constraints, owner-only authorization, exact revision 4 retirement
+and observer-only reconciliation separation, exact candidate paging and
+completion replay, cold-start fifth-
 lane collection, independent settlement, two-phase local deletion, protected-
 property revalidation, and `collected` to `absent` acknowledgement loss.
 Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential

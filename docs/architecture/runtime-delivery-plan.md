@@ -443,8 +443,11 @@ Restore and launcher authority are now split into eight serial pull requests:
      Connection or database loss may release that advisory lease without
      proving callback quiescence; a same-authorization cold overlap then relies
      on exact concurrent idempotent-or-fail-closed collection.
-     The raw supervisor, logical facade, collection surface/receipt, and
-     aggregate binding are versions 4, 3, 2, and 3. Migration 009 binds each
+     The raw Podman/physical supervisor, physical facade, logical supervisor,
+     logical reconcile receipt, collection surface/receipt, and aggregate
+     binding are versions 5, 4, 4, 2, 2, and 4. The raw launch receipt remains
+     version 2, while the raw reconciliation receipt is now version 2.
+     Migration 009 binds each
      launch attempt immutably to its local owner before dispatch; GC
      authorization/request/receipt repeat the marker and completion rechecks it.
      The durable launch request remains version 1. Migration 009 refuses any
@@ -464,16 +467,19 @@ Restore and launcher authority are now split into eight serial pull requests:
      two independently minted leases use the maximum window rather than a sum;
      stable-plan provisioning and every resolution enforce the same exact
      configured duration before physical work.
-   - The completed assembled safety-matrix slice classifies the twenty physical
-     contracts before claiming coverage. Fifteen belong to the private
-     protocol surface: eight grant-bearing mutators and seven repeatable
-     read-only resolver, verifier, inspector, or reconciler observations. The
-     supervisor-state collector is the eighth mutator, with cut
+   - The completed version 2 assembled safety-matrix slice classifies the twenty
+     physical contracts before claiming coverage. Fifteen belong to the private
+     protocol surface: nine mutators and six repeatable read-only resolver,
+     verifier, inspector, or observer-only reconciliation leaves. The
+     supervisor-state collector retains cut
      `supervisor-state-gc`, durable key
      `authorization.terminalOperationId`, and independent overlay
-     `supervisor-state-mutator`; the matrix now has eight durable cuts and six
+     `supervisor-state-mutator`. The complete
+     `supervisor.reconcileWriterLaunch` leaf is conservatively the ninth mutator
+     in `supervisor-mutator`, with cut `writer-launch-retirement` and durable key
+     `attempt.launchAttemptId`; the matrix now has nine durable cuts and six
      overlays. The other five generic lifecycle methods remain contract-only in
-     this saga. Its evidence combines eight real-PostgreSQL durable-cut/commit-
+     this saga. Its evidence combines nine real-PostgreSQL durable-cut/commit-
      acknowledgement-loss paths with a same-database/stable-plan retry through
      fresh physical bindings, image binding, runtime, and controller plus
      separate stable-plan-registry rehydration. Settlement evidence remains
@@ -488,12 +494,21 @@ Restore and launcher authority are now split into eight serial pull requests:
      whole-saga deployment restart, operating-system `SIGKILL`, or fake-
      PostgreSQL execution of all five collaborator families.
    - The no-second-dispatch property is scoped by authority. One settlement
-     invocation is never automatically retried; a durable mutator is dispatched
-     at most once for its operation grant. Trusted image observations,
-     destination resolution, committed verifiers, and stopped-only
-     reconciliation may repeat in a separate recovery attempt, but cannot mint
-     a grant. A fresh image reservation is therefore permitted for the same
-     fixed prepared plan and is not mutation replay.
+     invocation is never automatically retried, and the seven one-shot mutators
+     remain at-most-once for their operation grants. Exact revision 4 cold
+     retirement may repeat only idempotent removal plus the same name/ID absence
+     proofs while the record remains durable. It returns the terminal record and
+     uses the owner-bound GC finalizer only after both proofs. Ambiguous removal,
+     proof, adaptation, or a pre-commit finalizer failure preserves revision 4
+     and commits no database finalization. A post-COMMIT acknowledgement loss
+     may instead follow an atomic commit of the operation and owner-bound GC
+     authorization; exact authorization readback determines whether that commit
+     exists. Revision 4 remains until the authorized collector removes it in
+     either case. Observer-only reconciliation remains null-record and no-GC.
+     Trusted image observations, destination resolution, and committed
+     verifiers may repeat in a separate recovery attempt but cannot mint a grant.
+     A fresh image reservation is therefore permitted for the same fixed
+     prepared plan and is not mutation replay.
    - The final public restore-capable backend is complete. Runtime assembly
      keeps the capture backend private, constructs a second immutable backend
      after foreground composition, and binds its restore authority without a

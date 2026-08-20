@@ -81,6 +81,7 @@ import {
 } from "../src/postgres-writer-detach-composition.mjs";
 import {
   LOGICAL_WRITER_LAUNCH_RECEIPT_VERSION,
+  LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION,
   LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
   createPostgresLogicalWriterLauncher,
@@ -10526,6 +10527,126 @@ test(
           reason: "lease-expired-before-launch-dispatch",
         });
         assertOperationReceipt(cancelled, "committed");
+      },
+    );
+
+    await t.test(
+      "cold rev4 launch reconciliation commits owner-bound GC authorization",
+      async () => {
+        const sessionId = randomUUID();
+        sessionIds.push(sessionId);
+        const image = integrationPlatformImageFixture();
+        const fixture = await prepareCommittedRestoreGenerationFixture(
+          authority,
+          checkpointAuthority,
+          sessionId,
+          { imageDigest: image.descriptor.digest },
+        );
+        const imagePlanFixture = integrationImagePlanBindingFixture({
+          image,
+          session: fixture.finalized.session,
+        });
+        const launchAttemptId = `writer-launch-${randomUUID()}`;
+        const supervisorId = `supervisor-${randomUUID()}`;
+        const input = writerLaunchAttemptInput(
+          fixture.finalized.session,
+          fixture.finalized.generation,
+          { operationId: launchAttemptId, supervisorId },
+        );
+        await authority.reserveOperation(input);
+        await authority.claimWriterLaunchAttemptDispatch({
+          ...structuredClone(input),
+          expectedOperationRevision: "0",
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
+        });
+        await authority.markOperationUncertain({
+          ...structuredClone(input),
+          expectedOperationRevision: "1",
+        });
+        const stoppedFixture = podmanWriterTerminalFixture({
+          evidenceContractVersion: 1,
+          launchAttemptId,
+          request: input.request,
+          stopOperationId: `cold-retirement-${randomUUID()}`,
+          supervisorId,
+        });
+        const stoppedEvidence = frozenNullPrototypeRecord({
+          ...stoppedFixture.evidence,
+          proofId: stoppedFixture.terminalRecord.stopProofId,
+          status: "complete-stopped",
+        });
+        let launchCalls = 0;
+        let reconcileCalls = 0;
+        const facade = createPostgresLogicalWriterLauncher({
+          authority,
+          imagePlanBinding: imagePlanFixture.binding,
+          operationGuard,
+          stoppedWriterCoordinator:
+            new StoppedWriterCapabilityCoordinator(),
+          supervisor: {
+            contractVersion: LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
+            async launchWriter() {
+              launchCalls += 1;
+              throw new Error("cold recovery must not launch");
+            },
+            async reconcileWriterLaunch(context) {
+              reconcileCalls += 1;
+              assert.equal(
+                context.attempt.launchAttemptId,
+                launchAttemptId,
+              );
+              return frozenNullPrototypeRecord({
+                evidence: stoppedEvidence,
+                receiptVersion: LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION,
+                terminalRecord: stoppedFixture.terminalRecord,
+              });
+            },
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
+            supervisorId,
+          },
+        });
+
+        const result = await facade.reconcileLaunchAttempt({
+          launchAttemptId,
+        });
+        assert.equal(result.status, "complete-stopped");
+        assert.equal(result.writer, null);
+        assert.equal(launchCalls, 0);
+        assert.equal(reconcileCalls, 1);
+        const read = await authority.readWriterLaunchAttempt({
+          operationId: launchAttemptId,
+          stateOwnerId: INTEGRATION_STATE_OWNER_ID,
+        });
+        assertOperationReceipt(read, "committed");
+        assert.equal(read.status, "complete-stopped");
+        const authorization =
+          await authority.readWriterSupervisorStateGcAuthorization({
+            stateOwnerId: INTEGRATION_STATE_OWNER_ID,
+            terminalOperationId: launchAttemptId,
+          });
+        assert.equal(authorization.launchAttemptId, launchAttemptId);
+        assert.equal(
+          authorization.stateOwnerId,
+          INTEGRATION_STATE_OWNER_ID,
+        );
+        assert.deepEqual(
+          structuredClone(authorization.terminalRecord),
+          structuredClone(stoppedFixture.terminalRecord),
+        );
+        const pendingGc = await pool.query(
+          [
+            "SELECT state_owner_id, collected_at",
+            "FROM session_authority.writer_supervisor_state_gc",
+            "WHERE launch_attempt_id = $1",
+          ].join(" "),
+          [launchAttemptId],
+        );
+        assert.deepEqual(pendingGc.rows, [
+          {
+            collected_at: null,
+            state_owner_id: INTEGRATION_STATE_OWNER_ID,
+          },
+        ]);
       },
     );
 
