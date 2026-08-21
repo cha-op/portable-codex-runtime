@@ -722,6 +722,8 @@ class FakeAuthorityDatabase {
 class FakeAuthorityClient {
   constructor(database) {
     this.connection = new EventEmitter();
+    this.connection.execute = () => {};
+    this.connection.flush = () => {};
     this.connection.sync = () => {};
     this.database = database;
     this.heads = null;
@@ -803,9 +805,12 @@ class FakeAuthorityClient {
             rowCount += 1;
             this.database.streamRowsEmitted += 1;
             args[0].emit("row", row, args[0]._result);
+            if (rowCount % args[0].rows === 0) {
+              args[0].handlePortalSuspended(this.connection);
+            }
           });
           args[0].handleCommandComplete(
-            { text: `SELECT ${rowCount}` },
+            { text: `SELECT ${rowCount % args[0].rows}` },
             this.connection,
           );
           args[0].handleReadyForQuery(this.connection);
@@ -819,9 +824,12 @@ class FakeAuthorityClient {
           for (let index = 0; index < response.rows.length; index += 1) {
             this.database.streamRowsEmitted += 1;
             args[0].emit("row", response.rows[index], args[0]._result);
+            if ((index + 1) % args[0].rows === 0) {
+              args[0].handlePortalSuspended(this.connection);
+            }
           }
           args[0].handleCommandComplete(
-            { text: `SELECT ${response.rows.length}` },
+            { text: `SELECT ${response.rows.length % args[0].rows}` },
             this.connection,
           );
           args[0].handleReadyForQuery(this.connection);

@@ -80,9 +80,11 @@ superseded_by:
   sequentially with constant authority-owned working memory, then normalized
   again only for the current query batch. It returns a receipt only for an
   exact match under the exact head. The repository-pinned
-  `pg@8.22.0` portal fetches 1,024 rows at a time; the store accepts completion
-  only after exact `SELECT` command, row-count, empty-result-accumulator, and
-  transaction-identity checks. A server `ErrorResponse` sends one protocol
+  `pg@8.22.0` portal fetches 1,024 rows at a time; the store binds every
+  `PortalSuspended` to one complete 1,024-row batch and the terminal `SELECT`
+  count to the final partial batch, including `SELECT 0` after an exact
+  multiple. Completion also requires an empty result accumulator and the
+  transaction-identity recheck. A server `ErrorResponse` sends one protocol
   `Sync` before rollback waits for `ReadyForQuery`; a client-side query timeout
   or failed sync instead destroys the dedicated connection so rollback cannot
   remain queued behind an unrecoverable active query.

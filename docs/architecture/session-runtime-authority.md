@@ -2637,14 +2637,17 @@ and additional comparison memory. The prepared statement count is independent
 of prepared cardinality; origin statement count grows only by fixed 65,535-ID
 batches. This path is bound to the repository-pinned `pg@8.22.0` extended
 query portal with 1,024-row fetches. Completion requires one `RowDescription`,
-one `SELECT` command completion, an exact streamed row count, no accumulated
-`Result.rows`, and the transaction-identity recheck. A server `ErrorResponse`
-on that portal sends exactly one protocol `Sync`, waits for `ReadyForQuery`,
-and only then permits the queued rollback. A client-side query timeout or a
-failed protocol sync destroys the dedicated connection instead of queueing a
-rollback behind an unrecoverable active query. Normal version 3 appends keep
-`indexed-frame-v1`; arbitrary-age reads come from the permanent index. An
-adopted prepared row may later acquire a native indexed suffix.
+one `SELECT` command completion, exactly 1,024 observed rows before every
+`PortalSuspended`, a terminal `SELECT` count for the final partial batch, no
+accumulated `Result.rows`, and the transaction-identity recheck. An exact
+multiple therefore terminates with `SELECT 0` after its final suspension. A
+server `ErrorResponse` on that portal sends exactly one protocol `Sync`, waits
+for `ReadyForQuery`, and only then permits the queued rollback. A client-side
+query timeout or a failed protocol sync destroys the dedicated connection
+instead of queueing a rollback behind an unrecoverable active query. Normal
+version 3 appends keep `indexed-frame-v1`; arbitrary-age reads come from the
+permanent index. An adopted prepared row may later acquire a native indexed
+suffix.
 
 Filesystem candidate publication precedes the database adoption. Exact target
 head, marker, manifest, and full-row readback proves success after a lost COMMIT

@@ -16,6 +16,7 @@ const TRANSACTION_ID_QUERY =
   "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
+const POSTGRES_ROW_STREAM_FETCH_SIZE = 1024;
 const ArrayConstructor = Array;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
@@ -83,7 +84,7 @@ const postgresQueryConstructor = Query;
 const postgresQueryPrototype = Query.prototype;
 const bootstrapPostgresQuery = new Query({
   queryMode: "extended",
-  rows: 1024,
+  rows: POSTGRES_ROW_STREAM_FETCH_SIZE,
   text: "SELECT 1",
   values: objectFreeze([]),
 });
@@ -138,6 +139,11 @@ const postgresQueryHandleErrorIntrinsic = objectGetOwnPropertyDescriptor(
   postgresQueryPrototype,
   "handleError",
 ).value;
+const postgresQueryHandlePortalSuspendedIntrinsic =
+  objectGetOwnPropertyDescriptor(
+    postgresQueryPrototype,
+    "handlePortalSuspended",
+  ).value;
 const postgresQueryHandleRowDescriptionIntrinsic =
   objectGetOwnPropertyDescriptor(
     postgresQueryPrototype,
@@ -985,7 +991,7 @@ function createPostgresRowStreamQuery(text, values) {
     [
       objectFreeze({
         queryMode: "extended",
-        rows: 1024,
+        rows: POSTGRES_ROW_STREAM_FETCH_SIZE,
         text,
         values,
       }),
@@ -1058,6 +1064,8 @@ async function clientQueryRows(client, query, onRow, transactionError) {
   let commandCompleteCount = 0;
   let endCount = 0;
   let endResult;
+  let completedPortalRowCount = 0;
+  let portalSuspendedSequenceInvalid = false;
   let rowDescriptionCount = 0;
   let listenerAttached = false;
   let callbackFailure;
@@ -1167,6 +1175,28 @@ async function clientQueryRows(client, query, onRow, transactionError) {
         postgresQueryHandleRowDescriptionIntrinsic,
         query,
         [message],
+      );
+    },
+    writable: false,
+  });
+  objectDefineProperty(query, "handlePortalSuspended", {
+    configurable: false,
+    enumerable: false,
+    value(portalConnection) {
+      const nextCompletedPortalRowCount =
+        completedPortalRowCount + POSTGRES_ROW_STREAM_FETCH_SIZE;
+      if (
+        numberIsSafeInteger(nextCompletedPortalRowCount) &&
+        observedRowCount === nextCompletedPortalRowCount
+      ) {
+        completedPortalRowCount = nextCompletedPortalRowCount;
+      } else {
+        portalSuspendedSequenceInvalid = true;
+      }
+      return reflectApply(
+        postgresQueryHandlePortalSuspendedIntrinsic,
+        query,
+        [portalConnection],
       );
     },
     writable: false,
@@ -1291,6 +1321,19 @@ async function clientQueryRows(client, query, onRow, transactionError) {
     const currentResult = ownDataValue(query, "_result");
     const currentResults = ownDataValue(query, "_results");
     const resultRows = ownDataValue(expectedResult, "rows");
+    const terminalRowCount = ownDataValue(expectedResult, "rowCount");
+    let reportedTotalRowCount = numberNaN;
+    if (
+      !portalSuspendedSequenceInvalid &&
+      numberIsSafeInteger(terminalRowCount) &&
+      terminalRowCount >= 0 &&
+      terminalRowCount < POSTGRES_ROW_STREAM_FETCH_SIZE
+    ) {
+      const totalRowCount = completedPortalRowCount + terminalRowCount;
+      if (numberIsSafeInteger(totalRowCount)) {
+        reportedTotalRowCount = totalRowCount;
+      }
+    }
     if (
       endCount !== 1 ||
       !objectIs(endResult, expectedResult) ||
@@ -1301,7 +1344,7 @@ async function clientQueryRows(client, query, onRow, transactionError) {
       rowDescriptionCount !== 1 ||
       commandCompleteCount !== 1 ||
       ownDataValue(expectedResult, "command") !== "SELECT" ||
-      ownDataValue(expectedResult, "rowCount") !== observedRowCount ||
+      reportedTotalRowCount !== observedRowCount ||
       !isDenseEmptyBuiltInArray(resultRows)
     ) {
       callbackFailure = objectFreeze({

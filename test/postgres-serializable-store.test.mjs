@@ -439,7 +439,7 @@ function streamedRowsStep(
       let deliveredRows = 0;
       const recordDelivery = () => {
         deliveredRows += 1;
-        if (deliveredRows % 1024 === 0 && deliveredRows < totalRows) {
+        if (deliveredRows % 1024 === 0) {
           query.handlePortalSuspended(client.connection);
         }
       };
@@ -465,7 +465,7 @@ function streamedRowsStep(
       } else {
         beforeCommand?.(query, client);
         const messages =
-          commandMessages ?? [{ text: `SELECT ${totalRows}` }];
+          commandMessages ?? [{ text: `SELECT ${totalRows % 1024}` }];
         for (let index = 0; index < messages.length; index += 1) {
           query.handleCommandComplete(messages[index], client.connection);
         }
@@ -715,46 +715,53 @@ test("row streaming copies 0, 1, and 65535 primitive parameters", async (t) => {
   }
 });
 
-test("row streaming uses one portal query without accumulating Result rows", async () => {
-  const rowCount = 2_049;
-  const client = new FakeClient([
-    {},
-    timestampResult("2026-07-23T10:11:12.000Z"),
-    streamedRowsStep([], { protocolRows: rowCount }),
-    transactionIdResult(),
-    COMMIT_RESULT,
-  ]);
-  const store = new PostgresSerializableStore({
-    dedicatedPool: new FakePool([client]),
-  });
-  let count = 0;
-  await store.runSerializable((transaction) =>
-    consumePostgresSerializableTransactionRows(
-      transaction,
-      "SELECT operation_id FROM session_authority.operations",
-      [],
-      () => {
-        count += 1;
-      },
-    ),
-  );
-  assert.equal(count, rowCount);
-  assert.equal(
-    nonResetQueries(client).filter(
-      (args) =>
-        queryText(args) ===
-        "SELECT operation_id FROM session_authority.operations",
-    ).length,
-    1,
-  );
-  assert.deepEqual(client.portalExecutions, [
-    { portal: "", rows: 1024 },
-    { portal: "", rows: 1024 },
-  ]);
-  assert.equal(client.portalFlushes, 2);
-  assert.equal(client.portalSyncs, 1);
-  client.assertExhausted();
-});
+test(
+  "row streaming counts complete portal fetches without accumulating Result rows",
+  async (t) => {
+    for (const rowCount of [1_024, 1_025, 2_048, 2_049]) {
+      await t.test(String(rowCount), async () => {
+        const client = new FakeClient([
+          {},
+          timestampResult("2026-07-23T10:11:12.000Z"),
+          streamedRowsStep([], { protocolRows: rowCount }),
+          transactionIdResult(),
+          COMMIT_RESULT,
+        ]);
+        const store = new PostgresSerializableStore({
+          dedicatedPool: new FakePool([client]),
+        });
+        let count = 0;
+        await store.runSerializable((transaction) =>
+          consumePostgresSerializableTransactionRows(
+            transaction,
+            "SELECT operation_id FROM session_authority.operations",
+            [],
+            () => {
+              count += 1;
+            },
+          ),
+        );
+        assert.equal(count, rowCount);
+        assert.equal(
+          nonResetQueries(client).filter(
+            (args) =>
+              queryText(args) ===
+              "SELECT operation_id FROM session_authority.operations",
+          ).length,
+          1,
+        );
+        const portalSuspensionCount = Math.floor(rowCount / 1024);
+        assert.deepEqual(
+          client.portalExecutions,
+          new Array(portalSuspensionCount).fill({ portal: "", rows: 1024 }),
+        );
+        assert.equal(client.portalFlushes, portalSuspensionCount);
+        assert.equal(client.portalSyncs, 1);
+        client.assertExhausted();
+      });
+    }
+  },
+);
 
 test("pg Client.query keeps streaming callbacks hidden with and without a global timeout", async (t) => {
   for (const queryTimeout of [0, 25]) {
@@ -1115,6 +1122,21 @@ test("row streaming rejects malformed or incomplete terminal results", async (t)
     {
       name: "row-count-mismatch",
       options: { commandMessages: [{ text: "SELECT 2" }] },
+    },
+    {
+      name: "terminal-portal-row-count-mismatch",
+      options: {
+        commandMessages: [{ text: "SELECT 2" }],
+        protocolRows: 1_024,
+      },
+    },
+    {
+      name: "misaligned-portal-suspension",
+      options: {
+        beforeCommand(query, client) {
+          query.handlePortalSuspended(client.connection);
+        },
+      },
     },
     {
       name: "multiple-command-results",
