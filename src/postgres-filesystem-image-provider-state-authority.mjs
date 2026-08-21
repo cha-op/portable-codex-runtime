@@ -3250,13 +3250,8 @@ function normalizeProjectionRequestOuter(value, code) {
     input.preparedProjectionChecksum,
     code,
   );
-  const attachmentOrigins = normalizeAttachmentOrigins(
-    input.attachmentOrigins,
-    structuralBound,
-    code,
-  );
   return objectFreeze({
-    attachmentOrigins,
+    attachmentOrigins: input.attachmentOrigins,
     expectedHead,
     preparedOperationCount: input.preparedOperationCount,
     preparedProjectionChecksum,
@@ -3450,19 +3445,24 @@ function createAuthoritySurface(args, runtimeOnly) {
         input.expectedHead.contractVersion,
       );
       if (!headEqual(observedHead.head, input.expectedHead)) return null;
+      const structuralBound =
+        observedHead.head.checkpointFrameCount + observedHead.head.frameCount;
+      const attachmentOrigins = normalizeAttachmentOrigins(
+        input.attachmentOrigins,
+        structuralBound,
+        requestCode,
+      );
+      ensure(attachmentOrigins.count <= structuralBound, requestCode);
       ensure(
         input.expectedHead.contractVersion ===
           FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
         stateCode,
       );
       requireExpectedOperationIndex(observedHead, input.expectedHead, stateCode);
-      const structuralBound =
-        observedHead.head.checkpointFrameCount + observedHead.head.frameCount;
       ensure(
         input.preparedOperationCount <= structuralBound,
         requestCode,
       );
-      ensure(input.attachmentOrigins.count <= structuralBound, requestCode);
       const prepared = await comparePreparedProjectionInTransaction(
         transaction,
         identity,
@@ -3477,12 +3477,12 @@ function createAuthoritySurface(args, runtimeOnly) {
           transaction,
           identity,
           observedHead,
-          input.attachmentOrigins,
+          attachmentOrigins,
           stateCode,
         );
       if (prepared === null || attachmentOriginsChecksum === null) return null;
       const receipt = objectFreeze({
-        attachmentOriginCount: input.attachmentOrigins.count,
+        attachmentOriginCount: attachmentOrigins.count,
         attachmentOriginsChecksum,
         expectedHeadChecksum: canonicalHeadChecksum(
           observedHead.head,

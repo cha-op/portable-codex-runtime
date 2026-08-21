@@ -2069,73 +2069,107 @@ test("runtime projection keeps corrupt head markers and rows state-invalid", asy
   });
 });
 
-test("runtime projection trusts only the exact stored head for array bounds", async () => {
-  const fixture = projectionFixture({ preparedCount: 0 });
-  const oversizedOrigins = Object.freeze([
-    fixture.attachmentOrigins[0],
-    Object.freeze({
-      ...fixture.attachmentOrigins[0],
-      operationId: "attach-operation-extra-1",
-      storageId: "origin-storage-extra-1",
-    }),
-    Object.freeze({
-      ...fixture.attachmentOrigins[0],
-      operationId: "attach-operation-extra-2",
-      storageId: "origin-storage-extra-2",
-    }),
-  ]);
-  await assert.rejects(
-    fixture.runtimeAuthority.compareProjection({
-      ...fixture.request,
-      attachmentOrigins: oversizedOrigins,
-    }),
-    authorityError(
-      "invalid_postgres_filesystem_image_provider_state_authority_request",
-    ),
-  );
-  assert.equal(
-    fixture.database.queries.some(([text]) =>
-      text.includes("filesystem_image_provider_operations"),
-    ),
-    false,
-  );
+test(
+  "runtime projection trusts only the exact stored head for array bounds",
+  { concurrency: false },
+  async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const oversizedOrigins = Object.freeze([
+      fixture.attachmentOrigins[0],
+      Object.freeze({
+        ...fixture.attachmentOrigins[0],
+        operationId: "attach-operation-extra-1",
+        storageId: "origin-storage-extra-1",
+      }),
+      Object.freeze({
+        ...fixture.attachmentOrigins[0],
+        operationId: "attach-operation-extra-2",
+        storageId: "origin-storage-extra-2",
+      }),
+    ]);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        attachmentOrigins: oversizedOrigins,
+      }),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+    assert.equal(
+      fixture.database.queries.filter(([text]) =>
+        text.includes("filesystem_image_provider_heads"),
+      ).length,
+      1,
+    );
+    assert.equal(
+      fixture.database.queries.some(([text]) =>
+        text.includes("filesystem_image_provider_operations"),
+      ),
+      false,
+    );
 
-  fixture.database.queries.length = 0;
-  let proxyTrapCalls = 0;
-  const hostileOrigins = new Proxy([], {
-    get() {
-      proxyTrapCalls += 1;
-      throw new Error("hostile projection array get trap");
-    },
-    ownKeys() {
-      proxyTrapCalls += 1;
-      throw new Error("hostile projection array ownKeys trap");
-    },
-  });
-  const forgedHead = {
-    ...fixture.expectedHead,
-    anchorRevision: "65535",
-    stateRevision: "65535",
-    frameCount: 65_535,
-  };
-  await assert.rejects(
-    fixture.runtimeAuthority.compareProjection({
-      ...fixture.request,
-      attachmentOrigins: hostileOrigins,
-      expectedHead: forgedHead,
-    }),
-    authorityError(
-      "invalid_postgres_filesystem_image_provider_state_authority_request",
-    ),
-  );
-  assert.equal(proxyTrapCalls, 0);
-  assert.equal(
-    fixture.database.queries.some(([text]) =>
-      text.includes("filesystem_image_provider_operations"),
-    ),
-    false,
-  );
-});
+    fixture.database.queries.length = 0;
+    const hostileOrigins = Object.freeze(
+      new Array(65_535).fill(fixture.attachmentOrigins[0]),
+    );
+    const forgedHead = {
+      ...fixture.expectedHead,
+      anchorRevision: "65535",
+      stateRevision: "65535",
+      frameCount: 65_535,
+    };
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(
+      Reflect,
+      "ownKeys",
+    );
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    let hostileOriginEnumerations = 0;
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(target) {
+        if (target === hostileOrigins) hostileOriginEnumerations += 1;
+        return Reflect.apply(ownKeysDescriptor.value, this, [target]);
+      },
+    });
+    try {
+      const authorityModule = await import(
+        "../src/postgres-filesystem-image-provider-state-authority.mjs?runtime-projection-head-first-test"
+      );
+      const runtimeAuthority =
+        authorityModule.createPostgresFilesystemImageProviderStateRuntimeAuthority(
+          {
+            store: fixture.store,
+            providerId: "filesystem-image-ext4",
+            anchorId: "host-primary",
+          },
+        );
+      assert.equal(
+        await runtimeAuthority.compareProjection({
+          ...fixture.request,
+          attachmentOrigins: hostileOrigins,
+          expectedHead: forgedHead,
+        }),
+        null,
+      );
+    } finally {
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+    assert.equal(hostileOriginEnumerations, 0);
+    assert.equal(
+      fixture.database.queries.filter(([text]) =>
+        text.includes("filesystem_image_provider_heads"),
+      ).length,
+      1,
+    );
+    assert.equal(
+      fixture.database.queries.some(([text]) =>
+        text.includes("filesystem_image_provider_operations"),
+      ),
+      false,
+    );
+  },
+);
 
 test("runtime projection streams prepared and origin reads once in one transaction", async () => {
   const fixture = projectionFixture({ originCount: 9, preparedCount: 9 });

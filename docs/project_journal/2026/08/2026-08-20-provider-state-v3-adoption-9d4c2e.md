@@ -147,6 +147,10 @@ superseded_by:
   apply only to adoption version 1; a legal version 3 runtime projection is
   instead bounded by its exact stored head and streamed attachment-origin
   batches, not by the adoption envelope.
+- Runtime projection reads and validates the exact stored head before it
+  enumerates or canonicalizes caller-supplied attachment origins. A stale or
+  forged expected head therefore cannot select a larger normalization bound or
+  force caller-scale allocation before the mismatch is returned.
 - The filesystem candidate and `pending` marker are durable before the
   database cut. A definite unchanged outcome removes only that candidate and
   its marker; an uncertain outcome never guesses which generation is
