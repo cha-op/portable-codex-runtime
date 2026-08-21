@@ -6,12 +6,17 @@ import test from "node:test";
 
 import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   filesystemImageProviderStateHeadChecksum,
 } from "../src/filesystem-image-provider-state.mjs";
 import {
   POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_AUTHORITY_CONTRACT_VERSION,
+  POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION,
+  POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT_VERSION,
   PostgresFilesystemImageProviderStateAuthorityError,
+  createPostgresFilesystemImageProviderStateAdoptionAuthority,
   createPostgresFilesystemImageProviderStateAuthority,
+  createPostgresFilesystemImageProviderStateRuntimeAuthority,
 } from "../src/postgres-filesystem-image-provider-state-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -19,7 +24,7 @@ import {
 } from "../src/postgres-serializable-store.mjs";
 
 const GENESIS = Object.freeze({
-  contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   anchorRevision: "0",
   generation: "0",
   stateRevision: "0",
@@ -32,10 +37,31 @@ const GENESIS = Object.freeze({
   lastChecksum: null,
   ledgerBytes: 0,
 });
+const V3_GENESIS = Object.freeze({
+  ...GENESIS,
+  contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+});
 const RECORD_DOMAIN = Buffer.from(
   "portable-codex/filesystem-image-provider-state/operation-record/v1\0",
   "utf8",
 );
+const PREPARED_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/prepared-projection/v1\0",
+  "utf8",
+);
+const STABLE_STORAGE_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/stable-storage-projection/v1\0",
+  "utf8",
+);
+const ATTACHMENT_ORIGIN_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/attachment-origin-projection/v1\0",
+  "utf8",
+);
+const AUTHORITY_PROJECTION_RECEIPT_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/authority-projection-receipt/v1\0",
+  "utf8",
+);
+const MAX_CANONICAL_REQUEST_BYTES = 768 * 1024;
 
 function successor(value) {
   return (BigInt(value) + 1n).toString();
@@ -70,6 +96,24 @@ function rotationHead(expectedHead) {
     checkpointFrameCount: 2,
     checkpointChecksum,
     checkpointBytes: 768,
+    frameCount: 0,
+    lastChecksum: checkpointChecksum,
+    ledgerBytes: 0,
+  };
+}
+
+function adoptionHead(expectedHead) {
+  const checkpointChecksum = "e".repeat(64);
+  return {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    anchorRevision: successor(expectedHead.anchorRevision),
+    generation: successor(expectedHead.generation),
+    stateRevision: expectedHead.stateRevision,
+    baseHeadChecksum: filesystemImageProviderStateHeadChecksum(expectedHead),
+    checkpointStateRevision: expectedHead.stateRevision,
+    checkpointFrameCount: 3,
+    checkpointChecksum,
+    checkpointBytes: 896,
     frameCount: 0,
     lastChecksum: checkpointChecksum,
     ledgerBytes: 0,
@@ -130,6 +174,41 @@ function provisionedStorage(storageId = "storage-1") {
   };
 }
 
+function attachedStorage(storageId = "storage-1") {
+  const provisioned = provisionedStorage(storageId);
+  const dataRoot = {
+    rootPath: `${provisioned.mount.mountPath}/root`,
+    imageIdentity: provisioned.mount.imageIdentity,
+    rootIdentity: {
+      filesystemId: provisioned.filesystemId,
+      objectIdentityScheme: "linux-dev-inode",
+      objectId: `1:5:${storageId}`,
+    },
+  };
+  return {
+    ...provisioned,
+    lifecycle: "attached",
+    revision: "2",
+    writerEpoch: "1",
+    writerAuthority: {
+      fencingEpoch: "1",
+      holderId: "holder-1",
+      leaseId: "lease-1",
+    },
+    dataRoot,
+    attachment: {
+      attachmentId: `attachment-${storageId}`,
+      leaseId: "lease-1",
+      holderId: "holder-1",
+      fencingEpoch: "1",
+      rootPath: dataRoot.rootPath,
+      proofId: `proof-${storageId}`,
+      imageIdentity: dataRoot.imageIdentity,
+      rootIdentity: dataRoot.rootIdentity,
+    },
+  };
+}
+
 function committedRecord(prepared, revision = "2") {
   return {
     ...prepared,
@@ -138,6 +217,418 @@ function committedRecord(prepared, revision = "2") {
     expectedStorage: null,
     result: { status: "created" },
     storageState: provisionedStorage(prepared.storageId),
+  };
+}
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalJson).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
+}
+
+function countedProjectionChecksum(domain, values) {
+  const hash = createHash("sha256")
+    .update(domain)
+    .update(Buffer.from(`${values.length}\0`, "ascii"));
+  for (const value of values) {
+    const bytes = Buffer.from(canonicalJson(value), "utf8");
+    hash.update(Buffer.from(`${bytes.length}\0`, "ascii")).update(bytes);
+  }
+  return hash.digest("hex");
+}
+
+function generatedCountedProjectionChecksum(domain, count, valueAt) {
+  const hash = createHash("sha256")
+    .update(domain)
+    .update(Buffer.from(`${count}\0`, "ascii"));
+  for (let index = 0; index < count; index += 1) {
+    const bytes = Buffer.from(canonicalJson(valueAt(index)), "utf8");
+    hash.update(Buffer.from(`${bytes.length}\0`, "ascii")).update(bytes);
+  }
+  return hash.digest("hex");
+}
+
+function stableStorageChecksum(storage) {
+  return createHash("sha256")
+    .update(STABLE_STORAGE_PROJECTION_DOMAIN)
+    .update(Buffer.from(canonicalJson({ ...storage, revision: "1" }), "utf8"))
+    .digest("hex");
+}
+
+function projectionReceiptChecksum({
+  attachmentOrigins,
+  expectedHead,
+  preparedOperations,
+}) {
+  const attachmentOriginsChecksum = countedProjectionChecksum(
+    ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
+    attachmentOrigins,
+  );
+  const preparedProjectionChecksum = countedProjectionChecksum(
+    PREPARED_PROJECTION_DOMAIN,
+    preparedOperations,
+  );
+  return createHash("sha256")
+    .update(AUTHORITY_PROJECTION_RECEIPT_DOMAIN)
+    .update(
+      Buffer.from(
+        canonicalJson({
+          attachmentOriginCount: attachmentOrigins.length,
+          attachmentOriginsChecksum,
+          expectedHeadChecksum:
+            filesystemImageProviderStateHeadChecksum(expectedHead),
+          preparedOperationCount: preparedOperations.length,
+          preparedProjectionChecksum,
+        }),
+        "utf8",
+      ),
+    )
+    .digest("hex");
+}
+
+function recordBytesAndDigest(record) {
+  const bytes = Buffer.from(canonicalJson(record), "utf8");
+  const sha256 = createHash("sha256")
+    .update(RECORD_DOMAIN)
+    .update(bytes)
+    .digest("hex");
+  return { bytes, sha256 };
+}
+
+function storedOperationRow(record, committedChecksum) {
+  const prepared = {
+    kind: record.kind,
+    operationId: record.operationId,
+    preparedChecksum: record.preparedChecksum,
+    preparedStateRevision: record.preparedStateRevision,
+    request: record.request,
+    state: "prepared",
+    storageId: record.storageId,
+    storageStateBefore: record.storageStateBefore,
+  };
+  const preparedMaterial = recordBytesAndDigest(prepared);
+  const committedMaterial = recordBytesAndDigest(record);
+  return {
+    provider_id: "filesystem-image-ext4",
+    anchor_id: "host-primary",
+    operation_id: record.operationId,
+    record_contract_version: 1,
+    state: "committed",
+    kind: record.kind,
+    storage_id: record.storageId,
+    prepared_state_revision: record.preparedStateRevision,
+    prepared_checksum: record.preparedChecksum,
+    prepared_record_bytes: preparedMaterial.bytes,
+    prepared_record_sha256: preparedMaterial.sha256,
+    committed_state_revision: record.committedStateRevision,
+    committed_checksum_provenance: "indexed-frame-v1",
+    committed_checksum: committedChecksum,
+    committed_record_bytes: committedMaterial.bytes,
+    committed_record_sha256: committedMaterial.sha256,
+    adoption_id: null,
+  };
+}
+
+function storedPreparedOperationRow(record) {
+  const material = recordBytesAndDigest(record);
+  return {
+    provider_id: "filesystem-image-ext4",
+    anchor_id: "host-primary",
+    operation_id: record.operationId,
+    record_contract_version: 1,
+    state: "prepared",
+    kind: record.kind,
+    storage_id: record.storageId,
+    prepared_state_revision: record.preparedStateRevision,
+    prepared_checksum: record.preparedChecksum,
+    prepared_record_bytes: material.bytes,
+    prepared_record_sha256: material.sha256,
+    committed_state_revision: null,
+    committed_checksum_provenance: null,
+    committed_checksum: null,
+    committed_record_bytes: null,
+    committed_record_sha256: null,
+    adoption_id: null,
+  };
+}
+
+function projectionFixture({ originCount = 1, preparedCount = 1 } = {}) {
+  const fixture = createFixture();
+  const attachmentOrigins = [];
+  const preparedOperations = [];
+  let revision = 0;
+  let lastChecksum = null;
+  for (let index = 0; index < originCount; index += 1) {
+    const ordinal = String(index + 1).padStart(3, "0");
+    const storageId = `origin-storage-${ordinal}`;
+    const operationId = `attach-operation-${ordinal}`;
+    const preparedChecksum = createHash("sha256")
+      .update(`prepared-${ordinal}`)
+      .digest("hex");
+    const committedChecksum = createHash("sha256")
+      .update(`committed-${ordinal}`)
+      .digest("hex");
+    const prepared = preparedRecord({
+      checksum: preparedChecksum,
+      kind: "attach",
+      operationId,
+      revision: String(++revision),
+      storageId,
+      storageStateBefore: provisionedStorage(storageId),
+    });
+    const storageState = attachedStorage(storageId);
+    const committed = {
+      ...prepared,
+      state: "committed",
+      committedStateRevision: String(++revision),
+      expectedStorage: { lifecycle: "provisioned", revision: "1" },
+      result: { status: "attached" },
+      storageState,
+    };
+    fixture.database.operations.set(
+      operationKey("filesystem-image-ext4", "host-primary", operationId),
+      storedOperationRow(committed, committedChecksum),
+    );
+    attachmentOrigins.push(
+      Object.freeze({
+        currentStorageRevision: storageState.revision,
+        operationId,
+        stableStorageChecksum: stableStorageChecksum(storageState),
+        storageId,
+      }),
+    );
+    lastChecksum = committedChecksum;
+  }
+  for (let index = 0; index < preparedCount; index += 1) {
+    const ordinal = String(index + 1).padStart(3, "0");
+    const storageId = `prepared-storage-${ordinal}`;
+    const operationId = `prepared-operation-${ordinal}`;
+    const checksum = createHash("sha256")
+      .update(`pending-${ordinal}`)
+      .digest("hex");
+    const prepared = preparedRecord({
+      checksum,
+      operationId,
+      revision: String(++revision),
+      storageId,
+    });
+    fixture.database.operations.set(
+      operationKey("filesystem-image-ext4", "host-primary", operationId),
+      storedPreparedOperationRow(prepared),
+    );
+    preparedOperations.push(prepared);
+    lastChecksum = checksum;
+  }
+  const expectedHead = Object.freeze({
+    ...V3_GENESIS,
+    anchorRevision: String(revision),
+    stateRevision: String(revision),
+    frameCount: revision,
+    lastChecksum,
+    ledgerBytes: revision * 128,
+  });
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(expectedHead),
+  );
+  const frozenOrigins = Object.freeze(attachmentOrigins);
+  const request = {
+    attachmentOrigins: frozenOrigins,
+    expectedHead,
+    preparedOperationCount: preparedOperations.length,
+    preparedProjectionChecksum: countedProjectionChecksum(
+      PREPARED_PROJECTION_DOMAIN,
+      preparedOperations,
+    ),
+  };
+  return {
+    ...fixture,
+    attachmentOrigins: frozenOrigins,
+    expectedHead,
+    preparedOperations,
+    request,
+  };
+}
+
+function largeRuntimeProjectionHead() {
+  return Object.freeze({
+    ...V3_GENESIS,
+    anchorRevision: "65537",
+    generation: "1",
+    stateRevision: "65536",
+    baseHeadChecksum: "c".repeat(64),
+    checkpointStateRevision: "65536",
+    checkpointFrameCount: 65_538,
+    checkpointChecksum: "d".repeat(64),
+    checkpointBytes: 1,
+    frameCount: 0,
+    lastChecksum: "d".repeat(64),
+    ledgerBytes: 0,
+  });
+}
+
+function largePreparedProjectionRecord(index) {
+  const ordinal = String(index).padStart(5, "0");
+  return preparedRecord({
+    checksum: "b".repeat(64),
+    operationId: `operation-${ordinal}`,
+    revision: String(index + 1),
+    storageId: `storage-${ordinal}`,
+  });
+}
+
+function largeAttachmentOriginsFixture() {
+  const fixture = createFixture();
+  const count = 65_536;
+  const expectedHead = largeRuntimeProjectionHead();
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(expectedHead),
+  );
+  const attachmentOrigins = new Array(count);
+  for (let index = 0; index < count; index += 1) {
+    const ordinal = String(index).padStart(5, "0");
+    attachmentOrigins[index] = Object.freeze({
+      currentStorageRevision: "2",
+      operationId: `operation-${ordinal}`,
+      stableStorageChecksum: "b".repeat(64),
+      storageId: `storage-${ordinal}`,
+    });
+  }
+  const lastOrigin = attachmentOrigins[count - 1];
+  const lastStorageState = attachedStorage(lastOrigin.storageId);
+  attachmentOrigins[count - 1] = Object.freeze({
+    ...lastOrigin,
+    stableStorageChecksum: stableStorageChecksum(lastStorageState),
+  });
+  Object.freeze(attachmentOrigins);
+  const prepared = preparedRecord({
+    checksum: "e".repeat(64),
+    kind: "attach",
+    operationId: lastOrigin.operationId,
+    revision: "1",
+    storageId: lastOrigin.storageId,
+    storageStateBefore: provisionedStorage(lastOrigin.storageId),
+  });
+  const committed = {
+    ...prepared,
+    state: "committed",
+    committedStateRevision: "2",
+    expectedStorage: { lifecycle: "provisioned", revision: "1" },
+    result: { status: "attached" },
+    storageState: lastStorageState,
+  };
+  const lastOperationKey = operationKey(
+    "filesystem-image-ext4",
+    "host-primary",
+    lastOrigin.operationId,
+  );
+  fixture.database.operations.set(
+    lastOperationKey,
+    storedOperationRow(committed, "f".repeat(64)),
+  );
+  return {
+    ...fixture,
+    attachmentOrigins,
+    expectedHead,
+    lastOperationKey,
+  };
+}
+
+function maxCanonicalPreparedProjectionFixture(preparedCount) {
+  const fixture = projectionFixture({ originCount: 0, preparedCount });
+  const preparedOperations = fixture.preparedOperations.map((record) => {
+    const emptyRequest = { payload: "", storageId: record.storageId };
+    const payloadLength =
+      MAX_CANONICAL_REQUEST_BYTES -
+      Buffer.byteLength(canonicalJson(emptyRequest), "utf8");
+    const request = {
+      payload: "x".repeat(payloadLength),
+      storageId: record.storageId,
+    };
+    assert.equal(
+      Buffer.byteLength(canonicalJson(request), "utf8"),
+      MAX_CANONICAL_REQUEST_BYTES,
+    );
+    const expanded = { ...record, request };
+    fixture.database.operations.set(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        expanded.operationId,
+      ),
+      storedPreparedOperationRow(expanded),
+    );
+    return expanded;
+  });
+  return {
+    ...fixture,
+    preparedOperations,
+    request: {
+      ...fixture.request,
+      preparedProjectionChecksum: countedProjectionChecksum(
+        PREPARED_PROJECTION_DOMAIN,
+        preparedOperations,
+      ),
+    },
+  };
+}
+
+function completeProvisionAdoptionFixture(operationCount, payload = null) {
+  const fixture = createFixture();
+  const operations = [];
+  const storages = [];
+  for (let index = 0; index < operationCount; index += 1) {
+    const ordinal = String(index + 1).padStart(3, "0");
+    const storageId = `storage-${ordinal}`;
+    const prepared = {
+      ...preparedRecord({
+        operationId: `operation-${ordinal}`,
+        revision: String(index * 2 + 1),
+        storageId,
+      }),
+      request:
+        payload === null ? { storageId } : { payload, storageId },
+    };
+    const committed = {
+      ...committedRecord(prepared, String(index * 2 + 2)),
+      result:
+        payload === null
+          ? { status: "created" }
+          : { payload, status: "created" },
+    };
+    operations.push(committed);
+    storages.push({
+      currentAttachmentOriginOperationId: null,
+      storage: committed.storageState,
+    });
+  }
+  const eventCount = operationCount * 2;
+  const expectedHead = {
+    ...GENESIS,
+    anchorRevision: String(eventCount),
+    stateRevision: String(eventCount),
+    frameCount: eventCount,
+    lastChecksum: "c".repeat(64),
+    ledgerBytes: eventCount,
+  };
+  return {
+    ...fixture,
+    expectedHead,
+    operations,
+    request: {
+      expectedHead,
+      nextHead: adoptionHead(expectedHead),
+      operations,
+      storages,
+    },
   };
 }
 
@@ -151,6 +642,35 @@ function operationKey(providerId, anchorId, operationId) {
 
 function copyHeadRow(row) {
   return { ...row };
+}
+
+function headRow(
+  head,
+  {
+    adoptionId = null,
+    adoptionXid = null,
+    operationIndexStateRevision = head.stateRevision,
+  } = {},
+) {
+  return {
+    provider_id: "filesystem-image-ext4",
+    anchor_id: "host-primary",
+    contract_version: head.contractVersion,
+    anchor_revision: head.anchorRevision,
+    generation: head.generation,
+    state_revision: head.stateRevision,
+    base_head_checksum: head.baseHeadChecksum,
+    checkpoint_state_revision: head.checkpointStateRevision,
+    checkpoint_frame_count: String(head.checkpointFrameCount),
+    checkpoint_checksum: head.checkpointChecksum,
+    checkpoint_bytes: String(head.checkpointBytes),
+    frame_count: String(head.frameCount),
+    last_checksum: head.lastChecksum,
+    ledger_bytes: String(head.ledgerBytes),
+    operation_index_state_revision: operationIndexStateRevision,
+    operation_index_adoption_id: adoptionId,
+    operation_index_adoption_xid: adoptionXid,
+  };
 }
 
 function copyOperationRow(row) {
@@ -177,11 +697,16 @@ class FakeAuthorityDatabase {
     this.heads = new Map();
     this.operations = new Map();
     this.failCommitOnce = false;
+    this.failCommitBeforeDurabilityOnce = false;
+    this.afterCommitOnce = null;
     this.forceHeadCasMissOnce = false;
     this.forceOperationMutationMissOnce = false;
+    this.attachmentOriginReadOverride = null;
     this.operationReadOverride = null;
+    this.operationStreamOverride = null;
     this.queries = [];
     this.releaseCalls = [];
+    this.streamRowsEmitted = 0;
   }
 
   createPool() {
@@ -197,12 +722,19 @@ class FakeAuthorityDatabase {
 class FakeAuthorityClient {
   constructor(database) {
     this.connection = new EventEmitter();
+    this.connection.sync = () => {};
     this.database = database;
     this.heads = null;
     this.operations = null;
   }
 
-  async query(...args) {
+  query(...args) {
+    const streamQuery =
+      typeof args[0] === "object" &&
+      args[0] !== null &&
+      args[0].queryMode === "extended" &&
+      args[0].rows === 1024 &&
+      typeof args[0].submit === "function";
     const text = typeof args[0] === "string" ? args[0] : args[0].text;
     const values = typeof args[0] === "string" ? args[1] : args[0].values;
     this.database.queries.push([text, values]);
@@ -238,8 +770,17 @@ class FakeAuthorityClient {
       return result("ROLLBACK");
     }
     if (text === "COMMIT") {
+      if (this.database.failCommitBeforeDurabilityOnce) {
+        this.database.failCommitBeforeDurabilityOnce = false;
+        throw new Error("commit outcome unavailable before durability");
+      }
       this.database.heads = this.heads;
       this.database.operations = this.operations;
+      if (this.database.afterCommitOnce !== null) {
+        const mutate = this.database.afterCommitOnce;
+        this.database.afterCommitOnce = null;
+        mutate(this.database);
+      }
       if (this.database.failCommitOnce) {
         this.database.failCommitOnce = false;
         throw new Error("commit acknowledgement lost");
@@ -252,7 +793,42 @@ class FakeAuthorityClient {
     if (
       text.includes("session_authority.filesystem_image_provider_operations")
     ) {
-      return this.#operationQuery(text, values);
+      if (streamQuery && this.database.operationStreamOverride !== null) {
+        const emitOverride = this.database.operationStreamOverride;
+        this.database.operationStreamOverride = null;
+        args[0].handleRowDescription({ fields: [] });
+        queueMicrotask(() => {
+          let rowCount = 0;
+          emitOverride((row) => {
+            rowCount += 1;
+            this.database.streamRowsEmitted += 1;
+            args[0].emit("row", row, args[0]._result);
+          });
+          args[0].handleCommandComplete(
+            { text: `SELECT ${rowCount}` },
+            this.connection,
+          );
+          args[0].handleReadyForQuery(this.connection);
+        });
+        return args[0];
+      }
+      const response = this.#operationQuery(text, values);
+      if (streamQuery) {
+        args[0].handleRowDescription({ fields: [] });
+        queueMicrotask(() => {
+          for (let index = 0; index < response.rows.length; index += 1) {
+            this.database.streamRowsEmitted += 1;
+            args[0].emit("row", response.rows[index], args[0]._result);
+          }
+          args[0].handleCommandComplete(
+            { text: `SELECT ${response.rows.length}` },
+            this.connection,
+          );
+          args[0].handleReadyForQuery(this.connection);
+        });
+        return args[0];
+      }
+      return response;
     }
     throw new Error(`unexpected fake query: ${text}`);
   }
@@ -288,9 +864,55 @@ class FakeAuthorityClient {
         last_checksum: values[12],
         ledger_bytes: values[13],
         operation_index_state_revision: values[14],
+        operation_index_adoption_id: null,
+        operation_index_adoption_xid: null,
       };
       this.heads.set(identity, stored);
       return result("INSERT", [copyHeadRow(stored)]);
+    }
+    if (text.includes("operation_index_adoption_id = $16")) {
+      const stored = this.heads.get(identity);
+      if (
+        stored === undefined ||
+        stored.contract_version !== values[16] ||
+        stored.anchor_revision !== values[17] ||
+        stored.generation !== values[18] ||
+        stored.state_revision !== values[19] ||
+        stored.base_head_checksum !== values[20] ||
+        stored.checkpoint_state_revision !== values[21] ||
+        stored.checkpoint_frame_count !== values[22] ||
+        stored.checkpoint_checksum !== values[23] ||
+        stored.checkpoint_bytes !== values[24] ||
+        stored.frame_count !== values[25] ||
+        stored.last_checksum !== values[26] ||
+        stored.ledger_bytes !== values[27] ||
+        stored.operation_index_state_revision !== values[28] ||
+        stored.operation_index_adoption_id !== null ||
+        stored.operation_index_adoption_xid !== null
+      ) {
+        return result("UPDATE");
+      }
+      const updated = {
+        provider_id: values[0],
+        anchor_id: values[1],
+        contract_version: values[2],
+        anchor_revision: values[3],
+        generation: values[4],
+        state_revision: values[5],
+        base_head_checksum: values[6],
+        checkpoint_state_revision: values[7],
+        checkpoint_frame_count: values[8],
+        checkpoint_checksum: values[9],
+        checkpoint_bytes: values[10],
+        frame_count: values[11],
+        last_checksum: values[12],
+        ledger_bytes: values[13],
+        operation_index_state_revision: values[14],
+        operation_index_adoption_id: values[15],
+        operation_index_adoption_xid: "1",
+      };
+      this.heads.set(identity, updated);
+      return result("UPDATE", [copyHeadRow(updated)]);
     }
     const stored = this.heads.get(identity);
     if (
@@ -327,6 +949,8 @@ class FakeAuthorityClient {
       last_checksum: values[12],
       ledger_bytes: values[13],
       operation_index_state_revision: values[14],
+      operation_index_adoption_id: stored.operation_index_adoption_id,
+      operation_index_adoption_xid: stored.operation_index_adoption_xid,
     };
     this.heads.set(identity, updated);
     return result("UPDATE", [copyHeadRow(updated)]);
@@ -347,6 +971,31 @@ class FakeAuthorityClient {
           "SELECT",
           stored === undefined ? [] : [copyOperationRow(stored)],
         );
+      }
+      if (text.includes("operation_id = ANY($3::text[])")) {
+        if (this.database.attachmentOriginReadOverride !== null) {
+          const overridden = this.database.attachmentOriginReadOverride;
+          this.database.attachmentOriginReadOverride = null;
+          return overridden;
+        }
+        const operationIds = new Set(values[2].slice(2, -2).split('","'));
+        const rows = [...this.operations.values()]
+          .filter(
+            (row) =>
+              row.provider_id === values[0] &&
+              row.anchor_id === values[1] &&
+              operationIds.has(row.operation_id),
+          )
+          .sort((left, right) =>
+            left.operation_id < right.operation_id
+              ? -1
+              : left.operation_id > right.operation_id
+                ? 1
+                : 0,
+          )
+          .slice(0, Number(values[3]))
+          .map(copyOperationRow);
+        return result("SELECT", rows);
       }
       if (text.includes("storage_id = $3")) {
         const rows = [...this.operations.values()]
@@ -375,19 +1024,35 @@ class FakeAuthorityClient {
       }
       const after = text.includes("operation_id COLLATE") && values.length === 4
         ? values[2]
-        : null;
+        : text.includes("storage_id COLLATE") && values.length === 4
+          ? values[2]
+          : null;
       const maximumRows = Number(values[values.length - 1]);
       const rows = [...this.operations.values()]
         .filter(
           (row) =>
             row.provider_id === values[0] &&
             row.anchor_id === values[1] &&
-            (after === null || row.operation_id > after),
+            (!text.includes("state = 'prepared'") || row.state === "prepared") &&
+            (after === null ||
+              (text.includes("storage_id COLLATE")
+                ? row.storage_id > after
+                : row.operation_id > after)),
         )
         .sort((left, right) =>
-          left.operation_id < right.operation_id
+          (text.includes("storage_id COLLATE")
+            ? left.storage_id
+            : left.operation_id) <
+          (text.includes("storage_id COLLATE")
+            ? right.storage_id
+            : right.operation_id)
             ? -1
-            : left.operation_id > right.operation_id
+            : (text.includes("storage_id COLLATE")
+                  ? left.storage_id
+                  : left.operation_id) >
+                (text.includes("storage_id COLLATE")
+                  ? right.storage_id
+                  : right.operation_id)
               ? 1
               : 0,
         )
@@ -399,30 +1064,48 @@ class FakeAuthorityClient {
       this.database.forceOperationMutationMissOnce = false;
       return result(text.startsWith("INSERT ") ? "INSERT" : "UPDATE");
     }
-    const key = operationKey(values[0], values[1], values[2]);
     if (text.startsWith("INSERT ")) {
-      if (this.operations.has(key)) return result("INSERT");
-      const stored = {
-        provider_id: values[0],
-        anchor_id: values[1],
-        operation_id: values[2],
-        record_contract_version: values[3],
-        state: values[4],
-        kind: values[5],
-        storage_id: values[6],
-        prepared_state_revision: values[7],
-        prepared_checksum: values[8],
-        prepared_record_bytes: Buffer.from(values[9], "hex"),
-        prepared_record_sha256: values[10],
-        committed_state_revision: null,
-        committed_checksum_provenance: null,
-        committed_checksum: null,
-        committed_record_bytes: null,
-        committed_record_sha256: null,
-      };
-      this.operations.set(key, stored);
-      return result("INSERT", [copyOperationRow(stored)]);
+      const adopted = text.includes("committed_record_sha256, adoption_id)");
+      const width = adopted ? 17 : 11;
+      assert.equal(values.length % width, 0);
+      const rows = [];
+      for (let offset = 0; offset < values.length; offset += width) {
+        const key = operationKey(
+          values[offset],
+          values[offset + 1],
+          values[offset + 2],
+        );
+        if (this.operations.has(key)) continue;
+        const stored = {
+          provider_id: values[offset],
+          anchor_id: values[offset + 1],
+          operation_id: values[offset + 2],
+          record_contract_version: values[offset + 3],
+          state: values[offset + 4],
+          kind: values[offset + 5],
+          storage_id: values[offset + 6],
+          prepared_state_revision: values[offset + 7],
+          prepared_checksum: values[offset + 8],
+          prepared_record_bytes: Buffer.from(values[offset + 9], "hex"),
+          prepared_record_sha256: values[offset + 10],
+          committed_state_revision: adopted ? values[offset + 11] : null,
+          committed_checksum_provenance: adopted
+            ? values[offset + 12]
+            : null,
+          committed_checksum: adopted ? values[offset + 13] : null,
+          committed_record_bytes:
+            adopted && values[offset + 14] !== null
+              ? Buffer.from(values[offset + 14], "hex")
+              : null,
+          committed_record_sha256: adopted ? values[offset + 15] : null,
+          adoption_id: adopted ? values[offset + 16] : null,
+        };
+        this.operations.set(key, stored);
+        rows.push(copyOperationRow(stored));
+      }
+      return result("INSERT", rows);
     }
+    const key = operationKey(values[0], values[1], values[2]);
     const stored = this.operations.get(key);
     if (
       stored === undefined ||
@@ -450,6 +1133,7 @@ class FakeAuthorityClient {
       committed_checksum: values[14],
       committed_record_bytes: Buffer.from(values[15], "hex"),
       committed_record_sha256: values[16],
+      adoption_id: stored.adoption_id,
     };
     this.operations.set(key, updated);
     return result("UPDATE", [copyOperationRow(updated)]);
@@ -473,7 +1157,30 @@ function createFixture() {
       anchorId: "host-primary",
       ...overrides,
     });
-  return { authority: createAuthority(), createAuthority, database, store };
+  const createRuntimeAuthority = (overrides = {}) =>
+    createPostgresFilesystemImageProviderStateRuntimeAuthority({
+      store,
+      providerId: "filesystem-image-ext4",
+      anchorId: "host-primary",
+      ...overrides,
+    });
+  const createAdoptionAuthority = (overrides = {}) =>
+    createPostgresFilesystemImageProviderStateAdoptionAuthority({
+      store,
+      providerId: "filesystem-image-ext4",
+      anchorId: "host-primary",
+      ...overrides,
+    });
+  return {
+    adoptionAuthority: createAdoptionAuthority(),
+    authority: createAuthority(),
+    createAdoptionAuthority,
+    createAuthority,
+    createRuntimeAuthority,
+    database,
+    runtimeAuthority: createRuntimeAuthority(),
+    store,
+  };
 }
 
 function authorityError(code) {
@@ -617,6 +1324,1755 @@ test("exposes a frozen exact receiver-independent authority surface", async () =
     () => createAuthority({ providerId: "bad/id" }),
     authorityError(
       "invalid_postgres_filesystem_image_provider_state_authority_options",
+    ),
+  );
+});
+
+test("exposes distinct frozen runtime and adoption capabilities", async () => {
+  const { adoptionAuthority, runtimeAuthority } = createFixture();
+  assert.equal(
+    POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT_VERSION,
+    3,
+  );
+  assert.deepEqual(Reflect.ownKeys(runtimeAuthority), [
+    "contractVersion",
+    "readHead",
+    "readOperation",
+    "readOperationsPage",
+    "readPreparedOperationsPage",
+    "compareProjection",
+    "compareAndAdvance",
+  ]);
+  assert.equal(runtimeAuthority.contractVersion, 3);
+  assert.equal(Object.isFrozen(runtimeAuthority), true);
+  assert.equal(Object.isFrozen(runtimeAuthority.compareProjection), true);
+  assert.deepEqual(await runtimeAuthority.readHead(), V3_GENESIS);
+  assert.deepEqual(
+    await runtimeAuthority.readPreparedOperationsPage({
+      afterStorageId: null,
+      expectedHead: V3_GENESIS,
+      limit: 4,
+    }),
+    { operations: [], nextAfterStorageId: null },
+  );
+  const attachmentOrigins = Object.freeze([]);
+  const preparedProjectionChecksum = countedProjectionChecksum(
+    PREPARED_PROJECTION_DOMAIN,
+    [],
+  );
+  const projectionPromise = Reflect.apply(
+    runtimeAuthority.compareProjection,
+    { hostile: true },
+    [
+      {
+        attachmentOrigins,
+        expectedHead: V3_GENESIS,
+        preparedOperationCount: 0,
+        preparedProjectionChecksum,
+      },
+    ],
+  );
+  assert.equal(Object.getPrototypeOf(projectionPromise), Promise.prototype);
+  const receipt = await projectionPromise;
+  assert.deepEqual(receipt, {
+    contractVersion: 1,
+    projectionChecksum: projectionReceiptChecksum({
+      attachmentOrigins,
+      expectedHead: V3_GENESIS,
+      preparedOperations: [],
+    }),
+  });
+  assert.equal(Object.isFrozen(receipt), true);
+
+  assert.equal(
+    POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION,
+    1,
+  );
+  assert.deepEqual(Reflect.ownKeys(adoptionAuthority), [
+    "contractVersion",
+    "compareAndAdopt",
+  ]);
+  assert.equal(adoptionAuthority.contractVersion, 1);
+  assert.equal(Object.isFrozen(adoptionAuthority), true);
+  assert.equal(Object.isFrozen(adoptionAuthority.compareAndAdopt), true);
+});
+
+test("legacy authority rejects stored v3 heads while runtime dual-reads v2 and v3", async () => {
+  const { authority, database, runtimeAuthority } = createFixture();
+  const v2Head = appendHead(GENESIS, "a".repeat(64), 128);
+  database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(v2Head),
+  );
+  assert.deepEqual(await authority.readHead(), v2Head);
+  assert.deepEqual(await runtimeAuthority.readHead(), v2Head);
+
+  const v3Head = appendHead(V3_GENESIS, "b".repeat(64), 128);
+  database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(v3Head),
+  );
+  await assert.rejects(
+    authority.readHead(),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.deepEqual(await runtimeAuthority.readHead(), v3Head);
+});
+
+test("runtime authority pages prepared operations by C storage id", async () => {
+  const { runtimeAuthority } = createFixture();
+  let head = V3_GENESIS;
+  for (const [index, [operationId, storageId]] of [
+    ["operation-c", "storage-c"],
+    ["operation-a", "storage-a"],
+    ["operation-b", "storage-b"],
+  ].entries()) {
+    const appended = await appendPrepared(runtimeAuthority, head, {
+      checksum: String.fromCharCode(97 + index).repeat(64),
+      ledgerBytes: 128 * (index + 1),
+      operationId,
+      storageId,
+    });
+    head = appended.nextHead;
+  }
+  const first = await runtimeAuthority.readPreparedOperationsPage({
+    afterStorageId: null,
+    expectedHead: head,
+    limit: 2,
+  });
+  assert.deepEqual(
+    first.operations.map(({ storageId }) => storageId),
+    ["storage-a", "storage-b"],
+  );
+  assert.equal(first.nextAfterStorageId, "storage-b");
+  const second = await runtimeAuthority.readPreparedOperationsPage({
+    afterStorageId: first.nextAfterStorageId,
+    expectedHead: head,
+    limit: 2,
+  });
+  assert.deepEqual(
+    second.operations.map(({ storageId }) => storageId),
+    ["storage-c"],
+  );
+  assert.equal(second.nextAfterStorageId, null);
+});
+
+test("runtime authority returns the frozen projection receipt fixed vector", async () => {
+  const fixture = projectionFixture();
+  assert.equal(
+    fixture.request.preparedProjectionChecksum,
+    "088eb91dfb1e421d879a70cdcf4abcdaf996229cba352915db5a9f8393424997",
+  );
+  assert.equal(
+    fixture.attachmentOrigins[0].stableStorageChecksum,
+    "f618dddf6d6a06a0ab2140d2df31349712649272ded924bb1e48cf116d1f4623",
+  );
+  assert.equal(
+    countedProjectionChecksum(
+      ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
+      fixture.attachmentOrigins,
+    ),
+    "454ad27deee8a7585e2f5cd04f0424830b23d33736c025ffb29e08e6b40afe37",
+  );
+  const receipt = await fixture.runtimeAuthority.compareProjection(
+    fixture.request,
+  );
+  assert.deepEqual(Reflect.ownKeys(receipt), [
+    "contractVersion",
+    "projectionChecksum",
+  ]);
+  assert.deepEqual(receipt, {
+    contractVersion: 1,
+    projectionChecksum: projectionReceiptChecksum({
+      attachmentOrigins: fixture.attachmentOrigins,
+      expectedHead: fixture.expectedHead,
+      preparedOperations: fixture.preparedOperations,
+    }),
+  });
+  assert.equal(
+    receipt.projectionChecksum,
+    "a9910b485763f0b9d8557b79d0ec369028012d1be6177a713649fa7773b7693d",
+  );
+  assert.equal(Object.isFrozen(receipt), true);
+});
+
+test("runtime projection compares complete prepared content", async (t) => {
+  await t.test("missing stored prepared operation", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 2 });
+    fixture.database.operations.delete(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        fixture.preparedOperations[1].operationId,
+      ),
+    );
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(fixture.request),
+      null,
+    );
+  });
+
+  await t.test("extra stored prepared operation", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 2 });
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        preparedOperationCount: 1,
+        preparedProjectionChecksum: countedProjectionChecksum(
+          PREPARED_PROJECTION_DOMAIN,
+          fixture.preparedOperations.slice(0, 1),
+        ),
+      }),
+      null,
+    );
+  });
+
+  await t.test("wrong prepared content digest", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 2 });
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        preparedProjectionChecksum: "f".repeat(64),
+      }),
+      null,
+    );
+  });
+});
+
+test("runtime projection applies the canonical budget per prepared row", async (t) => {
+  await t.test("one request exactly at 768 KiB", async () => {
+    const fixture = maxCanonicalPreparedProjectionFixture(1);
+    assert.equal(
+      Buffer.byteLength(
+        canonicalJson(fixture.preparedOperations[0].request),
+        "utf8",
+      ),
+      MAX_CANONICAL_REQUEST_BYTES,
+    );
+    assert.notEqual(
+      await fixture.runtimeAuthority.compareProjection(fixture.request),
+      null,
+    );
+  });
+
+  await t.test("four individually valid requests exceed 768 KiB together", async () => {
+    const fixture = maxCanonicalPreparedProjectionFixture(4);
+    const aggregateBytes = fixture.preparedOperations.reduce(
+      (sum, record) =>
+        sum + Buffer.byteLength(canonicalJson(record.request), "utf8"),
+      0,
+    );
+    assert.ok(aggregateBytes > MAX_CANONICAL_REQUEST_BYTES);
+    assert.notEqual(
+      await fixture.runtimeAuthority.compareProjection(fixture.request),
+      null,
+    );
+  });
+});
+
+test("runtime projection compares attachment origins exactly", async (t) => {
+  function requestWithOrigin(fixture, origin) {
+    return {
+      ...fixture.request,
+      attachmentOrigins: Object.freeze([Object.freeze(origin)]),
+    };
+  }
+
+  await t.test("legal monotonic current revision", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const origin = fixture.attachmentOrigins[0];
+    assert.notEqual(
+      await fixture.runtimeAuthority.compareProjection(
+        requestWithOrigin(fixture, {
+          ...origin,
+          currentStorageRevision: "9",
+          stableStorageChecksum: stableStorageChecksum({
+            ...attachedStorage(origin.storageId),
+            revision: "9",
+          }),
+        }),
+      ),
+      null,
+    );
+  });
+
+  await t.test("quoted PostgreSQL NULL operation id", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const origin = fixture.attachmentOrigins[0];
+    const oldKey = operationKey(
+      "filesystem-image-ext4",
+      "host-primary",
+      origin.operationId,
+    );
+    const oldRow = fixture.database.operations.get(oldKey);
+    const committed = {
+      ...JSON.parse(oldRow.committed_record_bytes.toString("utf8")),
+      operationId: "NULL",
+    };
+    fixture.database.operations.delete(oldKey);
+    fixture.database.operations.set(
+      operationKey("filesystem-image-ext4", "host-primary", "NULL"),
+      storedOperationRow(committed, fixture.expectedHead.lastChecksum),
+    );
+    fixture.database.queries.length = 0;
+    assert.notEqual(
+      await fixture.runtimeAuthority.compareProjection(
+        requestWithOrigin(fixture, { ...origin, operationId: "NULL" }),
+      ),
+      null,
+    );
+    const originQuery = fixture.database.queries.find(([text]) =>
+      text.includes("operation_id = ANY($3::text[])"),
+    );
+    assert.equal(originQuery[1][2], '{"NULL"}');
+  });
+
+  await t.test("missing origin operation", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(
+        requestWithOrigin(fixture, {
+          ...fixture.attachmentOrigins[0],
+          operationId: "missing-operation",
+        }),
+      ),
+      null,
+    );
+  });
+
+  await t.test("duplicate origin row", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const origin = fixture.attachmentOrigins[0];
+    const row = fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        origin.operationId,
+      ),
+    );
+    fixture.database.attachmentOriginReadOverride = result("SELECT", [
+      copyOperationRow(row),
+      copyOperationRow(row),
+    ]);
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(fixture.request),
+      null,
+    );
+  });
+
+  await t.test("extra origin row", async () => {
+    const fixture = projectionFixture({ originCount: 2, preparedCount: 0 });
+    const rows = fixture.attachmentOrigins.map((origin) =>
+      copyOperationRow(
+        fixture.database.operations.get(
+          operationKey(
+            "filesystem-image-ext4",
+            "host-primary",
+            origin.operationId,
+          ),
+        ),
+      ),
+    );
+    fixture.database.attachmentOriginReadOverride = result("SELECT", rows);
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        attachmentOrigins: Object.freeze([fixture.attachmentOrigins[0]]),
+      }),
+      null,
+    );
+  });
+
+  await t.test("wrong origin kind", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const storageId = fixture.attachmentOrigins[0].storageId;
+    const prepared = preparedRecord({
+      operationId: "provision-operation",
+      storageId,
+    });
+    const committed = committedRecord(prepared, "2");
+    fixture.database.operations.set(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        committed.operationId,
+      ),
+      storedOperationRow(committed, fixture.expectedHead.lastChecksum),
+    );
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(
+        requestWithOrigin(fixture, {
+          currentStorageRevision: "2",
+          operationId: committed.operationId,
+          stableStorageChecksum: stableStorageChecksum(
+            committed.storageState,
+          ),
+          storageId,
+        }),
+      ),
+      null,
+    );
+  });
+
+  await t.test("prepared origin state", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const storageId = fixture.attachmentOrigins[0].storageId;
+    const prepared = preparedRecord({
+      checksum: fixture.expectedHead.lastChecksum,
+      operationId: "still-prepared-operation",
+      revision: fixture.expectedHead.stateRevision,
+      storageId,
+    });
+    fixture.database.operations.set(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        prepared.operationId,
+      ),
+      storedPreparedOperationRow(prepared),
+    );
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(
+        {
+          ...requestWithOrigin(fixture, {
+            currentStorageRevision: "2",
+            operationId: prepared.operationId,
+            stableStorageChecksum: fixture.attachmentOrigins[0]
+              .stableStorageChecksum,
+            storageId,
+          }),
+          preparedOperationCount: 1,
+          preparedProjectionChecksum: countedProjectionChecksum(
+            PREPARED_PROJECTION_DOMAIN,
+            [prepared],
+          ),
+        },
+      ),
+      null,
+    );
+  });
+
+  await t.test("wrong origin storage", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(
+        requestWithOrigin(fixture, {
+          ...fixture.attachmentOrigins[0],
+          storageId: "origin-storage-other",
+        }),
+      ),
+      null,
+    );
+  });
+
+  await t.test("wrong stable storage state", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const origin = fixture.attachmentOrigins[0];
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(
+        requestWithOrigin(fixture, {
+          ...origin,
+          stableStorageChecksum: stableStorageChecksum({
+            ...attachedStorage(origin.storageId),
+            sessionId: "session-other",
+          }),
+        }),
+      ),
+      null,
+    );
+  });
+
+  await t.test("origin revision newer than current storage", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    assert.equal(
+      await fixture.runtimeAuthority.compareProjection(
+        requestWithOrigin(fixture, {
+          ...fixture.attachmentOrigins[0],
+          currentStorageRevision: "1",
+        }),
+      ),
+      null,
+    );
+  });
+});
+
+test("runtime projection requires sorted attachment origin storage IDs", async () => {
+  const fixture = projectionFixture({ originCount: 2, preparedCount: 0 });
+  await assert.rejects(
+    fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: Object.freeze([
+        fixture.attachmentOrigins[1],
+        fixture.attachmentOrigins[0],
+      ]),
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(
+    await fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: Object.freeze([
+        fixture.attachmentOrigins[0],
+        Object.freeze({
+          ...fixture.attachmentOrigins[1],
+          operationId: fixture.attachmentOrigins[0].operationId,
+        }),
+      ]),
+    }),
+    null,
+  );
+});
+
+test("runtime projection keeps corrupt head markers and rows state-invalid", async (t) => {
+  await t.test("head marker mismatch", async () => {
+    const fixture = projectionFixture();
+    fixture.database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ).operation_index_state_revision = "0";
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection(fixture.request),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+  });
+
+  await t.test("origin row digest corruption", async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const origin = fixture.attachmentOrigins[0];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        origin.operationId,
+      ),
+    ).committed_record_sha256 = "f".repeat(64);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection(fixture.request),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+  });
+
+  await t.test("prepared page sentinel corruption", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 5 });
+    const sentinel = fixture.preparedOperations[4];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        sentinel.operationId,
+      ),
+    ).prepared_record_sha256 = "f".repeat(64);
+    fixture.database.queries.length = 0;
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection(fixture.request),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+    assert.equal(
+      fixture.database.queries.filter(([text]) =>
+        text.includes("state = 'prepared'"),
+      ).length,
+      1,
+    );
+  });
+
+  await t.test(
+    "prepared projection can exceed the adoption operation capacity",
+    async () => {
+      const fixture = createFixture();
+      const expectedHead = largeRuntimeProjectionHead();
+      const preparedOperationCount = 65_536;
+      assert.equal(
+        expectedHead.checkpointFrameCount + expectedHead.frameCount,
+        preparedOperationCount + 2,
+      );
+      fixture.database.heads.set(
+        identityKey("filesystem-image-ext4", "host-primary"),
+        headRow(expectedHead),
+      );
+      fixture.database.operationStreamOverride = (emitRow) => {
+        for (let index = 0; index < preparedOperationCount; index += 1) {
+          emitRow(
+            storedPreparedOperationRow(
+              largePreparedProjectionRecord(index),
+            ),
+          );
+        }
+      };
+      assert.notEqual(
+        await fixture.runtimeAuthority.compareProjection({
+          attachmentOrigins: Object.freeze([]),
+          expectedHead,
+          preparedOperationCount,
+          preparedProjectionChecksum: generatedCountedProjectionChecksum(
+            PREPARED_PROJECTION_DOMAIN,
+            preparedOperationCount,
+            largePreparedProjectionRecord,
+          ),
+        }),
+        null,
+      );
+      assert.equal(
+        fixture.database.streamRowsEmitted,
+        preparedOperationCount,
+      );
+      const query = fixture.database.queries.find(([text]) =>
+        text.includes("state = 'prepared'"),
+      );
+      assert.match(query[0], /LIMIT \$3::pg_catalog\.int8$/u);
+      assert.equal(query[1][2], "65539");
+    },
+  );
+
+  await t.test("prepared stream drains after a corrupt first row", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 5 });
+    const first = fixture.preparedOperations[0];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        first.operationId,
+      ),
+    ).prepared_record_sha256 = "f".repeat(64);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection(fixture.request),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+    assert.equal(fixture.database.streamRowsEmitted, 5);
+  });
+
+  await t.test(
+    "a third-row corruption outranks a one-row caller projection",
+    async () => {
+      const fixture = projectionFixture({
+        originCount: 0,
+        preparedCount: 3,
+      });
+      const later = fixture.preparedOperations[2];
+      fixture.database.operations.get(
+        operationKey(
+          "filesystem-image-ext4",
+          "host-primary",
+          later.operationId,
+        ),
+      ).prepared_record_sha256 = "f".repeat(64);
+      await assert.rejects(
+        fixture.runtimeAuthority.compareProjection({
+          ...fixture.request,
+          preparedOperationCount: 1,
+          preparedProjectionChecksum: countedProjectionChecksum(
+            PREPARED_PROJECTION_DOMAIN,
+            fixture.preparedOperations.slice(0, 1),
+          ),
+        }),
+        authorityError(
+          "postgres_filesystem_image_provider_state_authority_state_invalid",
+        ),
+      );
+      assert.equal(fixture.database.streamRowsEmitted, 3);
+      const query = fixture.database.queries.find(([text]) =>
+        text.includes("state = 'prepared'"),
+      );
+      assert.equal(query[1][2], "4");
+    },
+  );
+
+  await t.test("origin corruption outranks prepared checksum mismatch", async () => {
+    const fixture = projectionFixture();
+    const origin = fixture.attachmentOrigins[0];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        origin.operationId,
+      ),
+    ).committed_record_sha256 = "f".repeat(64);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        preparedProjectionChecksum: "e".repeat(64),
+      }),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+    assert.equal(
+      fixture.database.queries.filter(([text]) =>
+        text.includes("filesystem_image_provider_operations"),
+      ).length,
+      2,
+    );
+  });
+
+  await t.test("a streamed record above 4 MiB is state-invalid", async () => {
+    const fixture = projectionFixture({ originCount: 0, preparedCount: 1 });
+    const record = fixture.preparedOperations[0];
+    const row = copyOperationRow(
+      fixture.database.operations.get(
+        operationKey(
+          "filesystem-image-ext4",
+          "host-primary",
+          record.operationId,
+        ),
+      ),
+    );
+    row.prepared_record_bytes = Buffer.alloc(4 * 1024 * 1024 + 1, 0x20);
+    fixture.database.operationReadOverride = result("SELECT", [row]);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection(fixture.request),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+  });
+
+  await t.test("later-batch corruption outranks an earlier mismatch", async () => {
+    const fixture = projectionFixture({ originCount: 5, preparedCount: 0 });
+    const laterOrigin = fixture.attachmentOrigins[4];
+    fixture.database.operations.get(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        laterOrigin.operationId,
+      ),
+    ).committed_record_sha256 = "f".repeat(64);
+    const attachmentOrigins = Object.freeze(
+      fixture.attachmentOrigins.map((origin, index) =>
+        Object.freeze(
+          index === 0
+            ? { ...origin, operationId: "missing-operation" }
+            : origin,
+        ),
+      ),
+    );
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        attachmentOrigins,
+      }),
+      authorityError(
+        "postgres_filesystem_image_provider_state_authority_state_invalid",
+      ),
+    );
+  });
+});
+
+test(
+  "runtime projection trusts only the exact stored head for array bounds",
+  { concurrency: false },
+  async () => {
+    const fixture = projectionFixture({ preparedCount: 0 });
+    const oversizedOrigins = Object.freeze([
+      fixture.attachmentOrigins[0],
+      Object.freeze({
+        ...fixture.attachmentOrigins[0],
+        operationId: "attach-operation-extra-1",
+        storageId: "origin-storage-extra-1",
+      }),
+      Object.freeze({
+        ...fixture.attachmentOrigins[0],
+        operationId: "attach-operation-extra-2",
+        storageId: "origin-storage-extra-2",
+      }),
+    ]);
+    await assert.rejects(
+      fixture.runtimeAuthority.compareProjection({
+        ...fixture.request,
+        attachmentOrigins: oversizedOrigins,
+      }),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+    assert.equal(
+      fixture.database.queries.filter(([text]) =>
+        text.includes("filesystem_image_provider_heads"),
+      ).length,
+      1,
+    );
+    assert.equal(
+      fixture.database.queries.some(([text]) =>
+        text.includes("filesystem_image_provider_operations"),
+      ),
+      false,
+    );
+
+    fixture.database.queries.length = 0;
+    const hostileOrigins = Object.freeze(
+      new Array(65_535).fill(fixture.attachmentOrigins[0]),
+    );
+    const forgedHead = {
+      ...fixture.expectedHead,
+      anchorRevision: "65535",
+      stateRevision: "65535",
+      frameCount: 65_535,
+    };
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(
+      Reflect,
+      "ownKeys",
+    );
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    let hostileOriginEnumerations = 0;
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(target) {
+        if (target === hostileOrigins) hostileOriginEnumerations += 1;
+        return Reflect.apply(ownKeysDescriptor.value, this, [target]);
+      },
+    });
+    try {
+      const authorityModule = await import(
+        "../src/postgres-filesystem-image-provider-state-authority.mjs?runtime-projection-head-first-test"
+      );
+      const runtimeAuthority =
+        authorityModule.createPostgresFilesystemImageProviderStateRuntimeAuthority(
+          {
+            store: fixture.store,
+            providerId: "filesystem-image-ext4",
+            anchorId: "host-primary",
+          },
+        );
+      assert.equal(
+        await runtimeAuthority.compareProjection({
+          ...fixture.request,
+          attachmentOrigins: hostileOrigins,
+          expectedHead: forgedHead,
+        }),
+        null,
+      );
+    } finally {
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+    assert.equal(hostileOriginEnumerations, 0);
+    assert.equal(
+      fixture.database.queries.filter(([text]) =>
+        text.includes("filesystem_image_provider_heads"),
+      ).length,
+      1,
+    );
+    assert.equal(
+      fixture.database.queries.some(([text]) =>
+        text.includes("filesystem_image_provider_operations"),
+      ),
+      false,
+    );
+  },
+);
+
+test("runtime projection streams prepared and origin reads once in one transaction", async () => {
+  const fixture = projectionFixture({ originCount: 9, preparedCount: 9 });
+  fixture.database.queries.length = 0;
+  const receipt = await fixture.runtimeAuthority.compareProjection(
+    fixture.request,
+  );
+  assert.notEqual(receipt, null);
+  assert.equal(
+    fixture.database.queries.filter(([text]) => text.startsWith("BEGIN "))
+      .length,
+    1,
+  );
+  assert.equal(
+    fixture.database.queries.filter(([text]) => text === "COMMIT").length,
+    1,
+  );
+  assert.equal(
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes("state = 'prepared'") &&
+        text.includes('ORDER BY storage_id COLLATE pg_catalog."C"'),
+    ).length,
+    1,
+  );
+  const originQueries = fixture.database.queries.filter(([text]) =>
+    text.includes("operation_id = ANY($3::text[])"),
+  );
+  assert.equal(originQueries.length, 1);
+  assert.equal(originQueries[0][1][3], "10");
+  assert.equal(
+    fixture.database.queries.filter(([text]) =>
+      text.startsWith("SELECT ") &&
+      (text.includes("filesystem_image_provider_heads") ||
+        text.includes("filesystem_image_provider_operations")),
+    ).length,
+    3,
+  );
+});
+
+test("runtime projection holds SQL count fixed at 65,535 lightweight origins", async () => {
+  const fixture = createFixture();
+  const count = 65_535;
+  const expectedHead = Object.freeze({
+    ...V3_GENESIS,
+    anchorRevision: String(count),
+    stateRevision: String(count),
+    frameCount: count,
+    lastChecksum: "a".repeat(64),
+    ledgerBytes: count,
+  });
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(expectedHead),
+  );
+  const attachmentOrigins = new Array(count);
+  for (let index = 0; index < count; index += 1) {
+    const ordinal = String(index).padStart(5, "0");
+    attachmentOrigins[index] = Object.freeze({
+      currentStorageRevision: "1",
+      operationId: `operation-${ordinal}`,
+      stableStorageChecksum: "b".repeat(64),
+      storageId: `storage-${ordinal}`,
+    });
+  }
+  Object.freeze(attachmentOrigins);
+  assert.equal(
+    await fixture.runtimeAuthority.compareProjection({
+      attachmentOrigins,
+      expectedHead,
+      preparedOperationCount: 0,
+      preparedProjectionChecksum: countedProjectionChecksum(
+        PREPARED_PROJECTION_DOMAIN,
+        [],
+      ),
+    }),
+    null,
+  );
+  const operationQueries = fixture.database.queries.filter(([text]) =>
+    text.includes("filesystem_image_provider_operations"),
+  );
+  assert.equal(operationQueries.length, 2);
+  assert.equal(operationQueries[0][1][2], "65536");
+  assert.equal(operationQueries[1][1][3], "65536");
+});
+
+test(
+  "runtime projection batches 65,536 origins and drains later corruption",
+  { concurrency: false },
+  async () => {
+    const fixture = largeAttachmentOriginsFixture();
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(
+      Reflect,
+      "ownKeys",
+    );
+    const isFrozenDescriptor = Object.getOwnPropertyDescriptor(
+      Object,
+      "isFrozen",
+    );
+    const mapDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Map");
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    assert.equal(typeof isFrozenDescriptor?.value, "function");
+    assert.equal(typeof mapDescriptor?.value, "function");
+    const NativeMap = mapDescriptor.value;
+    const nativeMapSet = NativeMap.prototype.set;
+    const nativeMapSize = Object.getOwnPropertyDescriptor(
+      NativeMap.prototype,
+      "size",
+    ).get;
+    let attachmentOriginOwnKeysCalls = 0;
+    let attachmentOriginIsFrozenCalls = 0;
+    let mapHighWater = 0;
+    class TrackingMap extends NativeMap {
+      get size() {
+        return Reflect.apply(nativeMapSize, this, []);
+      }
+
+      set(key, value) {
+        const result = Reflect.apply(nativeMapSet, this, [key, value]);
+        mapHighWater = Math.max(mapHighWater, this.size);
+        return result;
+      }
+    }
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(target) {
+        if (target === fixture.attachmentOrigins) {
+          attachmentOriginOwnKeysCalls += 1;
+        }
+        return Reflect.apply(ownKeysDescriptor.value, this, [target]);
+      },
+    });
+    Object.defineProperty(Object, "isFrozen", {
+      ...isFrozenDescriptor,
+      value(target) {
+        if (target === fixture.attachmentOrigins) {
+          attachmentOriginIsFrozenCalls += 1;
+        }
+        return Reflect.apply(isFrozenDescriptor.value, this, [target]);
+      },
+    });
+    Object.defineProperty(globalThis, "Map", {
+      ...mapDescriptor,
+      value: TrackingMap,
+    });
+    let runtimeAuthority;
+    let RuntimeAuthorityError;
+    try {
+      const authorityModule = await import(
+        "../src/postgres-filesystem-image-provider-state-authority.mjs?runtime-projection-batch-memory-test"
+      );
+      runtimeAuthority =
+        authorityModule.createPostgresFilesystemImageProviderStateRuntimeAuthority(
+          {
+            store: fixture.store,
+            providerId: "filesystem-image-ext4",
+            anchorId: "host-primary",
+          },
+        );
+      RuntimeAuthorityError =
+        authorityModule.PostgresFilesystemImageProviderStateAuthorityError;
+    } finally {
+      Object.defineProperty(globalThis, "Map", mapDescriptor);
+      Object.defineProperty(Object, "isFrozen", isFrozenDescriptor);
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+    assert.equal(
+      fixture.expectedHead.checkpointFrameCount +
+        fixture.expectedHead.frameCount,
+      fixture.attachmentOrigins.length + 2,
+    );
+    const request = {
+      attachmentOrigins: fixture.attachmentOrigins,
+      expectedHead: fixture.expectedHead,
+      preparedOperationCount: 0,
+      preparedProjectionChecksum: countedProjectionChecksum(
+        PREPARED_PROJECTION_DOMAIN,
+        [],
+      ),
+    };
+
+    assert.equal(
+      await runtimeAuthority.compareProjection(request),
+      null,
+    );
+    let originQueries = fixture.database.queries.filter(([text]) =>
+      text.includes("operation_id = ANY($3::text[])"),
+    );
+    assert.equal(originQueries.length, 2);
+    assert.match(originQueries[0][0], /LIMIT \$4::pg_catalog\.int4$/u);
+    assert.equal(originQueries[0][1][3], "65536");
+    assert.equal(originQueries[1][1][2], '{"operation-65535"}');
+    assert.equal(originQueries[1][1][3], "2");
+    assert.equal(
+      originQueries[0][1][2].slice(2, -2).split('","').length,
+      65_535,
+    );
+    assert.equal(fixture.database.streamRowsEmitted, 1);
+    assert.equal(attachmentOriginOwnKeysCalls, 0);
+    assert.equal(attachmentOriginIsFrozenCalls, 0);
+    assert.equal(mapHighWater, 65_535);
+
+    fixture.database.operations.get(
+      fixture.lastOperationKey,
+    ).committed_record_sha256 = "0".repeat(64);
+    fixture.database.queries.length = 0;
+    fixture.database.streamRowsEmitted = 0;
+    await assert.rejects(
+      runtimeAuthority.compareProjection(request),
+      (error) =>
+        error instanceof RuntimeAuthorityError &&
+        error.code ===
+          "postgres_filesystem_image_provider_state_authority_state_invalid" &&
+        error.retryable === false &&
+        Object.isFrozen(error),
+    );
+    originQueries = fixture.database.queries.filter(([text]) =>
+      text.includes("operation_id = ANY($3::text[])"),
+    );
+    assert.equal(originQueries.length, 2);
+    assert.equal(fixture.database.streamRowsEmitted, 1);
+    assert.equal(attachmentOriginOwnKeysCalls, 0);
+    assert.equal(attachmentOriginIsFrozenCalls, 0);
+    assert.equal(mapHighWater, 65_535);
+  },
+);
+
+test("runtime projection performs one query for each empty projection", async () => {
+  const fixture = projectionFixture({ originCount: 1, preparedCount: 0 });
+  fixture.database.queries.length = 0;
+  assert.notEqual(
+    await fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: Object.freeze([]),
+    }),
+    null,
+  );
+  assert.equal(
+    fixture.database.queries.filter(([text]) =>
+      text.includes("state = 'prepared'"),
+    ).length,
+    1,
+  );
+  const originQueries = fixture.database.queries.filter(([text]) =>
+    text.includes("operation_id = ANY($3::text[])"),
+  );
+  assert.equal(originQueries.length, 1);
+  assert.equal(originQueries[0][1][2], "{}");
+  assert.equal(originQueries[0][1][3], "1");
+});
+
+test("runtime projection rejects proxy and mutable projection ABI inputs", async () => {
+  const fixture = projectionFixture();
+  const proxyRequest = new Proxy(fixture.request, {
+    ownKeys() {
+      throw new Error("proxy request ownKeys trap");
+    },
+  });
+  await assert.rejects(
+    fixture.runtimeAuthority.compareProjection(proxyRequest),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+
+  const revoked = Proxy.revocable([], {});
+  revoked.revoke();
+  await assert.rejects(
+    fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: revoked.proxy,
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  await assert.rejects(
+    fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: [...fixture.attachmentOrigins],
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  await assert.rejects(
+    fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: Object.freeze([
+        { ...fixture.attachmentOrigins[0] },
+      ]),
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+});
+
+function legacyAdoptionFixture() {
+  const fixture = createFixture();
+  const preparedHead = appendHead(GENESIS, "a".repeat(64), 128);
+  const expectedHead = appendHead(preparedHead, "b".repeat(64), 320);
+  const prepared = preparedRecord();
+  const committed = committedRecord(prepared, expectedHead.stateRevision);
+  const nextHead = adoptionHead(expectedHead);
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(expectedHead, { operationIndexStateRevision: null }),
+  );
+  const request = {
+    expectedHead,
+    nextHead,
+    operations: [committed],
+    storages: [
+      {
+        currentAttachmentOriginOperationId: null,
+        storage: committed.storageState,
+      },
+    ],
+  };
+  return { ...fixture, committed, expectedHead, nextHead, request };
+}
+
+function preparedBatchAdoptionFixture(operationCount = 65) {
+  const fixture = createFixture();
+  const operations = Array.from({ length: operationCount }, (_, index) => {
+    const ordinal = String(index + 1).padStart(3, "0");
+    return preparedRecord({
+      operationId: `operation-${ordinal}`,
+      revision: String(index + 1),
+      storageId: `storage-${ordinal}`,
+    });
+  });
+  const expectedHead = {
+    ...GENESIS,
+    anchorRevision: String(operationCount),
+    stateRevision: String(operationCount),
+    frameCount: operationCount,
+    lastChecksum: "a".repeat(64),
+    ledgerBytes: operationCount,
+  };
+  const nextHead = {
+    ...adoptionHead(expectedHead),
+    checkpointFrameCount: operationCount + 2,
+  };
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(expectedHead, { operationIndexStateRevision: null }),
+  );
+  return {
+    ...fixture,
+    operations,
+    request: { expectedHead, nextHead, operations, storages: [] },
+  };
+}
+
+test(
+  "adoption keeps both complete-array capacities fixed at 65,535",
+  { concurrency: false },
+  async () => {
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(
+      Reflect,
+      "ownKeys",
+    );
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    const oversizedOperations = Object.freeze(new Array(65_536));
+    const oversizedStorages = Object.freeze(new Array(65_536));
+    let oversizedArrayEnumerations = 0;
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(target) {
+        if (target === oversizedOperations || target === oversizedStorages) {
+          oversizedArrayEnumerations += 1;
+        }
+        return Reflect.apply(ownKeysDescriptor.value, this, [target]);
+      },
+    });
+    try {
+      const authorityModule = await import(
+        "../src/postgres-filesystem-image-provider-state-authority.mjs?adoption-capacity-test"
+      );
+      const fixture = legacyAdoptionFixture();
+      const adoptionAuthority =
+        authorityModule.createPostgresFilesystemImageProviderStateAdoptionAuthority(
+          {
+            store: fixture.store,
+            providerId: "filesystem-image-ext4",
+            anchorId: "host-primary",
+          },
+        );
+      for (const request of [
+        { ...fixture.request, operations: oversizedOperations },
+        { ...fixture.request, storages: oversizedStorages },
+      ]) {
+        await assert.rejects(
+          adoptionAuthority.compareAndAdopt(request),
+          (error) =>
+            error instanceof
+              authorityModule.PostgresFilesystemImageProviderStateAuthorityError &&
+            error.code ===
+              "invalid_postgres_filesystem_image_provider_state_authority_request",
+        );
+      }
+      assert.equal(fixture.database.queries.length, 0);
+    } finally {
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+    assert.equal(oversizedArrayEnumerations, 0);
+  },
+);
+
+test("adoption rejects active and revoked Proxy arrays without traps or SQL", async () => {
+  const fixture = legacyAdoptionFixture();
+  let trapCalls = 0;
+  const operations = new Proxy(fixture.request.operations, {
+    getPrototypeOf() {
+      trapCalls += 1;
+      return Array.prototype;
+    },
+  });
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt({
+      ...fixture.request,
+      operations,
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(trapCalls, 0);
+
+  const revokedStorages = Proxy.revocable(fixture.request.storages, {});
+  revokedStorages.revoke();
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt({
+      ...fixture.request,
+      storages: revokedStorages.proxy,
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(fixture.database.queries.length, 0);
+});
+
+test("adoption bounds one shared canonical-material budget before SQL", async () => {
+  const fixture = completeProvisionAdoptionFixture(
+    32,
+    "x".repeat(700 * 1024),
+  );
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(fixture.database.queries.length, 0);
+});
+
+test("adoption bounds canonical material while rereading all database rows", async () => {
+  const fixture = completeProvisionAdoptionFixture(32);
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(fixture.expectedHead, { operationIndexStateRevision: null }),
+  );
+  const payload = "y".repeat(700 * 1024);
+  for (let index = 0; index < fixture.operations.length; index += 1) {
+    const original = fixture.operations[index];
+    const storedRecord = {
+      ...original,
+      request: { payload, storageId: original.storageId },
+      result: { payload, status: "created" },
+    };
+    fixture.database.operations.set(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        storedRecord.operationId,
+      ),
+      storedOperationRow(storedRecord, fixture.expectedHead.lastChecksum),
+    );
+  }
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.notEqual(fixture.database.queries.length, 0);
+  assert.equal(
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes("filesystem_image_provider_operations") &&
+        text.includes('ORDER BY operation_id COLLATE pg_catalog."C"') &&
+        !text.includes("operation_id = ANY") &&
+        !text.includes("state = 'prepared'"),
+    ).length,
+    1,
+  );
+  assert.equal(fixture.database.streamRowsEmitted, fixture.operations.length);
+});
+
+test("atomically adopts complete legacy history and is idempotent", async () => {
+  const fixture = legacyAdoptionFixture();
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    true,
+  );
+  const adoptionScans = () =>
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes("filesystem_image_provider_operations") &&
+        text.includes('ORDER BY operation_id COLLATE pg_catalog."C"') &&
+        !text.includes("operation_id = ANY") &&
+        !text.includes("state = 'prepared'"),
+    );
+  assert.equal(adoptionScans().length, 2);
+  assert.deepEqual(
+    adoptionScans().map(([, values]) => values[2]),
+    ["65536", "65536"],
+  );
+  const storedHead = fixture.database.heads.get(
+    identityKey("filesystem-image-ext4", "host-primary"),
+  );
+  assert.equal(storedHead.contract_version, 3);
+  assert.equal(storedHead.operation_index_state_revision, "2");
+  assert.equal(
+    storedHead.operation_index_adoption_id,
+    "c1eadcd18d4000dc400405bb4b9fc0aeb2cbab4b1578b75bb9fcd841ed91c598",
+  );
+  assert.equal(storedHead.operation_index_adoption_xid, "1");
+  const storedOperation = fixture.database.operations.get(
+    operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
+  );
+  assert.equal(
+    storedOperation.committed_checksum_provenance,
+    "unavailable-adopted-v2",
+  );
+  assert.equal(storedOperation.committed_checksum, null);
+  assert.equal(
+    storedOperation.adoption_id,
+    storedHead.operation_index_adoption_id,
+  );
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    true,
+  );
+  assert.equal(adoptionScans().length, 3);
+  assert.deepEqual(
+    await fixture.runtimeAuthority.readOperation({
+      expectedHead: fixture.nextHead,
+      operationId: "operation-1",
+    }),
+    fixture.committed,
+  );
+});
+
+test(
+  "adoption idempotency does not consult a poisoned Array iterator",
+  { concurrency: false },
+  async () => {
+    const fixture = legacyAdoptionFixture();
+    assert.equal(
+      await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+      true,
+    );
+    const descriptor = Object.getOwnPropertyDescriptor(
+      Array.prototype,
+      Symbol.iterator,
+    );
+    assert.equal(typeof descriptor?.value, "function");
+    let poisonCalls = 0;
+    Object.defineProperty(Array.prototype, Symbol.iterator, {
+      ...descriptor,
+      value() {
+        if (
+          this.length === 2 &&
+          this[0] === "legacy" &&
+          this[1] === "indexed"
+        ) {
+          poisonCalls += 1;
+          throw new Error("poisoned adoption mode iterator");
+        }
+        return Reflect.apply(descriptor.value, this, []);
+      },
+    });
+    try {
+      assert.equal(
+        await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+        true,
+      );
+    } finally {
+      Object.defineProperty(Array.prototype, Symbol.iterator, descriptor);
+    }
+    assert.equal(poisonCalls, 0);
+  },
+);
+
+test("adoption imports fixed-size batches and rejects a cross-batch revision hole before SQL", async () => {
+  const fixture = preparedBatchAdoptionFixture();
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    true,
+  );
+  const insertQueries = fixture.database.queries.filter(
+    ([text]) =>
+      text.startsWith(
+        "INSERT INTO session_authority.filesystem_image_provider_operations",
+      ) && text.includes("committed_record_sha256, adoption_id)"),
+  );
+  const insertParameterCounts = insertQueries.map(
+    ([, values]) => values.length,
+  );
+  assert.deepEqual(insertParameterCounts, [64 * 17, 17]);
+  for (const [text, values] of insertQueries) {
+    const placeholders = Array.from(
+      text.matchAll(/\$(\d+)/gu),
+      (match) => Number(match[1]),
+    );
+    const placeholderCounts = new Map();
+    for (const placeholder of placeholders) {
+      placeholderCounts.set(
+        placeholder,
+        (placeholderCounts.get(placeholder) ?? 0) + 1,
+      );
+    }
+    assert.deepEqual(
+      Array.from(placeholderCounts),
+      Array.from({ length: values.length }, (_, index) => [
+        index + 1,
+        index % 17 === 14 ? 2 : 1,
+      ]),
+    );
+  }
+  assert.equal(fixture.database.operations.size, 65);
+
+  const invalid = preparedBatchAdoptionFixture();
+  const operations = invalid.operations.map((record, index) =>
+    index === 63 ? { ...record, preparedStateRevision: "66" } : record,
+  );
+  await assert.rejects(
+    invalid.adoptionAuthority.compareAndAdopt({
+      ...invalid.request,
+      operations,
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(invalid.database.queries.length, 0);
+});
+
+test("adoption source stream drains semantic mismatch through later corruption", async () => {
+  const fixture = preparedBatchAdoptionFixture(2);
+  for (let index = 0; index < fixture.operations.length; index += 1) {
+    const record = fixture.operations[index];
+    fixture.database.operations.set(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        record.operationId,
+      ),
+      storedPreparedOperationRow(record),
+    );
+  }
+  fixture.database.operations.get(
+    operationKey(
+      "filesystem-image-ext4",
+      "host-primary",
+      fixture.operations[1].operationId,
+    ),
+  ).prepared_record_sha256 = "f".repeat(64);
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.equal(fixture.database.streamRowsEmitted, 2);
+  assert.equal(
+    fixture.database.queries.filter(([text]) =>
+      text.includes("filesystem_image_provider_operations") &&
+      text.includes('ORDER BY operation_id COLLATE pg_catalog."C"'),
+    ).length,
+    1,
+  );
+});
+
+test("adoption target stream compares input directly and drains later corruption", async () => {
+  const fixture = preparedBatchAdoptionFixture();
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    true,
+  );
+  fixture.database.queries.length = 0;
+  fixture.database.streamRowsEmitted = 0;
+  const firstKey = operationKey(
+    "filesystem-image-ext4",
+    "host-primary",
+    fixture.operations[0].operationId,
+  );
+  const first = fixture.database.operations.get(firstKey);
+  const mismatched = storedPreparedOperationRow(
+    preparedRecord({
+      operationId: "operation-000",
+      revision: "1",
+      storageId: fixture.operations[0].storageId,
+    }),
+  );
+  mismatched.adoption_id = first.adoption_id;
+  fixture.database.operations.set(firstKey, mismatched);
+  fixture.database.operations.get(
+    operationKey(
+      "filesystem-image-ext4",
+      "host-primary",
+      fixture.operations[fixture.operations.length - 1].operationId,
+    ),
+  ).prepared_record_sha256 = "f".repeat(64);
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.equal(fixture.database.streamRowsEmitted, fixture.operations.length);
+  assert.equal(
+    fixture.database.queries.filter(([text]) =>
+      text.includes("filesystem_image_provider_operations") &&
+      text.includes('ORDER BY operation_id COLLATE pg_catalog."C"'),
+    ).length,
+    1,
+  );
+});
+
+test("adopts an already indexed v2 source without rewriting rows", async () => {
+  const fixture = createFixture();
+  const prepared = await appendPrepared(fixture.authority, GENESIS);
+  const committed = await appendCommitted(
+    fixture.authority,
+    prepared.nextHead,
+    prepared.record,
+  );
+  const before = copyOperationRow(
+    fixture.database.operations.get(
+      operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
+    ),
+  );
+  const nextHead = adoptionHead(committed.nextHead);
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt({
+      expectedHead: committed.nextHead,
+      nextHead,
+      operations: [committed.record],
+      storages: [
+        {
+          currentAttachmentOriginOperationId: null,
+          storage: committed.record.storageState,
+        },
+      ],
+    }),
+    true,
+  );
+  assert.deepEqual(
+    fixture.database.operations.get(
+      operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
+    ),
+    before,
+  );
+  assert.equal(
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes("filesystem_image_provider_operations") &&
+        text.includes('ORDER BY operation_id COLLATE pg_catalog."C"') &&
+        !text.includes("operation_id = ANY") &&
+        !text.includes("state = 'prepared'"),
+    ).length,
+    2,
+  );
+});
+
+test("adoption rejects incomplete replay before SQL and returns false when stale", async () => {
+  const fixture = legacyAdoptionFixture();
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt({
+      ...fixture.request,
+      operations: [
+        {
+          ...fixture.committed,
+          committedStateRevision: "3",
+        },
+      ],
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(fixture.database.queries.length, 0);
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow({
+      ...fixture.expectedHead,
+      lastChecksum: "f".repeat(64),
+    }),
+  );
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    false,
+  );
+});
+
+test("adoption rejects a stored-genesis transition before SQL", async () => {
+  const fixture = createFixture();
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt({
+      expectedHead: GENESIS,
+      nextHead: adoptionHead(GENESIS),
+      operations: [],
+      storages: [],
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(fixture.database.queries.length, 0);
+});
+
+test("adoption resolves a lost commit acknowledgement by exact readback", async () => {
+  const fixture = legacyAdoptionFixture();
+  fixture.database.failCommitOnce = true;
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    true,
+  );
+  assert.deepEqual(await fixture.runtimeAuthority.readHead(), fixture.nextHead);
+});
+
+test("adoption resolves an uncertain unchanged source as stale", async () => {
+  const fixture = legacyAdoptionFixture();
+  fixture.database.failCommitBeforeDurabilityOnce = true;
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    false,
+  );
+  assert.deepEqual(
+    fixture.database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ),
+    headRow(fixture.expectedHead, { operationIndexStateRevision: null }),
+  );
+  assert.equal(fixture.database.operations.size, 0);
+});
+
+test("adoption readback rejects a manifest and provenance mode mismatch", async () => {
+  const fixture = legacyAdoptionFixture();
+  assert.equal(
+    await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    true,
+  );
+  const row = fixture.database.operations.get(
+    operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
+  );
+  row.adoption_id = null;
+  row.committed_checksum_provenance = "indexed-frame-v1";
+  row.committed_checksum = "c".repeat(64);
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+});
+
+test("adoption ACK readback classifies a cross-mode target as uncertain", async () => {
+  const fixture = legacyAdoptionFixture();
+  fixture.database.afterCommitOnce = (database) => {
+    const row = database.operations.get(
+      operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
+    );
+    row.adoption_id = null;
+    row.committed_checksum_provenance = "indexed-frame-v1";
+    row.committed_checksum = "c".repeat(64);
+  };
+  fixture.database.failCommitOnce = true;
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
+    ),
+  );
+});
+
+test("adoption ACK readback rejects a post-cut head mutation", async () => {
+  const fixture = legacyAdoptionFixture();
+  fixture.database.afterCommitOnce = (database) => {
+    const row = database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    );
+    row.checkpoint_checksum = "f".repeat(64);
+    row.last_checksum = row.checkpoint_checksum;
+  };
+  fixture.database.failCommitOnce = true;
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt(fixture.request),
+    authorityError(
+      "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
     ),
   );
 });
@@ -1599,6 +4055,41 @@ test("rejects hostile request objects and noncanonical operation records", async
     ),
   );
   assert.equal(database.queries.length, 0);
+});
+
+test("rejects oversized uint64 text before adoption materialization", async () => {
+  const fixture = legacyAdoptionFixture();
+  await assert.rejects(
+    fixture.adoptionAuthority.compareAndAdopt({
+      ...fixture.request,
+      operations: [
+        {
+          ...fixture.committed,
+          preparedStateRevision: "1".repeat(100_000),
+        },
+      ],
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(fixture.database.queries.length, 0);
+});
+
+test("rejects oversized stored numeric text before parsing", async () => {
+  const fixture = createFixture();
+  const stored = headRow(appendHead(V3_GENESIS, "a".repeat(64), 128));
+  stored.checkpoint_frame_count = "9".repeat(100_000);
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    stored,
+  );
+  await assert.rejects(
+    fixture.runtimeAuthority.readHead(),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
 });
 
 test("rejects non-object operation payload roots before SQL", async () => {

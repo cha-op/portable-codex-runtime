@@ -70,6 +70,7 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../migrations/authority/008-filesystem-image-provider-heads.sql", import.meta.url),
   new URL("../migrations/authority/009-writer-supervisor-state-gc.sql", import.meta.url),
   new URL("../migrations/authority/010-filesystem-image-provider-operations.sql", import.meta.url),
+  new URL("../migrations/authority/011-filesystem-image-provider-state-v3-adoption.sql", import.meta.url),
 ]);
 const LANES = Object.freeze([
   "generation",

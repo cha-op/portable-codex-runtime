@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -13,7 +14,7 @@ import {
   createExt4FilesystemImagePaths,
 } from "../src/ext4-filesystem-image-paths.mjs";
 import {
-  FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   FilesystemImageProviderState,
   normalizeFilesystemImageProviderStateHead,
 } from "../src/filesystem-image-provider-state.mjs";
@@ -30,6 +31,28 @@ const OTHER_SESSION_ID = "019f3400-0000-7000-8000-000000000002";
 
 function exact(values) {
   return Object.freeze(Object.assign(Object.create(null), values));
+}
+
+function canonicalSerializeForTest(value) {
+  if (value === null || typeof value !== "object") {
+    return typeof value === "number" ? String(value) : JSON.stringify(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(canonicalSerializeForTest).join(",")}]`;
+  }
+  const entries = Object.keys(value).sort().map((key) =>
+    `${JSON.stringify(key)}:${canonicalSerializeForTest(value[key])}`);
+  return `{${entries.join(",")}}`;
+}
+
+function bindingHashForTest(domainVersion, operationView) {
+  return createHash("sha256")
+    .update(
+      `portable-codex-runtime/ext4-podman-attachment-binding/v${domainVersion}\0`,
+      "utf8",
+    )
+    .update(canonicalSerializeForTest(operationView), "utf8")
+    .digest("hex");
 }
 
 function identity(
@@ -72,7 +95,7 @@ function createLockProvider() {
 
 function createHeadAnchor() {
   let head = normalizeFilesystemImageProviderStateHead({
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
     anchorRevision: "0",
     generation: "0",
     stateRevision: "0",
@@ -409,6 +432,33 @@ async function fixture(t) {
   };
 }
 
+async function commitCheckpoint(fixed, operationId) {
+  const current = await fixed.state.readStorage(fixed.provisioned.storageId);
+  const request = exact({
+    operation: "checkpoint",
+    operationId,
+    storageId: fixed.provisioned.storageId,
+  });
+  await fixed.state.prepareOperation({
+    expectedStorageState: current,
+    kind: "checkpoint",
+    operationId,
+    request,
+    storageId: fixed.provisioned.storageId,
+  });
+  const next = exact({
+    ...current,
+    revision: String(BigInt(current.revision) + 1n),
+  });
+  await fixed.state.commitOperation({
+    operationId,
+    request,
+    result: exact({ status: "checkpointed" }),
+    storageState: next,
+  });
+  return next;
+}
+
 function verify(fixed, attachment = fixed.attachment) {
   return Reflect.apply(fixed.binding.attachmentAuthority.verify, undefined, [
     exact({ attachment }),
@@ -438,6 +488,7 @@ test("exposes exact frozen binding, authority, backend, and composition surfaces
     fixed.binding.contractVersion,
     EXT4_PODMAN_ATTACHMENT_BINDING_CONTRACT_VERSION,
   );
+  assert.equal(EXT4_PODMAN_ATTACHMENT_BINDING_CONTRACT_VERSION, 2);
 
   const authority = fixed.binding.attachmentAuthority;
   assert.equal(Object.getPrototypeOf(authority), null);
@@ -447,6 +498,7 @@ test("exposes exact frozen binding, authority, backend, and composition surfaces
     authority.contractVersion,
     EXT4_PODMAN_PERSISTENT_AUTHORITY_CONTRACT_VERSION,
   );
+  assert.equal(EXT4_PODMAN_PERSISTENT_AUTHORITY_CONTRACT_VERSION, 2);
   assert.equal(Object.isFrozen(authority.verify), true);
 
   assert.equal(Object.getPrototypeOf(fixed.binding.backend), null);
@@ -488,6 +540,11 @@ test("committed attachment returns a stable binding and same-sample runtime iden
     fixed.fake.authoritySamples[0],
   );
   assert.deepEqual(first.rootRuntimeIdentity, fixed.fake.authoritySamples[0]);
+  const operationView = await fixed.state.readOperation({
+    operationId: fixed.attachment.operationId,
+  });
+  assert.equal(first.bindingSha256, bindingHashForTest(2, operationView));
+  assert.notEqual(first.bindingSha256, bindingHashForTest(1, operationView));
 
   fixed.fake.setAuthorityRuntimeIdentity({ device: "7", inode: "7002" });
   const second = await verify(fixed);
@@ -502,6 +559,24 @@ test("committed attachment returns a stable binding and same-sample runtime iden
   assert.equal(Object.isFrozen(second), true);
   assert.equal(Object.getPrototypeOf(second.rootRuntimeIdentity), null);
   assert.equal(Object.isFrozen(second.rootRuntimeIdentity), true);
+});
+
+test("the attachment origin remains current across monotonic checkpoint revisions", async (t) => {
+  const fixed = await fixture(t);
+  const attached = await verify(fixed);
+
+  await commitCheckpoint(fixed, "checkpoint-operation-001");
+  const firstCheckpoint = await verify(fixed);
+  assert.equal(firstCheckpoint.status, "current");
+  assert.notEqual(firstCheckpoint.bindingSha256, attached.bindingSha256);
+
+  await commitCheckpoint(fixed, "checkpoint-operation-002");
+  const secondCheckpoint = await verify(fixed);
+  assert.equal(secondCheckpoint.status, "current");
+  assert.notEqual(
+    secondCheckpoint.bindingSha256,
+    firstCheckpoint.bindingSha256,
+  );
 });
 
 test("valid mutations of the committed SessionAttachment tuple are mismatches", async (t) => {
@@ -527,7 +602,7 @@ test("valid mutations of the committed SessionAttachment tuple are mismatches", 
   }
 });
 
-test("absent origin operation and detached current storage are missing", async (t) => {
+test("absent operation is missing and a detached origin is a mismatch", async (t) => {
   const fixed = await fixture(t);
   const absent = assertSessionAttachment({
     ...fixed.attachment,
@@ -542,13 +617,71 @@ test("absent origin operation and detached current storage are missing", async (
   const authorityCallsBefore = fixed.fake.calls.filter(
     (name) => name === "observeAttachmentRootAuthority",
   ).length;
-  assertNullReceipt(await verify(fixed), "missing");
+  assertNullReceipt(await verify(fixed), "mismatch");
   assert.equal(
     fixed.fake.calls.filter(
       (name) => name === "observeAttachmentRootAuthority",
     ).length,
     authorityCallsBefore,
   );
+});
+
+test("prepared, non-origin, and superseded attachment operations mismatch", async (t) => {
+  await t.test("prepared attachment operation", async (t) => {
+    const fixed = await fixture(t);
+    await fixed.binding.backend.lifecycleBackend.detachAttachment(
+      mutationRequest("detach", fixed.provisioned.storageId),
+      context(),
+    );
+    const operationId = "prepared-attach-operation-001";
+    const request = mutationRequest("attach", fixed.provisioned.storageId, {
+      attachmentId: "attachment-prepared-001",
+      operationId,
+    });
+    const current = await fixed.state.readStorage(fixed.provisioned.storageId);
+    await fixed.state.prepareOperation({
+      expectedStorageState: current,
+      kind: "attach",
+      operationId,
+      request,
+      storageId: fixed.provisioned.storageId,
+    });
+    const candidate = assertSessionAttachment({
+      ...fixed.attachment,
+      operationId,
+    });
+    assertNullReceipt(await verify(fixed, candidate), "mismatch");
+  });
+
+  await t.test("committed checkpoint is not the attachment origin", async (t) => {
+    const fixed = await fixture(t);
+    const operationId = "checkpoint-not-origin-operation-001";
+    await commitCheckpoint(fixed, operationId);
+    const candidate = assertSessionAttachment({
+      ...fixed.attachment,
+      operationId,
+    });
+    assertNullReceipt(await verify(fixed, candidate), "mismatch");
+  });
+
+  await t.test("detach and reattach supersedes the old origin", async (t) => {
+    const fixed = await fixture(t);
+    await fixed.binding.backend.lifecycleBackend.detachAttachment(
+      mutationRequest("detach", fixed.provisioned.storageId),
+      context(),
+    );
+    const attached = await fixed.binding.backend.lifecycleBackend
+      .prepareWritableAttachment(
+        mutationRequest("attach", fixed.provisioned.storageId, {
+          fencingEpoch: "2",
+          operationId: "reattach-operation-001",
+        }),
+        context(),
+      );
+    const currentAttachment = attachmentFromResult(attached);
+    assertNullReceipt(await verify(fixed), "mismatch");
+    assert.equal((await verify(fixed, currentAttachment)).status, "current");
+  });
 });
 
 test("maps only conclusive driver absence and mismatch errors to receipts", async (t) => {

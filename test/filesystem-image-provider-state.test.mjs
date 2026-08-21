@@ -28,6 +28,8 @@ import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
   FILESYSTEM_IMAGE_PROVIDER_STATE_LEDGER_NAME,
   FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   FilesystemImageProviderState,
   FilesystemImageProviderStateError,
   filesystemImageProviderStateCheckpointName,
@@ -41,6 +43,73 @@ const TRUSTED_ACL_INSPECTORS = Object.freeze({
   inspectDirectoryAcl: async () => false,
 });
 const execFileAsync = promisify(execFile);
+const PREPARED_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/prepared-projection/v1\0",
+  "utf8",
+);
+const STABLE_STORAGE_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/stable-storage-projection/v1\0",
+  "utf8",
+);
+const ATTACHMENT_ORIGIN_PROJECTION_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/attachment-origin-projection/v1\0",
+  "utf8",
+);
+const AUTHORITY_PROJECTION_RECEIPT_DOMAIN = Buffer.from(
+  "portable-codex/filesystem-image-provider-state/authority-projection-receipt/v1\0",
+  "utf8",
+);
+
+function canonicalJson(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) {
+    return `[${value.map((item) => canonicalJson(item)).join(",")}]`;
+  }
+  return `{${Object.keys(value)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(value[key])}`)
+    .join(",")}}`;
+}
+
+function lengthPrefixedProjectionChecksum(domain, values) {
+  const hash = createHash("sha256").update(domain).update(`${values.length}\0`);
+  for (const value of values) {
+    const bytes = Buffer.from(canonicalJson(value), "utf8");
+    hash.update(`${bytes.length}\0`).update(bytes);
+  }
+  return hash.digest("hex");
+}
+
+function stableStorageProjectionChecksum(storage) {
+  return createHash("sha256")
+    .update(STABLE_STORAGE_PROJECTION_DOMAIN)
+    .update(canonicalJson({ ...storage, revision: "1" }))
+    .digest("hex");
+}
+
+function projectionReceiptForRequest(request) {
+  const attachmentOriginsChecksum = lengthPrefixedProjectionChecksum(
+    ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
+    request.attachmentOrigins,
+  );
+  return Object.freeze({
+    contractVersion: 1,
+    projectionChecksum: createHash("sha256")
+      .update(AUTHORITY_PROJECTION_RECEIPT_DOMAIN)
+      .update(
+        canonicalJson({
+          attachmentOriginCount: request.attachmentOrigins.length,
+          attachmentOriginsChecksum,
+          expectedHeadChecksum: filesystemImageProviderStateHeadChecksum(
+            request.expectedHead,
+          ),
+          preparedOperationCount: request.preparedOperationCount,
+          preparedProjectionChecksum: request.preparedProjectionChecksum,
+        }),
+      )
+      .digest("hex"),
+  });
+}
 
 function stateError(code) {
   return (error) =>
@@ -49,6 +118,15 @@ function stateError(code) {
     error.retryable === false &&
     error.commitState ===
       (code === "commit_outcome_uncertain" ? "uncertain" : "not-committed") &&
+    Object.isFrozen(error);
+}
+
+function committedStateError(code) {
+  return (error) =>
+    error instanceof FilesystemImageProviderStateError &&
+    error.code === code &&
+    error.retryable === false &&
+    error.commitState === "committed" &&
     Object.isFrozen(error);
 }
 
@@ -145,6 +223,11 @@ function createSerializedLockProvider(tracker = {}) {
     let released = false;
     return {
       async assertHeld() {
+        tracker.assertions = (tracker.assertions ?? 0) + 1;
+        if (tracker.failNextAssertion === true) {
+          tracker.failNextAssertion = false;
+          throw new Error("lock lost");
+        }
         if (!held || released) throw new Error("lock lost");
       },
       async release() {
@@ -193,6 +276,23 @@ function sameLedgerHead(left, right) {
 
 function genesisHead() {
   return normalizeFilesystemImageProviderStateHead({
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+    anchorRevision: "0",
+    generation: "0",
+    stateRevision: "0",
+    baseHeadChecksum: null,
+    checkpointStateRevision: "0",
+    checkpointFrameCount: 0,
+    checkpointChecksum: null,
+    checkpointBytes: 0,
+    frameCount: 0,
+    lastChecksum: null,
+    ledgerBytes: 0,
+  });
+}
+
+function v3GenesisHead() {
+  return normalizeFilesystemImageProviderStateHead({
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
     anchorRevision: "0",
     generation: "0",
@@ -206,6 +306,24 @@ function genesisHead() {
     lastChecksum: null,
     ledgerBytes: 0,
   });
+}
+
+function adoptionMarkerPath(directory, generation, phase) {
+  return join(directory, `state.g${generation}.${phase}`);
+}
+
+function adoptionMarkerStagingPath(directory, generation, phase) {
+  return join(directory, `state.g${generation}.${phase}.staging`);
+}
+
+async function fileExists(path) {
+  try {
+    await lstat(path);
+    return true;
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
 }
 
 function createTrustedHeadAnchor(tracker = {}) {
@@ -249,6 +367,242 @@ function createFixedTrustedHeadAnchor(value) {
   });
 }
 
+function createExactStateAuthorities(options = {}) {
+  const tracker = options.tracker ?? {};
+  let head = normalizeFilesystemImageProviderStateHead(
+    options.head ?? v3GenesisHead(),
+  );
+  let committedAdoptionKey = null;
+  const operations = new Map();
+  for (const record of options.operations ?? []) {
+    operations.set(record.operationId, Object.freeze(record));
+  }
+  const requireHead = (expectedHead) => {
+    if (!sameLedgerHead(head, expectedHead)) {
+      throw new Error("exact head changed");
+    }
+  };
+  const readHead = Object.freeze(async function readHead() {
+    tracker.reads = (tracker.reads ?? 0) + 1;
+    if (tracker.failRead === true) throw new Error("authority unavailable");
+    return copyLedgerHead(head);
+  });
+  const readOperation = Object.freeze(async function readOperation({
+    expectedHead,
+    operationId,
+  }) {
+    requireHead(expectedHead);
+    tracker.operationReads = (tracker.operationReads ?? 0) + 1;
+    return operations.get(operationId) ?? null;
+  });
+  const readOperationsPage = Object.freeze(async function readOperationsPage({
+    expectedHead,
+    afterOperationId,
+    limit,
+  }) {
+    requireHead(expectedHead);
+    const records = [...operations.values()]
+      .filter(
+        (record) =>
+          afterOperationId === null || record.operationId > afterOperationId,
+      )
+      .sort((left, right) =>
+        left.operationId < right.operationId
+          ? -1
+          : left.operationId > right.operationId
+            ? 1
+            : 0,
+      );
+    const page = records.slice(0, limit);
+    return Object.freeze({
+      operations: Object.freeze(page),
+      nextAfterOperationId:
+        records.length > limit ? page[page.length - 1].operationId : null,
+    });
+  });
+  const readPreparedOperationsPage = Object.freeze(
+    async function readPreparedOperationsPage({
+      expectedHead,
+      afterStorageId,
+      limit,
+    }) {
+      requireHead(expectedHead);
+      tracker.preparedPageReads = (tracker.preparedPageReads ?? 0) + 1;
+      const records = [...operations.values()]
+        .filter(
+          (record) =>
+            record.state === "prepared" &&
+            (afterStorageId === null || record.storageId > afterStorageId),
+        )
+        .sort((left, right) =>
+          left.storageId < right.storageId
+            ? -1
+            : left.storageId > right.storageId
+              ? 1
+              : 0,
+        );
+      const page = records.slice(0, limit);
+      return Object.freeze({
+        operations: Object.freeze(page),
+        nextAfterStorageId:
+          records.length > limit ? page[page.length - 1].storageId : null,
+      });
+    },
+  );
+  const compareProjection = Object.freeze(
+    async function compareProjection(request) {
+      requireHead(request.expectedHead);
+      tracker.projectionComparisons =
+        (tracker.projectionComparisons ?? 0) + 1;
+      if (tracker.projectionFailure === "throw") {
+        throw new Error("projection unavailable");
+      }
+      if (
+        tracker.projectionMismatch === true ||
+        tracker.projectionFailure === "null"
+      ) {
+        return null;
+      }
+      const prepared = [...operations.values()]
+        .filter((record) => record.state === "prepared")
+        .sort((left, right) =>
+          left.storageId < right.storageId
+            ? -1
+            : left.storageId > right.storageId
+              ? 1
+              : 0,
+        );
+      if (
+        request.preparedOperationCount !== prepared.length ||
+        request.preparedProjectionChecksum !==
+          lengthPrefixedProjectionChecksum(
+            PREPARED_PROJECTION_DOMAIN,
+            prepared,
+          )
+      ) {
+        return null;
+      }
+      for (const origin of request.attachmentOrigins) {
+        const record = operations.get(origin.operationId);
+        if (
+          record?.state !== "committed" ||
+          (record.kind !== "attach" && record.kind !== "restore-attach") ||
+          record.storageId !== origin.storageId ||
+          BigInt(record.storageState.revision) >
+            BigInt(origin.currentStorageRevision) ||
+          stableStorageProjectionChecksum(record.storageState) !==
+            origin.stableStorageChecksum
+        ) {
+          return null;
+        }
+      }
+      return projectionReceiptForRequest(request);
+    },
+  );
+  const compareAndAdvance = Object.freeze(
+    async function compareAndAdvance({ expectedHead, nextHead, transition }) {
+      tracker.advances = (tracker.advances ?? 0) + 1;
+      if (!sameLedgerHead(head, expectedHead)) return false;
+      if (tracker.failAdvanceBeforeCommit === true) {
+        throw new Error("advance unavailable");
+      }
+      if (transition.type === "append-prepared-v1") {
+        assert.equal(transition.record.state, "prepared");
+        operations.set(
+          transition.record.operationId,
+          Object.freeze(transition.record),
+        );
+      } else if (transition.type === "append-committed-v1") {
+        assert.equal(transition.record.state, "committed");
+        operations.set(
+          transition.record.operationId,
+          Object.freeze(transition.record),
+        );
+      } else {
+        assert.equal(transition.type, "rotate-v1");
+      }
+      head = normalizeFilesystemImageProviderStateHead(nextHead);
+      tracker.head = copyLedgerHead(head);
+      if (tracker.projectionFailureAfterNextAdvance !== undefined) {
+        assert(
+          ["null", "throw"].includes(
+            tracker.projectionFailureAfterNextAdvance,
+          ),
+        );
+        tracker.projectionFailure = tracker.projectionFailureAfterNextAdvance;
+        tracker.projectionFailureAfterNextAdvance = undefined;
+      }
+      if (tracker.loseNextAdvanceAcknowledgement === true) {
+        tracker.loseNextAdvanceAcknowledgement = false;
+        throw new Error("advance acknowledgement lost");
+      }
+      return true;
+    },
+  );
+  const compareAndAdopt = Object.freeze(
+    async function compareAndAdopt({
+      expectedHead,
+      nextHead,
+      operations: adoptedOperations,
+      storages,
+    }) {
+      tracker.adoptions = (tracker.adoptions ?? 0) + 1;
+      tracker.adoptionOperations = adoptedOperations;
+      tracker.adoptionStorages = storages;
+      const adoptionKey = canonicalJson({
+        expectedHead,
+        nextHead,
+        operations: adoptedOperations,
+        storages,
+      });
+      if (sameLedgerHead(head, nextHead)) {
+        return adoptionKey === committedAdoptionKey;
+      }
+      if (!sameLedgerHead(head, expectedHead)) return false;
+      if (tracker.returnFalseNextAdoption === true) {
+        tracker.returnFalseNextAdoption = false;
+        return false;
+      }
+      if (tracker.returnFalseWithNextHeadObservation === true) {
+        tracker.returnFalseWithNextHeadObservation = false;
+        head = normalizeFilesystemImageProviderStateHead(nextHead);
+        tracker.head = copyLedgerHead(head);
+        return false;
+      }
+      if (tracker.failAdoptionBeforeCommit === true) {
+        throw new Error("adoption outcome uncertain");
+      }
+      operations.clear();
+      for (const record of adoptedOperations) {
+        operations.set(record.operationId, Object.freeze(record));
+      }
+      head = normalizeFilesystemImageProviderStateHead(nextHead);
+      tracker.head = copyLedgerHead(head);
+      committedAdoptionKey = adoptionKey;
+      if (tracker.loseNextAdoptionAcknowledgement === true) {
+        tracker.loseNextAdoptionAcknowledgement = false;
+        throw new Error("adoption acknowledgement lost");
+      }
+      return true;
+    },
+  );
+  tracker.head = copyLedgerHead(head);
+  tracker.operations = operations;
+  return Object.freeze({
+    adoptionAuthority: Object.freeze({ contractVersion: 1, compareAndAdopt }),
+    stateAuthority: Object.freeze({
+      contractVersion: 3,
+      readHead,
+      readOperation,
+      readOperationsPage,
+      readPreparedOperationsPage,
+      compareProjection,
+      compareAndAdvance,
+    }),
+    tracker,
+  });
+}
+
 function corruptPreviousChecksumWithValidEnvelope(ledger, frameStart) {
   const payloadLength = ledger.readUInt32BE(frameStart + 8);
   const sequence = ledger.readUInt32BE(frameStart + 12);
@@ -264,6 +618,38 @@ function corruptPreviousChecksumWithValidEnvelope(ledger, frameStart) {
   const checksumMetadata = Buffer.allocUnsafe(8);
   checksumMetadata.writeUInt32BE(payloadLength, 0);
   checksumMetadata.writeUInt32BE(sequence, 4);
+  const checksum = createHash("sha256")
+    .update(
+      Buffer.from(
+        "portable-codex/filesystem-image-provider-state/frame/v2\0",
+        "utf8",
+      ),
+    )
+    .update(checksumMetadata)
+    .update(ledger.subarray(payloadStart, footerStart))
+    .digest();
+  checksum.copy(ledger, frameStart + 16);
+  checksum.copy(ledger, footerStart + 16);
+}
+
+function rewritePayloadSequenceWithValidEnvelope(
+  ledger,
+  frameStart,
+  replacementSequence,
+) {
+  const payloadLength = ledger.readUInt32BE(frameStart + 8);
+  const envelopeSequence = ledger.readUInt32BE(frameStart + 12);
+  const payloadStart = frameStart + 48;
+  const footerStart = payloadStart + payloadLength;
+  const marker = Buffer.from(`"sequence":${envelopeSequence}`, "utf8");
+  const replacement = Buffer.from(`"sequence":${replacementSequence}`, "utf8");
+  assert.equal(replacement.length, marker.length);
+  const markerOffset = ledger.indexOf(marker, payloadStart);
+  assert(markerOffset >= payloadStart && markerOffset < footerStart);
+  replacement.copy(ledger, markerOffset);
+  const checksumMetadata = Buffer.allocUnsafe(8);
+  checksumMetadata.writeUInt32BE(payloadLength, 0);
+  checksumMetadata.writeUInt32BE(envelopeSequence, 4);
   const checksum = createHash("sha256")
     .update(
       Buffer.from(
@@ -307,6 +693,39 @@ async function createFixture(t, options = {}) {
     root,
     state: createState(),
     tracker,
+  };
+}
+
+async function createExactFixture(t, options = {}) {
+  const root = await mkdtemp(
+    join(tmpdir(), "filesystem-image-provider-state-v3-test-"),
+  );
+  const directory = join(root, "state");
+  await mkdir(directory, { mode: 0o700 });
+  t.after(() => rm(root, { force: true, recursive: true }));
+  const lockTracker = {};
+  const acquireLock =
+    options.acquireLock ?? createSerializedLockProvider(lockTracker);
+  const authorities = createExactStateAuthorities(options);
+  const createState = (overrides = {}) =>
+    new FilesystemImageProviderState({
+      acquireLock,
+      adoptionAuthority: authorities.adoptionAuthority,
+      directory,
+      stateAuthority: authorities.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+      ...overrides,
+    });
+  return {
+    ...authorities,
+    acquireLock,
+    createState,
+    directory,
+    ledgerPath: join(directory, FILESYSTEM_IMAGE_PROVIDER_STATE_LEDGER_NAME),
+    lockTracker,
+    lockPath: join(directory, FILESYSTEM_IMAGE_PROVIDER_STATE_LOCK_NAME),
+    root,
+    state: createState(),
   };
 }
 
@@ -473,23 +892,57 @@ async function createRotatedFixture(t) {
   };
 }
 
+async function createRotatedV2AdoptionHarness(t, tracker) {
+  const legacy = await createFixture(t);
+  const legacyState = legacy.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+  });
+  await prepareAndCommit(legacyState, {
+    operationId: "operation-adoption-recovery-001",
+    request: operationRequest("provision"),
+    storage: storageState(),
+  });
+  const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+  assert(sourceHead.generation !== "0");
+  const candidateGeneration = String(BigInt(sourceHead.generation) + 1n);
+  const exact = createExactStateAuthorities({ head: sourceHead, tracker });
+  const createState = (overrides = {}) =>
+    new FilesystemImageProviderState({
+      acquireLock: legacy.acquireLock,
+      adoptionAuthority: exact.adoptionAuthority,
+      directory: legacy.directory,
+      stateAuthority: exact.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+      ...overrides,
+    });
+  return {
+    candidateGeneration,
+    createState,
+    exact,
+    legacy,
+    sourceHead,
+    state: createState(),
+  };
+}
+
 test("state directory admission reserves the longest generated pathname", () => {
   const headAnchor = createTrustedHeadAnchor();
   const options = {
-    directory: `/${"d".repeat(4_055)}`,
+    directory: `/${"d".repeat(4_049)}`,
     headAnchor,
     ...TRUSTED_ACL_INSPECTORS,
   };
-  const longestName = filesystemImageProviderStateCheckpointName(
-    "18446744073709551615",
-  );
-  assert.equal(Buffer.byteLength(options.directory, "utf8"), 4_056);
-  assert.equal(Buffer.byteLength(longestName, "utf8"), 38);
+  const longestName = "state.g18446744073709551615.verified.staging";
+  assert.equal(Buffer.byteLength(options.directory, "utf8"), 4_050);
+  assert.equal(Buffer.byteLength(longestName, "utf8"), 44);
   assert.equal(Buffer.byteLength(join(options.directory, longestName), "utf8"), 4_095);
   assert.doesNotThrow(() => new FilesystemImageProviderState(options));
 
-  const maximumMultibyteDirectory = `/${"é".repeat(2_027)}a`;
-  assert.equal(Buffer.byteLength(maximumMultibyteDirectory, "utf8"), 4_056);
+  const maximumMultibyteDirectory = `/${"é".repeat(2_024)}a`;
+  assert.equal(Buffer.byteLength(maximumMultibyteDirectory, "utf8"), 4_050);
   assert.doesNotThrow(
     () =>
       new FilesystemImageProviderState({
@@ -499,8 +952,8 @@ test("state directory admission reserves the longest generated pathname", () => 
   );
 
   for (const directory of [
-    `/${"d".repeat(4_056)}`,
-    `/${"é".repeat(2_028)}`,
+    `/${"d".repeat(4_050)}`,
+    `/${"é".repeat(2_025)}`,
     `/${"d".repeat(1_000_000)}`,
   ]) {
     assert.throws(
@@ -508,6 +961,118 @@ test("state directory admission reserves the longest generated pathname", () => 
       stateError("invalid_request"),
     );
   }
+});
+
+test("v2 and v3 head and frame hash domains remain fixed", async (t) => {
+  assert.equal(
+    filesystemImageProviderStateHeadChecksum(genesisHead()),
+    "7bece1a12f8c03f4caf77f9c74e8f839dfeef2e7a1c5beb85ec69a27971d1bb2",
+  );
+  assert.equal(
+    filesystemImageProviderStateHeadChecksum(v3GenesisHead()),
+    "0285b2f1d44ca9e82ae36333f4b79e395895f21895a265e6d64adf4dc42bd119",
+  );
+  const request = operationRequest("provision");
+  const legacy = await createFixture(t);
+  const exact = await createExactFixture(t);
+  for (const state of [legacy.state, exact.state]) {
+    await state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-domain-vector-001",
+      request,
+      storageId: "storage-001",
+    });
+  }
+  const checksums = [];
+  for (const [ledgerPath, version] of [
+    [legacy.ledgerPath, 2],
+    [exact.ledgerPath, 3],
+  ]) {
+    const ledger = await readFile(ledgerPath);
+    const payloadLength = ledger.readUInt32BE(8);
+    const sequence = ledger.readUInt32BE(12);
+    const payload = ledger.subarray(48, 48 + payloadLength);
+    const metadata = Buffer.allocUnsafe(8);
+    metadata.writeUInt32BE(payloadLength, 0);
+    metadata.writeUInt32BE(sequence, 4);
+    const calculated = createHash("sha256")
+      .update(
+        Buffer.from(
+          `portable-codex/filesystem-image-provider-state/frame/v${version}\0`,
+          "utf8",
+        ),
+      )
+      .update(metadata)
+      .update(payload)
+      .digest("hex");
+    assert.equal(ledger.subarray(16, 48).toString("hex"), calculated);
+    checksums.push(calculated);
+  }
+  assert.deepEqual(checksums, [
+    "f1e8d479e1e59c274ad91af5d126297d06b37aa27b21d8a9e3fe7d6b1a8f5667",
+    "40051f4f728439e6049d7c815877f451e1b27333289c58e40753e3f99b3e5930",
+  ]);
+});
+
+test("production authority mode is exact, frozen, and cannot mix with a legacy anchor", async (t) => {
+  const fixture = await createExactFixture(t);
+  const base = {
+    acquireLock: fixture.acquireLock,
+    adoptionAuthority: fixture.adoptionAuthority,
+    directory: fixture.directory,
+    stateAuthority: fixture.stateAuthority,
+    ...TRUSTED_ACL_INSPECTORS,
+  };
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        headAnchor: createTrustedHeadAnchor(),
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        stateAuthority: { ...fixture.stateAuthority },
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        stateAuthority: Object.freeze({
+          ...fixture.stateAuthority,
+          contractVersion: 2,
+        }),
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        stateAuthority: Object.freeze({
+          ...fixture.stateAuthority,
+          extra: true,
+        }),
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: {
+          contractVersion: 1,
+          compareAndAdopt: fixture.adoptionAuthority.compareAndAdopt,
+        },
+      }),
+    stateError("invalid_request"),
+  );
+  assert.doesNotThrow(() => new FilesystemImageProviderState(base));
 });
 
 test("rotates a prepared operation into a checkpoint before its commit", async (t) => {
@@ -572,6 +1137,1412 @@ test("rotates a prepared operation into a checkpoint before its commit", async (
   });
   assert.equal(replayed.state, "committed");
   assert.deepEqual(replayed.result, committed.result);
+});
+
+test("v3 exact authority keeps only live recovery state and replays history from the index", async (t) => {
+  const fixture = await createExactFixture(t);
+  const state = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+  });
+  const provisionRequest = operationRequest("provision");
+  const prepared = await state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-v3-provision-001",
+    request: provisionRequest,
+    storageId: "storage-001",
+  });
+  assert.equal(prepared.currentAttachmentOriginOperationId, null);
+  const provisioned = storageState();
+  await state.commitOperation({
+    operationId: "operation-v3-provision-001",
+    request: provisionRequest,
+    result: { status: "provisioned" },
+    storageState: provisioned,
+  });
+
+  const fixedMount = provisioned.mount;
+  const fixedAttachment = attachment(fixedMount);
+  const attached = storageState({
+    attachment: fixedAttachment,
+    lifecycle: "attached",
+    mount: fixedMount,
+    revision: "2",
+    writerEpoch: "1",
+  });
+  const attachRequest = operationRequest("attach");
+  await state.prepareOperation({
+    kind: "attach",
+    operationId: "operation-v3-attach-001",
+    request: attachRequest,
+    storageId: "storage-001",
+  });
+  const attachedView = await state.commitOperation({
+    operationId: "operation-v3-attach-001",
+    request: attachRequest,
+    result: { status: "attached" },
+    storageState: attached,
+  });
+  assert.equal(
+    attachedView.currentAttachmentOriginOperationId,
+    "operation-v3-attach-001",
+  );
+
+  const restarted = fixture.createState({
+    rotationPolicy: {
+      activeLedgerBytesWatermark: 64 * 1024 * 1024,
+      activeFrameCountWatermark: 1,
+    },
+  });
+  const historical = await restarted.readOperation({
+    operationId: "operation-v3-provision-001",
+    request: provisionRequest,
+  });
+  const coldProjectionComparisons = fixture.tracker.projectionComparisons;
+  assert.equal(historical.state, "committed");
+  assert.equal(
+    historical.currentAttachmentOriginOperationId,
+    "operation-v3-attach-001",
+  );
+  const snapshot = await restarted.snapshot();
+  assert.deepEqual(snapshot, {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "4",
+    storages: [attached],
+  });
+  const capacity = await restarted.inspectCapacity();
+  assert.equal(capacity.retainedOperationCount, 0);
+  assert.equal(capacity.preparedOperationCount, 0);
+  assert.equal(fixture.tracker.operations.size, 2);
+  assert(fixture.tracker.operationReads >= 1);
+  assert.equal(
+    fixture.tracker.projectionComparisons,
+    coldProjectionComparisons,
+  );
+
+  const checkpointRequest = operationRequest("checkpoint");
+  await restarted.prepareOperation({
+    kind: "checkpoint",
+    operationId: "operation-v3-checkpoint-001",
+    request: checkpointRequest,
+    storageId: "storage-001",
+  });
+  const checkpointed = { ...attached, revision: "3" };
+  const checkpointedView = await restarted.commitOperation({
+    operationId: "operation-v3-checkpoint-001",
+    request: checkpointRequest,
+    result: { status: "checkpointed" },
+    storageState: checkpointed,
+  });
+  assert.equal(
+    checkpointedView.currentAttachmentOriginOperationId,
+    "operation-v3-attach-001",
+  );
+
+  const detached = storageState({
+    dataRoot: checkpointed.dataRoot,
+    lifecycle: "detached",
+    mount: fixedMount,
+    revision: "4",
+    writerAuthority: checkpointed.writerAuthority,
+    writerEpoch: "1",
+  });
+  const detachRequest = operationRequest("detach");
+  await restarted.prepareOperation({
+    kind: "detach",
+    operationId: "operation-v3-detach-001",
+    request: detachRequest,
+    storageId: "storage-001",
+  });
+  const detachedView = await restarted.commitOperation({
+    operationId: "operation-v3-detach-001",
+    request: detachRequest,
+    result: { status: "detached" },
+    storageState: detached,
+  });
+  assert.equal(detachedView.currentAttachmentOriginOperationId, null);
+  const destroyed = storageState({
+    lifecycle: "destroyed",
+    revision: "5",
+    writerAuthority: detached.writerAuthority,
+    writerEpoch: "1",
+  });
+  const destroyRequest = operationRequest("destroy");
+  await restarted.prepareOperation({
+    kind: "destroy",
+    operationId: "operation-v3-destroy-001",
+    request: destroyRequest,
+    storageId: "storage-001",
+  });
+  const destroyedView = await restarted.commitOperation({
+    operationId: "operation-v3-destroy-001",
+    request: destroyRequest,
+    result: { status: "destroyed" },
+    storageState: destroyed,
+  });
+  assert.equal(destroyedView.currentAttachmentOriginOperationId, null);
+  assert.deepEqual(await fixture.createState().snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "10",
+    storages: [destroyed],
+  });
+});
+
+test("v3 projection receipts are reused only for the same loaded head", async (t) => {
+  const fixture = await createExactFixture(t);
+  assert.equal(fixture.tracker.projectionComparisons, undefined);
+
+  assert.deepEqual(await fixture.state.snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "0",
+    storages: [],
+  });
+  assert.equal(fixture.tracker.projectionComparisons, 1);
+  await fixture.state.inspectCapacity();
+  await fixture.state.snapshot();
+  assert.equal(fixture.tracker.projectionComparisons, 1);
+
+  await fixture.state.prepareOperation({
+    kind: "provision",
+    operationId: "operation-v3-projection-cache-001",
+    request: operationRequest(
+      "provision",
+      "storage-v3-projection-cache-001",
+    ),
+    storageId: "storage-v3-projection-cache-001",
+  });
+  assert.equal(fixture.tracker.projectionComparisons, 2);
+  await fixture.state.snapshot();
+  assert.equal(fixture.tracker.projectionComparisons, 2);
+
+  const restarted = fixture.createState();
+  await restarted.snapshot();
+  assert.equal(fixture.tracker.projectionComparisons, 3);
+  fixture.tracker.projectionMismatch = true;
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("corrupt_ledger"),
+  );
+  assert.equal(fixture.tracker.projectionComparisons, 4);
+});
+
+test(
+  "v3 append errors report committed after the authority advances",
+  async (t) => {
+    for (const [projectionFailure, code] of [
+      ["null", "corrupt_ledger"],
+      ["throw", "io_failed"],
+    ]) {
+      await t.test(projectionFailure, async (t) => {
+        const tracker = {
+          projectionFailureAfterNextAdvance: projectionFailure,
+        };
+        const fixture = await createExactFixture(t, { tracker });
+        const operationId = `operation-v3-committed-${projectionFailure}-001`;
+        const request = operationRequest(
+          "provision",
+          `storage-v3-committed-${projectionFailure}-001`,
+        );
+        const storageId = request.storageId;
+
+        await assert.rejects(
+          fixture.state.prepareOperation({
+            kind: "provision",
+            operationId,
+            request,
+            storageId,
+          }),
+          committedStateError(code),
+        );
+
+        assert.equal(tracker.head.contractVersion, 3);
+        assert.equal(tracker.head.generation, "0");
+        assert.equal(tracker.head.stateRevision, "1");
+        assert.equal(tracker.head.frameCount, 1);
+        const durableOperation = tracker.operations.get(operationId);
+        assert.equal(durableOperation?.state, "prepared");
+        assert.equal(durableOperation?.storageId, storageId);
+        assert.deepEqual(durableOperation?.request, request);
+        assert.equal(
+          (await readFile(fixture.ledgerPath)).length,
+          tracker.head.ledgerBytes,
+        );
+
+        tracker.projectionFailure = undefined;
+        const advances = tracker.advances;
+        const replayed = await fixture.createState().prepareOperation({
+          kind: "provision",
+          operationId,
+          request,
+          storageId,
+        });
+        assert.equal(replayed.state, "prepared");
+        assert.equal(replayed.replayed, true);
+        assert.equal(replayed.shouldDispatch, false);
+        assert.equal(tracker.advances, advances);
+        assert.equal(tracker.head.stateRevision, "1");
+        assert.equal(tracker.operations.get(operationId), durableOperation);
+      });
+    }
+  },
+);
+
+test("v3 projection receipts preserve per-record canonical budgets", async (t) => {
+  await t.test("one maximum-size request survives an exact-v3 restart", async (t) => {
+    const fixture = await createExactFixture(t);
+    const envelopeBytes = Buffer.byteLength('{"payload":""}', "utf8");
+    const payload = "x".repeat(768 * 1024 - envelopeBytes);
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-v3-maximum-request-001",
+      request: { payload },
+      storageId: "storage-v3-maximum-request-001",
+    });
+
+    const projectionComparisons = fixture.tracker.projectionComparisons;
+    assert.deepEqual(await fixture.createState().snapshot(), {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "1",
+      storages: [],
+    });
+    assert.equal(
+      fixture.tracker.projectionComparisons,
+      projectionComparisons + 1,
+    );
+  });
+
+  await t.test(
+    "four valid records may exceed one canonical budget in aggregate",
+    async (t) => {
+      const fixture = await createExactFixture(t);
+      const payload = "x".repeat(200 * 1024);
+      for (let index = 0; index < 4; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        await fixture.state.prepareOperation({
+          kind: "provision",
+          operationId: `operation-v3-page-budget-${suffix}`,
+          request: { payload },
+          storageId: `storage-v3-page-budget-${suffix}`,
+        });
+      }
+
+      const projectionComparisons = fixture.tracker.projectionComparisons;
+      assert.deepEqual(await fixture.createState().snapshot(), {
+        contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+        stateRevision: "4",
+        storages: [],
+      });
+      assert.equal(
+        fixture.tracker.projectionComparisons,
+        projectionComparisons + 1,
+      );
+    },
+  );
+});
+
+test("v2 adoption materializes a v3 recovery generation before switching authority", async (t) => {
+  await t.test("generation-zero bootstrap", async (t) => {
+    const fixture = await createExactFixture(t, { head: genesisHead() });
+    const snapshot = await fixture.state.snapshot();
+    assert.deepEqual(snapshot, {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "0",
+      storages: [],
+    });
+    assert.equal(fixture.tracker.adoptions, 1);
+    assert.equal(fixture.tracker.head.contractVersion, 3);
+    assert.equal(fixture.tracker.head.generation, "1");
+    assert.equal(
+      fixture.tracker.head.baseHeadChecksum,
+      filesystemImageProviderStateHeadChecksum(genesisHead()),
+    );
+  });
+
+  await t.test("rotated source with a live prepared operation", async (t) => {
+    const legacy = await createFixture(t);
+    const legacyState = legacy.createState({
+      rotationPolicy: {
+        activeLedgerBytesWatermark: 64 * 1024 * 1024,
+        activeFrameCountWatermark: 1,
+      },
+    });
+    await prepareAndCommit(legacyState, {
+      operationId: "operation-adopt-provision-001",
+      request: operationRequest("provision"),
+      storage: storageState(),
+    });
+    const pendingRequest = operationRequest("checkpoint");
+    await legacyState.prepareOperation({
+      kind: "checkpoint",
+      operationId: "operation-adopt-pending-001",
+      request: pendingRequest,
+      storageId: "storage-001",
+    });
+    const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+    assert(sourceHead.generation !== "0");
+    const sourceLedgerPath = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName(sourceHead.generation),
+    );
+    const sourceCheckpointPath = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName(sourceHead.generation),
+    );
+    const expiredGeneration = String(BigInt(sourceHead.generation) - 1n);
+    const expiredLedgerPath = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName(expiredGeneration),
+    );
+    const expiredCheckpointPath = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName(expiredGeneration),
+    );
+    await writeFile(expiredLedgerPath, "", { mode: 0o600 });
+    await writeFile(expiredCheckpointPath, "", { mode: 0o600 });
+    const exact = createExactStateAuthorities({ head: sourceHead });
+    const adopted = new FilesystemImageProviderState({
+      acquireLock: legacy.acquireLock,
+      adoptionAuthority: exact.adoptionAuthority,
+      directory: legacy.directory,
+      stateAuthority: exact.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+    });
+    const snapshot = await adopted.snapshot();
+    assert.deepEqual(snapshot, {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "3",
+      storages: [storageState()],
+    });
+    assert.equal(exact.tracker.adoptions, 1);
+    assert.equal(exact.tracker.operations.size, 2);
+    assert.equal(exact.tracker.head.contractVersion, 3);
+    assert.equal(
+      exact.tracker.head.baseHeadChecksum,
+      filesystemImageProviderStateHeadChecksum(sourceHead),
+    );
+    assert.deepEqual(exact.tracker.adoptionStorages, [
+      {
+        currentAttachmentOriginOperationId: null,
+        storage: storageState(),
+      },
+    ]);
+    await assert.rejects(
+      lstat(sourceLedgerPath),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(sourceCheckpointPath),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(expiredLedgerPath),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(expiredCheckpointPath),
+      (error) => error.code === "ENOENT",
+    );
+
+    const restartedAdopted = new FilesystemImageProviderState({
+      acquireLock: legacy.acquireLock,
+      adoptionAuthority: exact.adoptionAuthority,
+      directory: legacy.directory,
+      stateAuthority: exact.stateAuthority,
+      ...TRUSTED_ACL_INSPECTORS,
+    });
+    const committed = await restartedAdopted.commitOperation({
+      operationId: "operation-adopt-pending-001",
+      request: pendingRequest,
+      result: { status: "checkpointed" },
+      storageState: storageState({ revision: "2" }),
+    });
+    assert.equal(committed.state, "committed");
+    const historical = await restartedAdopted.readOperation({
+      operationId: "operation-adopt-provision-001",
+    });
+    assert.equal(historical.state, "committed");
+  });
+
+  await t.test(
+    "aggregate material over the adoption budget does not touch the candidate generation",
+    async (t) => {
+      const legacy = await createFixture(t);
+      const payload = "x".repeat(700 * 1024);
+      for (let index = 0; index < 32; index += 1) {
+        const suffix = String(index).padStart(3, "0");
+        const storageId = `storage-adoption-capacity-${suffix}`;
+        await prepareAndCommit(legacy.state, {
+          operationId: `operation-adoption-capacity-${suffix}`,
+          request: operationRequest("provision", storageId, { payload }),
+          result: { payload },
+          storage: storageState({ storageId }),
+        });
+      }
+      const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+      assert(sourceHead.ledgerBytes < 64 * 1024 * 1024);
+      const candidateGeneration = String(BigInt(sourceHead.generation) + 1n);
+      const candidateCheckpoint = join(
+        legacy.directory,
+        filesystemImageProviderStateCheckpointName(candidateGeneration),
+      );
+      const candidateLedger = join(
+        legacy.directory,
+        filesystemImageProviderStateLedgerName(candidateGeneration),
+      );
+      const checkpointSentinel = Buffer.from("candidate-checkpoint", "utf8");
+      const ledgerSentinel = Buffer.from("candidate-ledger", "utf8");
+      await writeFile(candidateCheckpoint, checkpointSentinel, { mode: 0o600 });
+      await writeFile(candidateLedger, ledgerSentinel, { mode: 0o600 });
+
+      const exact = createExactStateAuthorities({ head: sourceHead });
+      const adopted = new FilesystemImageProviderState({
+        acquireLock: legacy.acquireLock,
+        adoptionAuthority: exact.adoptionAuthority,
+        directory: legacy.directory,
+        stateAuthority: exact.stateAuthority,
+        ...TRUSTED_ACL_INSPECTORS,
+      });
+      await assert.rejects(
+        adopted.snapshot(),
+        stateError("state_capacity_exhausted"),
+      );
+      assert.equal(exact.tracker.adoptions ?? 0, 0);
+      assert.deepEqual(exact.tracker.head, sourceHead);
+      assert.deepEqual(await readFile(candidateCheckpoint), checkpointSentinel);
+      assert.deepEqual(await readFile(candidateLedger), ledgerSentinel);
+    },
+  );
+});
+
+test("v3 cold load rejects prepared-index and attachment-origin divergence", async (t) => {
+  await t.test("missing prepared operation", async (t) => {
+    const fixture = await createExactFixture(t);
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-v3-missing-prepared-001",
+      request: operationRequest("provision"),
+      storageId: "storage-001",
+    });
+    fixture.tracker.operations.delete("operation-v3-missing-prepared-001");
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+
+  await t.test("extra prepared operation", async (t) => {
+    const fixture = await createExactFixture(t);
+    fixture.tracker.operations.set(
+      "operation-v3-extra-prepared-001",
+      Object.freeze({
+        kind: "provision",
+        operationId: "operation-v3-extra-prepared-001",
+        preparedChecksum: "a".repeat(64),
+        preparedStateRevision: "1",
+        request: operationRequest("provision", "storage-extra"),
+        state: "prepared",
+        storageId: "storage-extra",
+        storageStateBefore: null,
+      }),
+    );
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+
+  await t.test("missing attachment origin operation", async (t) => {
+    const fixture = await createExactFixture(t);
+    await prepareAndCommit(fixture.state, {
+      operationId: "operation-v3-origin-provision-001",
+      request: operationRequest("provision"),
+      storage: storageState(),
+    });
+    const fixedMount = mount();
+    const fixedAttachment = attachment(fixedMount);
+    const attachRequest = operationRequest("attach");
+    await fixture.state.prepareOperation({
+      kind: "attach",
+      operationId: "operation-v3-origin-attach-001",
+      request: attachRequest,
+      storageId: "storage-001",
+    });
+    await fixture.state.commitOperation({
+      operationId: "operation-v3-origin-attach-001",
+      request: attachRequest,
+      result: { status: "attached" },
+      storageState: storageState({
+        attachment: fixedAttachment,
+        lifecycle: "attached",
+        mount: fixedMount,
+        revision: "2",
+        writerEpoch: "1",
+      }),
+    });
+    fixture.tracker.operations.delete("operation-v3-origin-attach-001");
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+});
+
+test("v2 adoption preserves target files across an uncertain acknowledgement", async (t) => {
+  const tracker = { loseNextAdoptionAcknowledgement: true };
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  const targetCheckpoint = join(
+    fixture.legacy.directory,
+    filesystemImageProviderStateCheckpointName(fixture.candidateGeneration),
+  );
+  const targetLedger = join(
+    fixture.legacy.directory,
+    filesystemImageProviderStateLedgerName(fixture.candidateGeneration),
+  );
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const verifiedMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "verified",
+  );
+  assert.equal((await lstat(targetCheckpoint)).isFile(), true);
+  assert.equal((await lstat(targetLedger)).isFile(), true);
+  assert.equal((await lstat(pendingMarker)).isFile(), true);
+  await assert.rejects(lstat(verifiedMarker), (error) => error.code === "ENOENT");
+  assert.equal(fixture.exact.tracker.head.contractVersion, 3);
+  const recovered = await fixture.createState().snapshot();
+  assert.deepEqual(recovered, {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "2",
+    storages: [storageState()],
+  });
+  assert.equal(fixture.exact.tracker.adoptions, 2);
+  assert.equal(fixture.exact.tracker.operations.size, 1);
+  for (const name of [
+    filesystemImageProviderStateCheckpointName(fixture.sourceHead.generation),
+    filesystemImageProviderStateLedgerName(fixture.sourceHead.generation),
+  ]) {
+    await assert.rejects(
+      lstat(join(fixture.legacy.directory, name)),
+      (error) => error.code === "ENOENT",
+    );
+  }
+  assert.equal((await lstat(targetCheckpoint)).isFile(), true);
+  assert.equal((await lstat(targetLedger)).isFile(), true);
+  await assert.rejects(lstat(pendingMarker), (error) => error.code === "ENOENT");
+  await assert.rejects(lstat(verifiedMarker), (error) => error.code === "ENOENT");
+});
+
+test("verified adoption marker completes cleanup after restart", async (t) => {
+  const fixture = await createRotatedV2AdoptionHarness(t, {});
+  let directorySyncs = 0;
+  const stopAfterVerified = async (handle) => {
+    await handle.sync();
+    directorySyncs += 1;
+    if (directorySyncs === 3) {
+      fixture.legacy.tracker.failNextAssertion = true;
+    }
+  };
+  await assert.rejects(
+    fixture.createState({ syncDirectory: stopAfterVerified }).snapshot(),
+    stateError("maintenance_failed"),
+  );
+  assert.equal(directorySyncs, 3);
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const verifiedMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "verified",
+  );
+  assert.equal((await lstat(pendingMarker)).isFile(), true);
+  assert.equal((await lstat(verifiedMarker)).isFile(), true);
+  for (const generation of [
+    fixture.sourceHead.generation,
+    fixture.candidateGeneration,
+  ]) {
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+  }
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 1);
+  assert.deepEqual(await fixture.createState().snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "2",
+    storages: [storageState()],
+  });
+  assert.equal(fixture.exact.tracker.adoptions, 2);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 2);
+  for (const path of [pendingMarker, verifiedMarker]) {
+    await assert.rejects(lstat(path), (error) => error.code === "ENOENT");
+  }
+  for (const name of [
+    filesystemImageProviderStateCheckpointName(fixture.sourceHead.generation),
+    filesystemImageProviderStateLedgerName(fixture.sourceHead.generation),
+  ]) {
+    await assert.rejects(
+      lstat(join(fixture.legacy.directory, name)),
+      (error) => error.code === "ENOENT",
+    );
+  }
+});
+
+test("verified recovery completes partial source cleanup cuts", async (t) => {
+  for (const remaining of ["checkpoint", "ledger"]) {
+    await t.test(`${remaining}-only`, async (t) => {
+      const fixture = await createRotatedV2AdoptionHarness(t, {});
+      let directorySyncs = 0;
+      const stopAfterVerified = async (handle) => {
+        await handle.sync();
+        directorySyncs += 1;
+        if (directorySyncs === 3) {
+          fixture.legacy.tracker.failNextAssertion = true;
+        }
+      };
+      await assert.rejects(
+        fixture.createState({ syncDirectory: stopAfterVerified }).snapshot(),
+        stateError("maintenance_failed"),
+      );
+      const sourcePaths = {
+        checkpoint: join(
+          fixture.legacy.directory,
+          filesystemImageProviderStateCheckpointName(
+            fixture.sourceHead.generation,
+          ),
+        ),
+        ledger: join(
+          fixture.legacy.directory,
+          filesystemImageProviderStateLedgerName(
+            fixture.sourceHead.generation,
+          ),
+        ),
+      };
+      const removed = remaining === "checkpoint" ? "ledger" : "checkpoint";
+      await rm(sourcePaths[removed]);
+      const directoryHandle = await open(fixture.legacy.directory, "r");
+      try {
+        // Model either durable unlink ordering at a source-cleanup crash cut.
+        await directoryHandle.sync();
+      } finally {
+        await directoryHandle.close();
+      }
+      assert.equal(await fileExists(sourcePaths[remaining]), true);
+      assert.equal(await fileExists(sourcePaths[removed]), false);
+      assert.equal(fixture.exact.tracker.adoptions, 1);
+      assert.equal(fixture.exact.tracker.projectionComparisons, 1);
+
+      assert.deepEqual(await fixture.createState().snapshot(), {
+        contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+        stateRevision: "2",
+        storages: [storageState()],
+      });
+      assert.equal(fixture.exact.tracker.adoptions, 1);
+      assert.equal(fixture.exact.tracker.projectionComparisons, 2);
+      assert.equal(await fileExists(sourcePaths.checkpoint), false);
+      assert.equal(await fileExists(sourcePaths.ledger), false);
+      for (const phase of ["pending", "verified"]) {
+        assert.equal(
+          await fileExists(
+            adoptionMarkerPath(
+              fixture.legacy.directory,
+              fixture.candidateGeneration,
+              phase,
+            ),
+          ),
+          false,
+        );
+      }
+    });
+  }
+});
+
+test("verified recovery skips replay only after durable source cleanup", async (t) => {
+  const fixture = await createRotatedV2AdoptionHarness(t, {});
+  const sourcePaths = [
+    join(
+      fixture.legacy.directory,
+      filesystemImageProviderStateCheckpointName(
+        fixture.sourceHead.generation,
+      ),
+    ),
+    join(
+      fixture.legacy.directory,
+      filesystemImageProviderStateLedgerName(fixture.sourceHead.generation),
+    ),
+  ];
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const verifiedMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "verified",
+  );
+  let pendingDeletionSynced = false;
+  const stopAfterPendingDeletion = async (handle) => {
+    await handle.sync();
+    if (
+      !pendingDeletionSynced &&
+      (await fileExists(verifiedMarker)) &&
+      !(await fileExists(pendingMarker)) &&
+      !(await fileExists(sourcePaths[0])) &&
+      !(await fileExists(sourcePaths[1]))
+    ) {
+      pendingDeletionSynced = true;
+      fixture.legacy.tracker.failNextAssertion = true;
+    }
+  };
+  await assert.rejects(
+    fixture
+      .createState({ syncDirectory: stopAfterPendingDeletion })
+      .snapshot(),
+    stateError("maintenance_failed"),
+  );
+  assert.equal(pendingDeletionSynced, true);
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 1);
+  for (const path of sourcePaths) assert.equal(await fileExists(path), false);
+  assert.equal(await fileExists(pendingMarker), false);
+  assert.equal(await fileExists(verifiedMarker), true);
+
+  assert.deepEqual(await fixture.createState().snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "2",
+    storages: [storageState()],
+  });
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons, 2);
+  assert.equal(await fileExists(pendingMarker), false);
+  assert.equal(await fileExists(verifiedMarker), false);
+});
+
+test("cold adoption removes incomplete phase staging files", async (t) => {
+  const fixture = await createExactFixture(t, { head: genesisHead() });
+  const pendingStaging = adoptionMarkerStagingPath(
+    fixture.directory,
+    "1",
+    "pending",
+  );
+  const verifiedStaging = adoptionMarkerStagingPath(
+    fixture.directory,
+    "1",
+    "verified",
+  );
+  await writeFile(pendingStaging, Buffer.alloc(0), { mode: 0o600 });
+  await writeFile(verifiedStaging, Buffer.from("partial", "utf8"), {
+    mode: 0o600,
+  });
+
+  assert.deepEqual(await fixture.state.snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "0",
+    storages: [],
+  });
+  assert.equal(fixture.tracker.adoptions, 1);
+  assert.equal(fixture.tracker.projectionComparisons, 1);
+  for (const phase of ["pending", "verified"]) {
+    assert.equal(
+      await fileExists(adoptionMarkerPath(fixture.directory, "1", phase)),
+      false,
+    );
+    assert.equal(
+      await fileExists(
+        adoptionMarkerStagingPath(fixture.directory, "1", phase),
+      ),
+      false,
+    );
+  }
+});
+
+test("adoption publishes complete phase-bound markers before directory sync", async (t) => {
+  const fixture = await createExactFixture(t, { head: genesisHead() });
+  const observedPhases = [];
+  const syncDirectory = async (handle) => {
+    for (const phase of ["pending", "verified"]) {
+      if (observedPhases.includes(phase)) continue;
+      const finalPath = adoptionMarkerPath(fixture.directory, "1", phase);
+      if (!(await fileExists(finalPath))) continue;
+      assert.equal(
+        await fileExists(
+          adoptionMarkerStagingPath(fixture.directory, "1", phase),
+        ),
+        false,
+      );
+      const bytes = await readFile(finalPath);
+      const marker = JSON.parse(bytes.toString("utf8"));
+      assert.equal(bytes.toString("utf8"), canonicalJson(marker));
+      assert.deepEqual(Object.keys(marker).sort(), [
+        "contractVersion",
+        "expectedHead",
+        "nextHead",
+        "phase",
+      ]);
+      assert.equal(marker.contractVersion, 1);
+      assert.equal(marker.phase, phase);
+      assert.deepEqual(marker.expectedHead, genesisHead());
+      assert.equal(marker.nextHead.contractVersion, 3);
+      assert.equal(marker.nextHead.generation, "1");
+      observedPhases.push(phase);
+    }
+    await handle.sync();
+  };
+
+  assert.deepEqual(
+    await fixture.createState({ syncDirectory }).snapshot(),
+    {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "0",
+      storages: [],
+    },
+  );
+  assert.deepEqual(observedPhases, ["pending", "verified"]);
+});
+
+test("v2 adoption removes an inert target generation after a definite stale result", async (t) => {
+  const tracker = { returnFalseNextAdoption: true };
+  const fixture = await createExactFixture(t, { head: genesisHead(), tracker });
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("maintenance_failed"),
+  );
+  await assert.rejects(
+    lstat(
+      join(
+        fixture.directory,
+        filesystemImageProviderStateCheckpointName("1"),
+      ),
+    ),
+    (error) => error.code === "ENOENT",
+  );
+  await assert.rejects(
+    lstat(
+      join(fixture.directory, filesystemImageProviderStateLedgerName("1")),
+    ),
+    (error) => error.code === "ENOENT",
+  );
+  for (const phase of ["pending", "verified"]) {
+    await assert.rejects(
+      lstat(adoptionMarkerPath(fixture.directory, "1", phase)),
+      (error) => error.code === "ENOENT",
+    );
+    await assert.rejects(
+      lstat(adoptionMarkerStagingPath(fixture.directory, "1", phase)),
+      (error) => error.code === "ENOENT",
+    );
+  }
+  assert.equal(fixture.tracker.head.contractVersion, 2);
+  assert.equal(fixture.tracker.projectionComparisons ?? 0, 0);
+});
+
+test("unchanged adoption cleanup survives the pending-delete crash cut", async (t) => {
+  const runFinalRetryAssertions = async (fixture) => {
+    assert.deepEqual(await fixture.createState().snapshot(), {
+      contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+      stateRevision: "0",
+      storages: [],
+    });
+    assert.equal(fixture.tracker.adoptions, 2);
+    for (const phase of ["pending", "verified"]) {
+      assert.equal(
+        await fileExists(adoptionMarkerPath(fixture.directory, "1", phase)),
+        false,
+      );
+      assert.equal(
+        await fileExists(
+          adoptionMarkerStagingPath(fixture.directory, "1", phase),
+        ),
+        false,
+      );
+    }
+  };
+
+  await t.test("fresh unchanged result", async (t) => {
+    const tracker = { returnFalseNextAdoption: true };
+    const fixture = await createExactFixture(t, {
+      head: genesisHead(),
+      tracker,
+    });
+    const pending = adoptionMarkerPath(fixture.directory, "1", "pending");
+    const candidate = join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("1"),
+    );
+    let pendingPublished = false;
+    let crashCutReached = false;
+    const syncDirectory = async (handle) => {
+      await handle.sync();
+      const pendingExists = await fileExists(pending);
+      if (pendingExists) pendingPublished = true;
+      else if (pendingPublished && (await fileExists(candidate))) {
+        crashCutReached = true;
+        fixture.lockTracker.failNextAssertion = true;
+      }
+    };
+    await assert.rejects(
+      fixture.createState({ syncDirectory }).snapshot(),
+      stateError("maintenance_failed"),
+    );
+    assert.equal(crashCutReached, true);
+    assert.equal(await fileExists(pending), false);
+    assert.equal(await fileExists(candidate), true);
+    assert.equal(fixture.tracker.head.contractVersion, 2);
+    await runFinalRetryAssertions(fixture);
+  });
+
+  await t.test("recovered unchanged result", async (t) => {
+    const tracker = { returnFalseNextAdoption: true };
+    const fixture = await createExactFixture(t, {
+      head: genesisHead(),
+      tracker,
+    });
+    const pending = adoptionMarkerPath(fixture.directory, "1", "pending");
+    const candidate = join(
+      fixture.directory,
+      filesystemImageProviderStateCheckpointName("1"),
+    );
+    let pendingPublished = false;
+    const stopBeforeCompare = async (handle) => {
+      await handle.sync();
+      if (!pendingPublished && (await fileExists(pending))) {
+        pendingPublished = true;
+        fixture.lockTracker.failNextAssertion = true;
+      }
+    };
+    await assert.rejects(
+      fixture.createState({ syncDirectory: stopBeforeCompare }).snapshot(),
+      stateError("io_failed"),
+    );
+    assert.equal(await fileExists(pending), true);
+    assert.equal(await fileExists(candidate), true);
+    let crashCutReached = false;
+    const stopAfterPendingDelete = async (handle) => {
+      await handle.sync();
+      if (!(await fileExists(pending)) && (await fileExists(candidate))) {
+        crashCutReached = true;
+        fixture.lockTracker.failNextAssertion = true;
+      }
+    };
+    await assert.rejects(
+      fixture
+        .createState({ syncDirectory: stopAfterPendingDelete })
+        .snapshot(),
+      stateError("maintenance_failed"),
+    );
+    assert.equal(crashCutReached, true);
+    assert.equal(await fileExists(pending), false);
+    assert.equal(await fileExists(candidate), true);
+    assert.equal(fixture.tracker.head.contractVersion, 2);
+    await runFinalRetryAssertions(fixture);
+  });
+});
+
+test("v2 adoption does not accept next-head observation after a false result", async (t) => {
+  const tracker = { returnFalseWithNextHeadObservation: true };
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  const { candidateGeneration, exact, legacy, sourceHead } = fixture;
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  const retainedPaths = [
+    adoptionMarkerPath(legacy.directory, candidateGeneration, "pending"),
+  ];
+  for (const generation of [sourceHead.generation, candidateGeneration]) {
+    retainedPaths.push(
+      join(
+        legacy.directory,
+        filesystemImageProviderStateCheckpointName(generation),
+      ),
+      join(legacy.directory, filesystemImageProviderStateLedgerName(generation)),
+    );
+  }
+  const retainedBytes = await Promise.all(retainedPaths.map((path) => readFile(path)));
+  const pendingMarker = JSON.parse(retainedBytes[0].toString("utf8"));
+  assert.equal(retainedBytes[0].toString("utf8"), canonicalJson(pendingMarker));
+  assert.deepEqual(pendingMarker, {
+    contractVersion: 1,
+    expectedHead: sourceHead,
+    nextHead: exact.tracker.head,
+    phase: "pending",
+  });
+  await assert.rejects(
+    lstat(adoptionMarkerPath(legacy.directory, candidateGeneration, "verified")),
+    (error) => error.code === "ENOENT",
+  );
+  assert.equal(exact.tracker.head.contractVersion, 3);
+  assert.equal(exact.tracker.head.generation, candidateGeneration);
+  assert.deepEqual(
+    exact.tracker.adoptionOperations.map((operation) => operation.operationId),
+    ["operation-adoption-recovery-001"],
+  );
+  assert.equal(exact.tracker.operations.size, 0);
+  assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  assert.equal(exact.tracker.adoptions, 2);
+  assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+  for (let index = 0; index < retainedPaths.length; index += 1) {
+    assert.deepEqual(await readFile(retainedPaths[index]), retainedBytes[index]);
+  }
+});
+
+test("verified marker cannot bypass exact retained-source replay", async (t) => {
+  for (const mode of ["copied-pending", "phase-rewritten"]) {
+    await t.test(mode, async (t) => {
+      const tracker = { returnFalseWithNextHeadObservation: true };
+      const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+      await assert.rejects(
+        fixture.state.snapshot(),
+        stateError("commit_outcome_uncertain"),
+      );
+      const pendingPath = adoptionMarkerPath(
+        fixture.legacy.directory,
+        fixture.candidateGeneration,
+        "pending",
+      );
+      const verifiedPath = adoptionMarkerPath(
+        fixture.legacy.directory,
+        fixture.candidateGeneration,
+        "verified",
+      );
+      const pendingBytes = await readFile(pendingPath);
+      const verifiedBytes =
+        mode === "copied-pending"
+          ? pendingBytes
+          : Buffer.from(
+              canonicalJson({
+                ...JSON.parse(pendingBytes.toString("utf8")),
+                phase: "verified",
+              }),
+              "utf8",
+            );
+      await writeFile(verifiedPath, verifiedBytes, { mode: 0o600 });
+      const retainedPaths = [pendingPath, verifiedPath];
+      for (const generation of [
+        fixture.sourceHead.generation,
+        fixture.candidateGeneration,
+      ]) {
+        retainedPaths.push(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        );
+      }
+      const retainedBytes = await Promise.all(
+        retainedPaths.map((path) => readFile(path)),
+      );
+      await assert.rejects(
+        fixture.createState().snapshot(),
+        stateError(
+          mode === "copied-pending"
+            ? "corrupt_ledger"
+            : "commit_outcome_uncertain",
+        ),
+      );
+      assert.equal(
+        fixture.exact.tracker.adoptions,
+        mode === "copied-pending" ? 1 : 2,
+      );
+      assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+      for (let index = 0; index < retainedPaths.length; index += 1) {
+        assert.deepEqual(await readFile(retainedPaths[index]), retainedBytes[index]);
+      }
+    });
+  }
+});
+
+test("tampered adoption marker fails closed without authority replay", async (t) => {
+  const tracker = { returnFalseWithNextHeadObservation: true };
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  const pendingMarker = adoptionMarkerPath(
+    fixture.legacy.directory,
+    fixture.candidateGeneration,
+    "pending",
+  );
+  const tampered = Buffer.from(await readFile(pendingMarker));
+  const marker = Buffer.from('"contractVersion":1', "utf8");
+  const markerOffset = tampered.indexOf(marker);
+  assert(markerOffset >= 0);
+  tampered[markerOffset + marker.length - 1] = 0x32;
+  await writeFile(pendingMarker, tampered, { mode: 0o600 });
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("corrupt_ledger"),
+  );
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+  assert.deepEqual(await readFile(pendingMarker), tampered);
+  for (const generation of [
+    fixture.sourceHead.generation,
+    fixture.candidateGeneration,
+  ]) {
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+  }
+});
+
+test("pending adoption recovery never truncates retained ledgers", async (t) => {
+  for (const target of ["source", "candidate"]) {
+    await t.test(target, async (t) => {
+      const tracker = { returnFalseWithNextHeadObservation: true };
+      const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+      await assert.rejects(
+        fixture.state.snapshot(),
+        stateError("commit_outcome_uncertain"),
+      );
+      const generation =
+        target === "source"
+          ? fixture.sourceHead.generation
+          : fixture.candidateGeneration;
+      const ledger = join(
+        fixture.legacy.directory,
+        filesystemImageProviderStateLedgerName(generation),
+      );
+      await appendFile(ledger, Buffer.from("retained-tail", "utf8"));
+      const retained = await readFile(ledger);
+      await assert.rejects(
+        fixture.createState().snapshot(),
+        stateError("corrupt_ledger"),
+      );
+      assert.deepEqual(await readFile(ledger), retained);
+      assert.equal(fixture.exact.tracker.adoptions, 1);
+      assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+      assert.equal(
+        (
+          await lstat(
+            adoptionMarkerPath(
+              fixture.legacy.directory,
+              fixture.candidateGeneration,
+              "pending",
+            ),
+          )
+        ).isFile(),
+        true,
+      );
+    });
+  }
+});
+
+test("v3 head without an adoption marker retains a v2 predecessor", async (t) => {
+  const tracker = { returnFalseWithNextHeadObservation: true };
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  await assert.rejects(
+    fixture.state.snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  await rm(
+    adoptionMarkerPath(
+      fixture.legacy.directory,
+      fixture.candidateGeneration,
+      "pending",
+    ),
+  );
+  await assert.rejects(
+    fixture.createState().snapshot(),
+    stateError("commit_outcome_uncertain"),
+  );
+  assert.equal(fixture.exact.tracker.adoptions, 1);
+  assert.equal(fixture.exact.tracker.projectionComparisons ?? 0, 0);
+  for (const generation of [
+    fixture.sourceHead.generation,
+    fixture.candidateGeneration,
+  ]) {
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateCheckpointName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+    assert.equal(
+      (
+        await lstat(
+          join(
+            fixture.legacy.directory,
+            filesystemImageProviderStateLedgerName(generation),
+          ),
+        )
+      ).isFile(),
+      true,
+    );
+  }
+});
+
+test(
+  "v3 head without an adoption marker retains an unrotated generation-zero v2 ledger",
+  async (t) => {
+    const legacy = await createFixture(t);
+    await prepareAndCommit(legacy.state, {
+      operationId: "operation-generation-zero-adoption-recovery-001",
+      request: operationRequest("provision"),
+      storage: storageState(),
+    });
+    const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+    assert.equal(sourceHead.contractVersion, 2);
+    assert.equal(sourceHead.generation, "0");
+    assert.equal(sourceHead.stateRevision, "2");
+    assert.equal(sourceHead.checkpointChecksum, null);
+    assert.equal(sourceHead.checkpointBytes, 0);
+
+    const tracker = { returnFalseWithNextHeadObservation: true };
+    const exact = createExactStateAuthorities({ head: sourceHead, tracker });
+    const createState = () =>
+      new FilesystemImageProviderState({
+        acquireLock: legacy.acquireLock,
+        adoptionAuthority: exact.adoptionAuthority,
+        directory: legacy.directory,
+        stateAuthority: exact.stateAuthority,
+        ...TRUSTED_ACL_INSPECTORS,
+      });
+
+    await assert.rejects(
+      createState().snapshot(),
+      stateError("commit_outcome_uncertain"),
+    );
+    assert.equal(exact.tracker.head.contractVersion, 3);
+    assert.equal(exact.tracker.head.generation, "1");
+    assert.equal(exact.tracker.operations.size, 0);
+    assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+
+    const pendingMarker = adoptionMarkerPath(legacy.directory, "1", "pending");
+    const sourceLedger = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName("0"),
+    );
+    const sourceCheckpoint = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName("0"),
+    );
+    const candidateCheckpoint = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName("1"),
+    );
+    const candidateLedger = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName("1"),
+    );
+    assert.equal(await fileExists(pendingMarker), true);
+    assert.equal(await fileExists(sourceCheckpoint), false);
+    const retainedPaths = [sourceLedger, candidateCheckpoint, candidateLedger];
+    const retainedBytes = await Promise.all(
+      retainedPaths.map((path) => readFile(path)),
+    );
+
+    await rm(pendingMarker);
+    await assert.rejects(
+      createState().snapshot(),
+      stateError("commit_outcome_uncertain"),
+    );
+    assert.equal(exact.tracker.adoptions, 1);
+    assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+    assert.equal(await fileExists(sourceCheckpoint), false);
+    for (let index = 0; index < retainedPaths.length; index += 1) {
+      assert.deepEqual(
+        await readFile(retainedPaths[index]),
+        retainedBytes[index],
+      );
+    }
+  },
+);
+
+test("v2 head replaces a candidate left before pending-marker durability", async (t) => {
+  const fixture = await createExactFixture(t, { head: genesisHead() });
+  const candidateCheckpoint = join(
+    fixture.directory,
+    filesystemImageProviderStateCheckpointName("1"),
+  );
+  const candidateLedger = join(
+    fixture.directory,
+    filesystemImageProviderStateLedgerName("1"),
+  );
+  const checkpointSentinel = Buffer.from("candidate-before-pending", "utf8");
+  const ledgerSentinel = Buffer.from("candidate-before-pending", "utf8");
+  await writeFile(candidateCheckpoint, checkpointSentinel, { mode: 0o600 });
+  await writeFile(candidateLedger, ledgerSentinel, { mode: 0o600 });
+  assert.deepEqual(await fixture.state.snapshot(), {
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    stateRevision: "0",
+    storages: [],
+  });
+  assert.notDeepEqual(await readFile(candidateCheckpoint), checkpointSentinel);
+  assert.deepEqual(await readFile(candidateLedger), Buffer.alloc(0));
+  for (const phase of ["pending", "verified"]) {
+    await assert.rejects(
+      lstat(adoptionMarkerPath(fixture.directory, "1", phase)),
+      (error) => error.code === "ENOENT",
+    );
+  }
+  assert.equal(fixture.tracker.adoptions, 1);
+  assert.equal(fixture.tracker.head.contractVersion, 3);
 });
 
 test("repeated rotation preserves committed evidence, tombstones, and prepared ambiguity", async (t) => {
@@ -675,7 +2646,7 @@ test("capacity inspection reports exact soft and hard boundaries", async (t) => 
   const initial = await initialPromise;
   assert.equal(Object.isFrozen(initial), true);
   assert.deepEqual(initial, {
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
     anchorRevision: "0",
     generation: "0",
     stateRevision: "0",
@@ -1686,7 +3657,10 @@ test("replays committed operations and complete mount state after restart", asyn
   const snapshotPromise = restarted.snapshot();
   assert.equal(snapshotPromise instanceof Promise, true);
   const snapshot = await snapshotPromise;
-  assert.equal(snapshot.contractVersion, FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION);
+  assert.equal(
+    snapshot.contractVersion,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_V2_CONTRACT_VERSION,
+  );
   assert.equal(snapshot.sequence, 2);
   assert.equal(snapshot.operations.length, 1);
   assert.equal(snapshot.storages.length, 1);
@@ -2426,6 +4400,35 @@ test("checksum corruption and non-frame garbage fail closed without truncation",
   });
 });
 
+test("checkpoint and delta payload sequence must equal the binary envelope sequence", async (t) => {
+  await t.test("delta", async (t) => {
+    const fixture = await createFixture(t);
+    await fixture.state.prepareOperation({
+      kind: "provision",
+      operationId: "operation-payload-sequence-001",
+      request: operationRequest("provision"),
+      storageId: "storage-001",
+    });
+    const ledger = await readFile(fixture.ledgerPath);
+    rewritePayloadSequenceWithValidEnvelope(ledger, 0, 2);
+    await writeFile(fixture.ledgerPath, ledger);
+    await assert.rejects(
+      fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+  await t.test("checkpoint", async (t) => {
+    const rotated = await createRotatedFixture(t);
+    const checkpoint = await readFile(rotated.checkpointPath);
+    rewritePayloadSequenceWithValidEnvelope(checkpoint, 0, 2);
+    await writeFile(rotated.checkpointPath, checkpoint);
+    await assert.rejects(
+      rotated.fixture.createState().snapshot(),
+      stateError("corrupt_ledger"),
+    );
+  });
+});
+
 test("directory fsync failure before genesis CAS reports failed cleanup without commit", async (t) => {
   const fixture = await createFixture(t);
   await fixture.state.snapshot();
@@ -2544,6 +4547,14 @@ test("trusted head collaborators and values are exact, receiver-safe, and promis
   );
   assert.throws(
     () => filesystemImageProviderStateLedgerName("01"),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      normalizeFilesystemImageProviderStateHead({
+        ...canonical,
+        stateRevision: "9".repeat(100_000),
+      }),
     stateError("invalid_request"),
   );
   const generationZeroActive = normalizeFilesystemImageProviderStateHead({

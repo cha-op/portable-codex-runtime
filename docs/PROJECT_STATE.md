@@ -518,48 +518,60 @@
   No published path, generation row, serialized measurement, attempt record,
   or discovery result is writer-launch authority by itself.
 - Production-injectable Linux ext4 physical components now supply sparse raw-
-  image lifecycle through native operations below host-owned `rprivate` mount
-  carriers, exact close-before-unmount and loop-detach settlement, an
-  automatically rotated provider-state checkpoint and bounded active delta log
-  checked against an external PostgreSQL v2 generation head, two distinct
-  persistent archive control identities, and a rootless digest-pinned Podman
-  writer supervisor. The head binds monotonic anchor/state revisions, the
-  generation and previous-head digest, checkpoint boundary/digest, and active-
-  log boundary/digest. Rotation syncs the next checkpoint, empty log, and
-  parent directory before a pure-maintenance CAS. Default 8 MiB/8,192-frame
-  soft watermarks rotate before the 64 MiB/65,535-frame hard envelope, and
-  `inspectCapacity()` exposes both boundaries. The control-plane checkpoint
-  retains all operations for exact replay plus current storage and destroyed
-  tombstones; it is not a physical image checkpoint. Migration 010 now adds a
-  permanent PostgreSQL operation-index foundation whose canonical prepared and
-  committed records, prepared checksums, committed-checksum provenance, and
-  record digests share one serializable durable cut with the external head.
-  The head now carries an internal nullable operation-index completeness
-  marker. Existing version 2 heads remain unadopted with a null marker;
-  `readHead()` may report their public head, while operation reads, paging, and
-  exact-head appends fail closed. Genesis-created indexed heads set and advance
-  the marker with logical appends and preserve it through rotation. The latest
-  validated committed record per storage is the current PostgreSQL projection,
-  so a full canonical `storageStateBefore` mismatch rolls back the head,
-  marker, and history. Destroyed storage remains represented by its committed
-  tombstone.
-  Migration 010 accepts only native `indexed-frame-v1` commits plus the exact
-  checksum; it neither represents nor permits an unavailable rotated-legacy
-  suffix. Migration 008 already requires every non-null value in the three
-  external-head checksum columns to be an exact 64-byte lowercase-hex value;
-  migration 010 normalizes those valid values to `varchar(64)` before version 3
-  and gives all four new operation checksum/digest columns the same exact
-  format. Bounded paging admits at most four operations. Exact prepared
-  history may gain its committed suffix once; it cannot be rebound or deleted
-  while the anchor remains, and
-  whole-table truncation is always rejected.
-  Production still serves version 2 provider state and retains the same
-  complete local history, so hosts must continue monitoring checkpoint and
-  aggregate provider-state bytes until PR-B migration 011 atomically introduces
-  the `unavailable-adopted-v2` provenance, validates and imports complete
-  history with revision coverage and uniqueness, installs its covering version
-  3 checkpoint head, and sets the exact completeness marker. A transaction
-  token or covering head alone does not grant that write capability. Producer
+  image lifecycle below host-owned `rprivate` mount carriers, exact close-
+  before-unmount and loop-detach settlement, an automatically rotated
+  provider-state checkpoint and bounded active delta log checked against an
+  external PostgreSQL head, two distinct persistent archive control identities,
+  and a rootless digest-pinned Podman writer supervisor. Migrations 010 and 011
+  make PostgreSQL the permanent exact-operation replay index for provider-state
+  version 3. The local version 3 checkpoint keeps all current storage records,
+  destroyed tombstones, attachment-origin operation IDs, and only the live
+  prepared recovery working set; committed history is no longer copied across
+  rotation. The contract-version-3 runtime authority validates one compact
+  projection request in a single serializable transaction: it independently
+  streams and fully normalizes the complete prepared set through one data
+  `SELECT` whose `LIMIT` comes from the exact stored head's structural bound.
+  It validates `A` committed attachment origins in independent fixed 65,535-ID
+  input/query batches through `max(1, ceil(A / 65,535))` streamed origin data
+  `SELECT` statements, in addition to the exact-head `SELECT`. SQL parameters
+  and additional memory remain bounded per batch, and a domain-separated
+  receipt is returned only for an exact match. The provider reuses that receipt
+  only for the same authority instance, exact head, and unchanged loaded
+  generation; uncertain acknowledgement and adoption paths require fresh validation.
+  A provider-locked version 2 adoption replays revisions `1..N`, proves storage
+  lineage and final projection, durably writes the covering version 3 files,
+  and then imports or verifies the complete PostgreSQL history in the same
+  serializable cut as the version 3 head and completeness marker. Migration
+  011's database-supplied transaction ID and deferred coverage trigger reject
+  head-only, partial, duplicate, extra, or cross-manifest imports. The manifest
+  is an acknowledgement receipt rather than a write token. Native commits use
+  `indexed-frame-v1`; only that adoption transaction can write
+  `unavailable-adopted-v2`. Commit acknowledgement loss is resolved by exact
+  head, marker, manifest, and full-row readback.
+  Migration 011 also claims each prepared and committed revision in an
+  internal unique event registry. It validates every migrated non-null marker
+  once, then permits only a one-revision indexed append with its deferred event
+  claim or a revision-preserving rotation; bulk adoption remains subject to
+  the separate full-range proof. A raw head insert or jump therefore cannot
+  assert completeness without permanent history. Stored heads exclude
+  revision zero, and a database-managed progress transaction ID prevents an
+  early constraint check from authorizing a second head mutation.
+  The latest validated committed operation per storage remains the PostgreSQL
+  projection, so a complete canonical `storageStateBefore` mismatch rolls the
+  head, marker, and history back together. Destroyed storage remains a durable
+  tombstone. Version 3 `inspectCapacity()` counts only live prepared operations
+  as retained local operations. Full-array adoption version 1 is deliberately
+  capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate
+  canonical operation/prepared-projection/storage material; those limits apply
+  only to adoption, not to legal version 3 runtime projection. A valid version
+  2 state over any adoption limit fails with `state_capacity_exhausted` before
+  candidate mutation and needs a future streaming adoption contract. A
+  permanent anchor-lifecycle row
+  serializes every head insert through the same unique key; full teardown of
+  any operation history moves that row from active to immutable retired, so
+  neither an early deferred-constraint check nor a concurrent transaction can
+  recycle the same provider/anchor identity. Every head deletion retires the
+  row, including an empty head, to prevent durable-anchor ABA. Producer
   outputs bind
   the archive mount-root and artifact-child tuples separately; on the consumer,
   the former makes the first remount verification-only and the latter
@@ -627,6 +639,8 @@
   `docs/project_journal/2026/07/2026-07-01-runtime-delivery-plan-6f13a8.md`
 - Provider-state operation index:
   `docs/project_journal/2026/08/2026-08-20-provider-state-operation-index-c7e4a1.md`
+- Provider-state version 3 adoption:
+  `docs/project_journal/2026/08/2026-08-20-provider-state-v3-adoption-9d4c2e.md`
 - Linux ext4 physical backend:
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - ext4-to-Podman attachment composition:
@@ -769,8 +783,8 @@
   registry trust. Terminal supervisor-state GC safety after PostgreSQL terminal
   commit is complete for both healthy-session callback quiescence and exact
   same-authorization session-loss overlap. The provider operation-index
-  authority foundation is complete; the next independent slice switches the
-  provider to version 3 by atomically importing the complete version 2 history
-  and setting the covering head's completeness marker. It must preserve every
-  current attachment's origin operation while removing permanent operation
-  history from local checkpoints.
+  authority, atomic version 2-to-3 adoption, current attachment-origin binding,
+  and committed-history removal from local checkpoints are complete. The next
+  provider-state capacity slice is a streaming or paged adoption contract for
+  otherwise-valid version 2 state beyond the current 65,535-operation,
+  65,535-storage, or 64 MiB full-array adoption limits.
