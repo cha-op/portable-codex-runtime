@@ -2132,6 +2132,12 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     revision: preparedZHead.stateRevision,
     storageId: `provider-storage-z-${randomUUID()}`,
   });
+  const committedZHead = appendHead(preparedZHead, "b".repeat(64), 1536);
+  const committedZ = committedRecord(
+    preparedZ,
+    committedZHead.stateRevision,
+  );
+  const committedZMaterial = operationMaterial(committedZ);
   assert.equal(
     await authority.compareAndAdvance({
       expectedHead: genesis,
@@ -2182,6 +2188,46 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   assert.equal(preparedZStored.rowCount, 1);
   const assertPreparedZStoredUnchanged = async () => {
     assert.deepEqual((await readPreparedZStored()).rows, preparedZStored.rows);
+  };
+  // A native commit advances the head before it appends the operation suffix.
+  // Reproduce that ordering so malformed suffixes reach the table CHECK.
+  const assertCommittedShapeRejected = async (query, values) => {
+    const client = await pool.connect();
+    let transactionOpen = false;
+    try {
+      await client.query("BEGIN");
+      transactionOpen = true;
+      assert.equal(
+        (
+          await client.query(
+            rawHeadUpdateQuery,
+            rawHeadInsertValues(
+              anchorId,
+              committedZHead,
+              committedZHead.stateRevision,
+            ),
+          )
+        ).rowCount,
+        1,
+      );
+      await assert.rejects(client.query(query, values), (error) => {
+        assert.equal(error.code, "23514");
+        assert.equal(
+          error.constraint,
+          "fs_image_operations_committed_shape",
+        );
+        return true;
+      });
+      await client.query("ROLLBACK");
+      transactionOpen = false;
+    } finally {
+      if (transactionOpen) await client.query("ROLLBACK");
+      client.release();
+    }
+    assert.deepEqual(
+      await readProviderAnchorSnapshot(anchorId),
+      preparedZSnapshot,
+    );
   };
   await assert.rejects(
     pool.query(
@@ -2247,51 +2293,44 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     },
   );
   await assertPreparedZStoredUnchanged();
-  await assert.rejects(
-    pool.query(
-      [
-        "UPDATE session_authority.filesystem_image_provider_operations",
-        "SET state = 'committed',",
-        "committed_state_revision = prepared_state_revision + 1,",
-        "committed_checksum_provenance = 'indexed-frame-v1',",
-        "committed_checksum = $4, committed_record_bytes = prepared_record_bytes,",
-        "committed_record_sha256 = prepared_record_sha256",
-        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
-      ].join(" "),
-      [providerId, anchorId, operationZ, "c".repeat(63)],
-    ),
-    (error) => {
-      assert.equal(error.code, "23514");
-      assert.equal(
-        error.constraint,
-        "fs_image_operations_committed_shape",
-      );
-      return true;
-    },
+  await assertCommittedShapeRejected(
+    [
+      "UPDATE session_authority.filesystem_image_provider_operations",
+      "SET state = 'committed',",
+      "committed_state_revision = prepared_state_revision + 1,",
+      "committed_checksum_provenance = 'indexed-frame-v1',",
+      "committed_checksum = $4, committed_record_bytes = $5,",
+      "committed_record_sha256 = $6",
+      "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+    ].join(" "),
+    [
+      providerId,
+      anchorId,
+      operationZ,
+      "c".repeat(63),
+      committedZMaterial.bytes,
+      committedZMaterial.sha256,
+    ],
   );
   await assertPreparedZStoredUnchanged();
-  await assert.rejects(
-    pool.query(
-      [
-        "UPDATE session_authority.filesystem_image_provider_operations",
-        "SET state = 'committed',",
-        "committed_state_revision = prepared_state_revision + 1,",
-        "committed_checksum_provenance = 'indexed-frame-v1',",
-        "committed_checksum = prepared_checksum,",
-        "committed_record_bytes = prepared_record_bytes,",
-        "committed_record_sha256 = $4",
-        "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
-      ].join(" "),
-      [providerId, anchorId, operationZ, "d".repeat(63)],
-    ),
-    (error) => {
-      assert.equal(error.code, "23514");
-      assert.equal(
-        error.constraint,
-        "fs_image_operations_committed_shape",
-      );
-      return true;
-    },
+  await assertCommittedShapeRejected(
+    [
+      "UPDATE session_authority.filesystem_image_provider_operations",
+      "SET state = 'committed',",
+      "committed_state_revision = prepared_state_revision + 1,",
+      "committed_checksum_provenance = 'indexed-frame-v1',",
+      "committed_checksum = $4, committed_record_bytes = $5,",
+      "committed_record_sha256 = $6",
+      "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
+    ].join(" "),
+    [
+      providerId,
+      anchorId,
+      operationZ,
+      committedZHead.lastChecksum,
+      committedZMaterial.bytes,
+      "d".repeat(63),
+    ],
   );
   await assertPreparedZStoredUnchanged();
   await assert.rejects(
@@ -2360,10 +2399,21 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     pool.query(
       [
         "UPDATE session_authority.filesystem_image_provider_operations",
-        "SET state = 'committed'",
+        "SET state = 'committed', committed_state_revision = $4,",
+        "committed_checksum_provenance = 'indexed-frame-v1',",
+        "committed_checksum = $5, committed_record_bytes = $6,",
+        "committed_record_sha256 = $7",
         "WHERE provider_id = $1 AND anchor_id = $2 AND operation_id = $3",
       ].join(" "),
-      [providerId, anchorId, operationZ],
+      [
+        providerId,
+        anchorId,
+        operationZ,
+        committedZHead.stateRevision,
+        committedZHead.lastChecksum,
+        committedZMaterial.bytes,
+        committedZMaterial.sha256,
+      ],
     ),
     (error) => {
       assert.equal(error.code, "55000");
@@ -2435,11 +2485,6 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   );
   assert.deepEqual(await authority.readHead(), preparedZHead);
 
-  const committedZHead = appendHead(preparedZHead, "b".repeat(64), 1536);
-  const committedZ = committedRecord(
-    preparedZ,
-    committedZHead.stateRevision,
-  );
   await assert.rejects(
     authority.compareAndAdvance({
       expectedHead: preparedZHead,
