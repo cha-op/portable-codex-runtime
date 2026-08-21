@@ -76,8 +76,10 @@ superseded_by:
   projection phase therefore uses one prepared data `SELECT` plus
   `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements, in
   addition to the exact-head `SELECT`; SQL parameters and additional memory
-  remain bounded per batch. It returns a receipt only for an exact match under
-  the exact head. The repository-pinned
+  remain bounded per batch. The frozen origin array is preflighted and hashed
+  sequentially with constant authority-owned working memory, then normalized
+  again only for the current query batch. It returns a receipt only for an
+  exact match under the exact head. The repository-pinned
   `pg@8.22.0` portal fetches 1,024 rows at a time; the store accepts completion
   only after exact `SELECT` command, row-count, empty-result-accumulator, and
   transaction-identity checks. A server `ErrorResponse` sends one protocol
@@ -88,6 +90,10 @@ superseded_by:
   and unchanged loaded generation; cold reparsing, adoption, and uncertain
   acknowledgement readback revalidate it. Arbitrary-age `readOperation()`
   results come from PostgreSQL.
+- Once an exact append CAS has advanced the PostgreSQL head and operation row,
+  any later projection query or receipt failure preserves its specific error
+  code but reports `commitState: "committed"`; callers cannot safely retry an
+  already durable user operation as uncommitted.
 - The version 2 ext4-to-Podman persistent binding requires
   `currentAttachmentOriginOperationId` to equal the queried operation. It
   compares the origin committed storage with current storage after normalizing
@@ -112,7 +118,9 @@ superseded_by:
   finishes an interrupted source cleanup when only part or none of that source
   remains. A marker/head mismatch, marker tamper, or a version 3 head with an
   unmarked version 2 predecessor fails closed and preserves the recovery
-  material.
+  material. Ledger-only predecessors, including generation zero, are decoded
+  by their delta sequence and revision fields rather than a checkpoint-only
+  generation field that delta frames do not contain.
 - A permanent lifecycle registry owns each `(provider_id, anchor_id)` key.
   Every head insert claims that same unique row, while complete teardown of any
   operation history moves it from active to immutable retired. This real

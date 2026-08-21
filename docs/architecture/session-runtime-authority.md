@@ -2592,6 +2592,12 @@ or later-transaction writes roll back. Already-indexed source and target
 history are each revalidated with one ordered row stream; only the legacy
 history import retains fixed 64-row write batches.
 
+Cold adoption recovery identifies the retained predecessor from either its
+checkpoint or its active ledger. Checkpoint envelopes bind their generation;
+delta-ledger envelopes bind sequence and revision but carry no generation
+field, so recovery does not invent a checkpoint-only generation requirement
+for a generation-zero or otherwise ledger-only predecessor.
+
 The version 3 runtime authority has the exact frozen surface
 `{ contractVersion: 3, readHead, readOperation, readOperationsPage,
 readPreparedOperationsPage, compareProjection, compareAndAdvance }`.
@@ -2601,7 +2607,10 @@ origin summaries. In one serializable transaction it validates the exact head
 and completeness marker, then independently streams and fully normalizes every
 prepared row in one data `SELECT` whose `LIMIT` is derived from the exact
 stored head's structural bound. It validates attachment-origin input and named
-origin query results in independent fixed batches of at most 65,535 IDs. Each
+origin query results in independent fixed batches of at most 65,535 IDs. A
+first sequential pass validates the frozen input, global storage ordering, and
+incremental checksum with constant authority-owned working memory. A second
+pass materializes only the current batch's normalized origins and IDs. Each
 origin must be a committed `attach` or `restore-attach` for the named storage;
 its complete canonical storage state must equal the current state after
 normalizing only a legal monotonic revision increase. The prepared and origin
@@ -2614,7 +2623,11 @@ The provider caches that receipt only inside the same authority instance and
 for the exact unchanged loaded generation and head. A definite normal append
 or rotation obtains the receipt for its new head before publishing the next
 cache. A cold parse, version 2 adoption, or acknowledgement-loss readback does
-not infer the receipt and must run a new comparison. For `A` attachment origins,
+not infer the receipt and must run a new comparison. Once a normal append's
+exact authority CAS is known to have advanced, a later projection failure
+preserves its `io_failed` or `corrupt_ledger` cause but reports
+`commitState: "committed"`, because the new head and operation row are already
+durable. For `A` attachment origins,
 projection validation uses one exact-head `SELECT`, one prepared data `SELECT`,
 and `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements in the
 same serializable transaction. The store rechecks transaction identity once

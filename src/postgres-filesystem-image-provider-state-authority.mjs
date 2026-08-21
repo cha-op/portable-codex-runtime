@@ -457,6 +457,7 @@ const objectGetOwnPropertyDescriptorIntrinsic = Object.getOwnPropertyDescriptor;
 const objectGetPrototypeOfIntrinsic = Object.getPrototypeOf;
 const objectHasOwnIntrinsic = Object.hasOwn;
 const objectIsIntrinsic = Object.is;
+const objectIsExtensibleIntrinsic = Object.isExtensible;
 const objectIsFrozenIntrinsic = Object.isFrozen;
 const mapSizeGetterIntrinsic = Object.getOwnPropertyDescriptor(
   Map.prototype,
@@ -562,6 +563,12 @@ function objectFreeze(value) {
   return callIntrinsic(objectFreezeIntrinsic, ObjectConstructor, [value]);
 }
 
+function objectIsExtensible(value) {
+  return callIntrinsic(objectIsExtensibleIntrinsic, ObjectConstructor, [
+    value,
+  ]);
+}
+
 function objectIsFrozen(value) {
   return callIntrinsic(objectIsFrozenIntrinsic, ObjectConstructor, [value]);
 }
@@ -654,6 +661,23 @@ function ownDataValue(value, key, code) {
   return descriptor.value;
 }
 
+function ownFrozenDataValue(value, key, code) {
+  let descriptor;
+  try {
+    descriptor = objectGetOwnPropertyDescriptor(value, key);
+  } catch {
+    fail(code);
+  }
+  ensure(
+    descriptor?.enumerable === true &&
+      descriptor.configurable === false &&
+      descriptor.writable === false &&
+      objectHasOwn(descriptor, "value"),
+    code,
+  );
+  return descriptor.value;
+}
+
 function exactDataObjectFromKeys(value, keys, expectedKeys, code) {
   ensure(
     keys.length === expectedKeys.length &&
@@ -710,26 +734,23 @@ function frozenDenseDataArrayLength(value, maximumLength, code) {
       arrayIsArray(value) &&
       objectGetPrototypeOf(value) === arrayPrototype &&
       numberIsSafeIntegerIntrinsic(value.length) &&
-      value.length <= maximumLength,
+      value.length <= maximumLength &&
+      objectIsExtensible(value) === false,
     code,
   );
-  let keys;
-  try {
-    keys = reflectOwnKeys(value);
-  } catch {
-    fail(code);
-  }
-  ensure(keys.length === value.length + 1 && objectIsFrozen(value), code);
-  for (let index = 0; index < value.length; index += 1) {
-    const descriptor = objectGetOwnPropertyDescriptor(
-      value,
-      StringConstructor(index),
-    );
-    ensure(
-      descriptor?.enumerable === true && objectHasOwn(descriptor, "value"),
-      code,
-    );
-  }
+  const lengthDescriptor = objectGetOwnPropertyDescriptor(value, "length");
+  ensure(
+    lengthDescriptor?.enumerable === false &&
+      lengthDescriptor.configurable === false &&
+      lengthDescriptor.writable === false &&
+      objectHasOwn(lengthDescriptor, "value") &&
+      lengthDescriptor.value === value.length,
+    code,
+  );
+  // Enumerating every own key would allocate an authority-owned O(length)
+  // keys array before batching begins. The projection ABI consumes only the
+  // frozen dense indexed payload; each index is validated by descriptor as it
+  // is hashed below, and inert extra own properties are not projection input.
   return value.length;
 }
 
@@ -2210,6 +2231,7 @@ async function comparePreparedProjectionInTransaction(
 
 function normalizeAttachmentOrigin(value, code) {
   const origin = exactDataObject(value, ATTACHMENT_ORIGIN_KEYS, code);
+  ensure(objectIsFrozen(value), code);
   return objectFreeze({
     currentStorageRevision: canonicalUint64(
       origin.currentStorageRevision,
@@ -2231,33 +2253,26 @@ function normalizeAttachmentOrigins(value, maximumCount, code) {
     ATTACHMENT_ORIGIN_PROJECTION_DOMAIN,
     count,
   );
-  const byOperationId = new MapConstructor();
-  const operationIds = [];
   let previousStorageId = null;
   for (let index = 0; index < count; index += 1) {
     const origin = normalizeAttachmentOrigin(
-      ownDataValue(value, StringConstructor(index), code),
+      ownFrozenDataValue(value, StringConstructor(index), code),
       code,
     );
     ensure(
-      (previousStorageId === null || origin.storageId > previousStorageId) &&
-        !mapHas(byOperationId, origin.operationId),
+      previousStorageId === null || origin.storageId > previousStorageId,
       code,
     );
     previousStorageId = origin.storageId;
-    mapSet(byOperationId, origin.operationId, origin);
-    arrayPush(operationIds, origin.operationId);
     updateLengthPrefixedBytes(
       hash,
       bufferFrom(canonicalString(origin), "utf8"),
     );
   }
-  objectFreeze(operationIds);
   return objectFreeze({
-    byOperationId,
     checksum: callIntrinsic(hashDigestIntrinsic, hash, ["hex"]),
     count,
-    operationIds,
+    source: value,
   });
 }
 
@@ -2276,15 +2291,25 @@ async function compareAttachmentOriginsInTransaction(
       origins.count,
       batchStart + MAX_RUNTIME_ATTACHMENT_ORIGIN_BATCH_SIZE,
     ]);
-    const batchOperationIds = callIntrinsic(
-      arraySliceIntrinsic,
-      origins.operationIds,
-      [batchStart, batchEnd],
-    );
+    const batchByOperationId = new MapConstructor();
+    const batchOperationIds = [];
     const batchOperationIdSet = new SetConstructor();
-    for (let index = 0; index < batchOperationIds.length; index += 1) {
+    for (let index = batchStart; index < batchEnd; index += 1) {
+      const origin = normalizeAttachmentOrigin(
+        ownFrozenDataValue(
+          origins.source,
+          StringConstructor(index),
+          stateCode,
+        ),
+        stateCode,
+      );
+      if (mapHas(batchByOperationId, origin.operationId)) {
+        projectionMismatch = true;
+      }
+      mapSet(batchByOperationId, origin.operationId, origin);
+      arrayPush(batchOperationIds, origin.operationId);
       callIntrinsic(setAddIntrinsic, batchOperationIdSet, [
-        batchOperationIds[index],
+        origin.operationId,
       ]);
     }
     const batchExpectedCount = batchOperationIds.length;
@@ -2314,7 +2339,7 @@ async function compareAttachmentOriginsInTransaction(
           projectionMismatch = true;
         }
         previousOperationId = operationId;
-        const origin = mapGet(origins.byOperationId, operationId);
+        const origin = mapGet(batchByOperationId, operationId);
         if (origin === undefined) {
           projectionMismatch = true;
           return;

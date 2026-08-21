@@ -121,6 +121,15 @@ function stateError(code) {
     Object.isFrozen(error);
 }
 
+function committedStateError(code) {
+  return (error) =>
+    error instanceof FilesystemImageProviderStateError &&
+    error.code === code &&
+    error.retryable === false &&
+    error.commitState === "committed" &&
+    Object.isFrozen(error);
+}
+
 function promiseSettlementCases(resolvedValue) {
   const cases = [
     {
@@ -445,7 +454,15 @@ function createExactStateAuthorities(options = {}) {
       requireHead(request.expectedHead);
       tracker.projectionComparisons =
         (tracker.projectionComparisons ?? 0) + 1;
-      if (tracker.projectionMismatch === true) return null;
+      if (tracker.projectionFailure === "throw") {
+        throw new Error("projection unavailable");
+      }
+      if (
+        tracker.projectionMismatch === true ||
+        tracker.projectionFailure === "null"
+      ) {
+        return null;
+      }
       const prepared = [...operations.values()]
         .filter((record) => record.state === "prepared")
         .sort((left, right) =>
@@ -506,6 +523,15 @@ function createExactStateAuthorities(options = {}) {
       }
       head = normalizeFilesystemImageProviderStateHead(nextHead);
       tracker.head = copyLedgerHead(head);
+      if (tracker.projectionFailureAfterNextAdvance !== undefined) {
+        assert(
+          ["null", "throw"].includes(
+            tracker.projectionFailureAfterNextAdvance,
+          ),
+        );
+        tracker.projectionFailure = tracker.projectionFailureAfterNextAdvance;
+        tracker.projectionFailureAfterNextAdvance = undefined;
+      }
       if (tracker.loseNextAdvanceAcknowledgement === true) {
         tracker.loseNextAdvanceAcknowledgement = false;
         throw new Error("advance acknowledgement lost");
@@ -1301,6 +1327,67 @@ test("v3 projection receipts are reused only for the same loaded head", async (t
   );
   assert.equal(fixture.tracker.projectionComparisons, 4);
 });
+
+test(
+  "v3 append errors report committed after the authority advances",
+  async (t) => {
+    for (const [projectionFailure, code] of [
+      ["null", "corrupt_ledger"],
+      ["throw", "io_failed"],
+    ]) {
+      await t.test(projectionFailure, async (t) => {
+        const tracker = {
+          projectionFailureAfterNextAdvance: projectionFailure,
+        };
+        const fixture = await createExactFixture(t, { tracker });
+        const operationId = `operation-v3-committed-${projectionFailure}-001`;
+        const request = operationRequest(
+          "provision",
+          `storage-v3-committed-${projectionFailure}-001`,
+        );
+        const storageId = request.storageId;
+
+        await assert.rejects(
+          fixture.state.prepareOperation({
+            kind: "provision",
+            operationId,
+            request,
+            storageId,
+          }),
+          committedStateError(code),
+        );
+
+        assert.equal(tracker.head.contractVersion, 3);
+        assert.equal(tracker.head.generation, "0");
+        assert.equal(tracker.head.stateRevision, "1");
+        assert.equal(tracker.head.frameCount, 1);
+        const durableOperation = tracker.operations.get(operationId);
+        assert.equal(durableOperation?.state, "prepared");
+        assert.equal(durableOperation?.storageId, storageId);
+        assert.deepEqual(durableOperation?.request, request);
+        assert.equal(
+          (await readFile(fixture.ledgerPath)).length,
+          tracker.head.ledgerBytes,
+        );
+
+        tracker.projectionFailure = undefined;
+        const advances = tracker.advances;
+        const replayed = await fixture.createState().prepareOperation({
+          kind: "provision",
+          operationId,
+          request,
+          storageId,
+        });
+        assert.equal(replayed.state, "prepared");
+        assert.equal(replayed.replayed, true);
+        assert.equal(replayed.shouldDispatch, false);
+        assert.equal(tracker.advances, advances);
+        assert.equal(tracker.head.stateRevision, "1");
+        assert.equal(tracker.operations.get(operationId), durableOperation);
+      });
+    }
+  },
+);
 
 test("v3 projection receipts preserve per-record canonical budgets", async (t) => {
   await t.test("one maximum-size request survives an exact-v3 restart", async (t) => {
@@ -2349,6 +2436,83 @@ test("v3 head without an adoption marker retains a v2 predecessor", async (t) =>
     );
   }
 });
+
+test(
+  "v3 head without an adoption marker retains an unrotated generation-zero v2 ledger",
+  async (t) => {
+    const legacy = await createFixture(t);
+    await prepareAndCommit(legacy.state, {
+      operationId: "operation-generation-zero-adoption-recovery-001",
+      request: operationRequest("provision"),
+      storage: storageState(),
+    });
+    const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+    assert.equal(sourceHead.contractVersion, 2);
+    assert.equal(sourceHead.generation, "0");
+    assert.equal(sourceHead.stateRevision, "2");
+    assert.equal(sourceHead.checkpointChecksum, null);
+    assert.equal(sourceHead.checkpointBytes, 0);
+
+    const tracker = { returnFalseWithNextHeadObservation: true };
+    const exact = createExactStateAuthorities({ head: sourceHead, tracker });
+    const createState = () =>
+      new FilesystemImageProviderState({
+        acquireLock: legacy.acquireLock,
+        adoptionAuthority: exact.adoptionAuthority,
+        directory: legacy.directory,
+        stateAuthority: exact.stateAuthority,
+        ...TRUSTED_ACL_INSPECTORS,
+      });
+
+    await assert.rejects(
+      createState().snapshot(),
+      stateError("commit_outcome_uncertain"),
+    );
+    assert.equal(exact.tracker.head.contractVersion, 3);
+    assert.equal(exact.tracker.head.generation, "1");
+    assert.equal(exact.tracker.operations.size, 0);
+    assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+
+    const pendingMarker = adoptionMarkerPath(legacy.directory, "1", "pending");
+    const sourceLedger = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName("0"),
+    );
+    const sourceCheckpoint = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName("0"),
+    );
+    const candidateCheckpoint = join(
+      legacy.directory,
+      filesystemImageProviderStateCheckpointName("1"),
+    );
+    const candidateLedger = join(
+      legacy.directory,
+      filesystemImageProviderStateLedgerName("1"),
+    );
+    assert.equal(await fileExists(pendingMarker), true);
+    assert.equal(await fileExists(sourceCheckpoint), false);
+    const retainedPaths = [sourceLedger, candidateCheckpoint, candidateLedger];
+    const retainedBytes = await Promise.all(
+      retainedPaths.map((path) => readFile(path)),
+    );
+
+    await rm(pendingMarker);
+    await assert.rejects(
+      createState().snapshot(),
+      stateError("commit_outcome_uncertain"),
+    );
+    assert.equal(exact.tracker.adoptions, 1);
+    assert.equal(exact.tracker.projectionComparisons ?? 0, 0);
+    assert.equal(await fileExists(sourceCheckpoint), false);
+    for (let index = 0; index < retainedPaths.length; index += 1) {
+      assert.deepEqual(
+        await readFile(retainedPaths[index]),
+        retainedBytes[index],
+      );
+    }
+  },
+);
 
 test("v2 head replaces a candidate left before pending-marker durability", async (t) => {
   const fixture = await createExactFixture(t, { head: genesisHead() });

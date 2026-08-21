@@ -659,7 +659,10 @@ Attachment-origin input is validated in independent fixed batches of at most
 attachment origins, projection validation uses one prepared data `SELECT` plus
 `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements, in
 addition to the exact-head `SELECT`; each batch keeps SQL parameters and
-additional memory bounded. The authority returns a receipt only when both
+additional memory bounded. A constant-working-memory preflight validates the
+frozen input and incrementally computes its existing checksum before the
+comparison pass materializes only one origin batch at a time. The authority
+returns a receipt only when both
 PostgreSQL projections exactly match. The provider caches that receipt only
 for the same authority instance, exact head, and unchanged loaded generation;
 an acknowledgement-loss readback or adoption requires a fresh comparison.

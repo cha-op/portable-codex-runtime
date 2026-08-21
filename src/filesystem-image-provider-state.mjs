@@ -400,28 +400,43 @@ const ERROR_MESSAGES = objectFreeze({
     "Filesystem image provider state active ledger capacity is exhausted",
   maintenance_failed: "Filesystem image provider state maintenance failed",
 });
+const COMMITTED_ERROR_CODES = objectFreeze(["io_failed", "corrupt_ledger"]);
 const INTERNAL_ERRORS = new WeakSetConstructor();
 const operationQueues = new MapConstructor();
 const jsonParseIntrinsic = JSON.parse;
 const jsonStringifyIntrinsic = JSON.stringify;
 
 export class FilesystemImageProviderStateError extends ErrorConstructor {
-  constructor(code) {
-    if (!objectHasOwn(ERROR_MESSAGES, code)) {
-      throw new TypeErrorConstructor("unsupported filesystem image provider state error");
+  constructor(
+    code,
+    commitState =
+      code === "commit_outcome_uncertain" ? "uncertain" : "not-committed",
+  ) {
+    const defaultCommitState =
+      code === "commit_outcome_uncertain" ? "uncertain" : "not-committed";
+    if (
+      !objectHasOwn(ERROR_MESSAGES, code) ||
+      (commitState !== defaultCommitState &&
+        !(
+          commitState === "committed" &&
+          arrayIncludes(COMMITTED_ERROR_CODES, code)
+        ))
+    ) {
+      throw new TypeErrorConstructor(
+        "unsupported filesystem image provider state error",
+      );
     }
     super(ERROR_MESSAGES[code]);
     this.name = "FilesystemImageProviderStateError";
     this.code = code;
-    this.commitState =
-      code === "commit_outcome_uncertain" ? "uncertain" : "not-committed";
+    this.commitState = commitState;
     this.retryable = false;
     objectFreeze(this);
   }
 }
 
-function stateError(code) {
-  const error = new FilesystemImageProviderStateError(code);
+function stateError(code, commitState) {
+  const error = new FilesystemImageProviderStateError(code, commitState);
   callIntrinsic(weakSetAddIntrinsic, INTERNAL_ERRORS, [error]);
   return error;
 }
@@ -3513,7 +3528,9 @@ function stateEnvelopeContractVersion(bytes, kind, generation) {
     normalizer,
     format,
   );
-  ensure(parsed.frame.generation === generation, "corrupt_ledger");
+  if (kind === "checkpoint") {
+    ensure(parsed.frame.generation === generation, "corrupt_ledger");
+  }
   return format.contractVersion;
 }
 
@@ -5274,6 +5291,13 @@ async function appendDeltaEvent({
       }
     }
     if (ledger !== undefined) await ignoreRejection(ledger.handle.close());
+    if (outcome === "advanced") {
+      const normalized = normalizeRuntimeError(error);
+      if (arrayIncludes(COMMITTED_ERROR_CODES, normalized.code)) {
+        throw stateError(normalized.code, "committed");
+      }
+      throw normalized;
+    }
     if (isInternalError(error)) throw error;
     if (casStarted && outcome === "unknown") fail("commit_outcome_uncertain");
     fail("io_failed");

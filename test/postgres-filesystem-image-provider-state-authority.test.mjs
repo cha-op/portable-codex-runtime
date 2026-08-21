@@ -1798,7 +1798,7 @@ test("runtime projection compares attachment origins exactly", async (t) => {
   });
 });
 
-test("runtime projection requires sorted unique attachment origin input", async () => {
+test("runtime projection requires sorted attachment origin storage IDs", async () => {
   const fixture = projectionFixture({ originCount: 2, preparedCount: 0 });
   await assert.rejects(
     fixture.runtimeAuthority.compareProjection({
@@ -1812,8 +1812,8 @@ test("runtime projection requires sorted unique attachment origin input", async 
       "invalid_postgres_filesystem_image_provider_state_authority_request",
     ),
   );
-  await assert.rejects(
-    fixture.runtimeAuthority.compareProjection({
+  assert.equal(
+    await fixture.runtimeAuthority.compareProjection({
       ...fixture.request,
       attachmentOrigins: Object.freeze([
         fixture.attachmentOrigins[0],
@@ -1823,9 +1823,7 @@ test("runtime projection requires sorted unique attachment origin input", async 
         }),
       ]),
     }),
-    authorityError(
-      "invalid_postgres_filesystem_image_provider_state_authority_request",
-    ),
+    null,
   );
 });
 
@@ -2256,64 +2254,155 @@ test("runtime projection holds SQL count fixed at 65,535 lightweight origins", a
   assert.equal(operationQueries[1][1][3], "65536");
 });
 
-test("runtime projection batches 65,536 origins and drains later corruption", async () => {
-  const fixture = largeAttachmentOriginsFixture();
-  assert.equal(
-    fixture.expectedHead.checkpointFrameCount +
-      fixture.expectedHead.frameCount,
-    fixture.attachmentOrigins.length + 2,
-  );
-  const request = {
-    attachmentOrigins: fixture.attachmentOrigins,
-    expectedHead: fixture.expectedHead,
-    preparedOperationCount: 0,
-    preparedProjectionChecksum: countedProjectionChecksum(
-      PREPARED_PROJECTION_DOMAIN,
-      [],
-    ),
-  };
+test(
+  "runtime projection batches 65,536 origins and drains later corruption",
+  { concurrency: false },
+  async () => {
+    const fixture = largeAttachmentOriginsFixture();
+    const ownKeysDescriptor = Object.getOwnPropertyDescriptor(
+      Reflect,
+      "ownKeys",
+    );
+    const isFrozenDescriptor = Object.getOwnPropertyDescriptor(
+      Object,
+      "isFrozen",
+    );
+    const mapDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Map");
+    assert.equal(typeof ownKeysDescriptor?.value, "function");
+    assert.equal(typeof isFrozenDescriptor?.value, "function");
+    assert.equal(typeof mapDescriptor?.value, "function");
+    const NativeMap = mapDescriptor.value;
+    const nativeMapSet = NativeMap.prototype.set;
+    const nativeMapSize = Object.getOwnPropertyDescriptor(
+      NativeMap.prototype,
+      "size",
+    ).get;
+    let attachmentOriginOwnKeysCalls = 0;
+    let attachmentOriginIsFrozenCalls = 0;
+    let mapHighWater = 0;
+    class TrackingMap extends NativeMap {
+      get size() {
+        return Reflect.apply(nativeMapSize, this, []);
+      }
 
-  assert.equal(
-    await fixture.runtimeAuthority.compareProjection(request),
-    null,
-  );
-  let originQueries = fixture.database.queries.filter(([text]) =>
-    text.includes("operation_id = ANY($3::text[])"),
-  );
-  assert.equal(originQueries.length, 2);
-  assert.match(originQueries[0][0], /LIMIT \$4::pg_catalog\.int4$/u);
-  assert.equal(originQueries[0][1][3], "65536");
-  assert.equal(originQueries[1][1][2], '{"operation-65535"}');
-  assert.equal(originQueries[1][1][3], "2");
-  assert.equal(
-    originQueries[0][1][2].slice(2, -2).split('","').length,
-    65_535,
-  );
-  assert.equal(fixture.database.streamRowsEmitted, 1);
+      set(key, value) {
+        const result = Reflect.apply(nativeMapSet, this, [key, value]);
+        mapHighWater = Math.max(mapHighWater, this.size);
+        return result;
+      }
+    }
+    Object.defineProperty(Reflect, "ownKeys", {
+      ...ownKeysDescriptor,
+      value(target) {
+        if (target === fixture.attachmentOrigins) {
+          attachmentOriginOwnKeysCalls += 1;
+        }
+        return Reflect.apply(ownKeysDescriptor.value, this, [target]);
+      },
+    });
+    Object.defineProperty(Object, "isFrozen", {
+      ...isFrozenDescriptor,
+      value(target) {
+        if (target === fixture.attachmentOrigins) {
+          attachmentOriginIsFrozenCalls += 1;
+        }
+        return Reflect.apply(isFrozenDescriptor.value, this, [target]);
+      },
+    });
+    Object.defineProperty(globalThis, "Map", {
+      ...mapDescriptor,
+      value: TrackingMap,
+    });
+    let runtimeAuthority;
+    let RuntimeAuthorityError;
+    try {
+      const authorityModule = await import(
+        "../src/postgres-filesystem-image-provider-state-authority.mjs?runtime-projection-batch-memory-test"
+      );
+      runtimeAuthority =
+        authorityModule.createPostgresFilesystemImageProviderStateRuntimeAuthority(
+          {
+            store: fixture.store,
+            providerId: "filesystem-image-ext4",
+            anchorId: "host-primary",
+          },
+        );
+      RuntimeAuthorityError =
+        authorityModule.PostgresFilesystemImageProviderStateAuthorityError;
+    } finally {
+      Object.defineProperty(globalThis, "Map", mapDescriptor);
+      Object.defineProperty(Object, "isFrozen", isFrozenDescriptor);
+      Object.defineProperty(Reflect, "ownKeys", ownKeysDescriptor);
+    }
+    assert.equal(
+      fixture.expectedHead.checkpointFrameCount +
+        fixture.expectedHead.frameCount,
+      fixture.attachmentOrigins.length + 2,
+    );
+    const request = {
+      attachmentOrigins: fixture.attachmentOrigins,
+      expectedHead: fixture.expectedHead,
+      preparedOperationCount: 0,
+      preparedProjectionChecksum: countedProjectionChecksum(
+        PREPARED_PROJECTION_DOMAIN,
+        [],
+      ),
+    };
 
-  fixture.database.operations.get(
-    fixture.lastOperationKey,
-  ).committed_record_sha256 = "0".repeat(64);
-  fixture.database.queries.length = 0;
-  fixture.database.streamRowsEmitted = 0;
-  await assert.rejects(
-    fixture.runtimeAuthority.compareProjection(request),
-    authorityError(
-      "postgres_filesystem_image_provider_state_authority_state_invalid",
-    ),
-  );
-  originQueries = fixture.database.queries.filter(([text]) =>
-    text.includes("operation_id = ANY($3::text[])"),
-  );
-  assert.equal(originQueries.length, 2);
-  assert.equal(fixture.database.streamRowsEmitted, 1);
-});
+    assert.equal(
+      await runtimeAuthority.compareProjection(request),
+      null,
+    );
+    let originQueries = fixture.database.queries.filter(([text]) =>
+      text.includes("operation_id = ANY($3::text[])"),
+    );
+    assert.equal(originQueries.length, 2);
+    assert.match(originQueries[0][0], /LIMIT \$4::pg_catalog\.int4$/u);
+    assert.equal(originQueries[0][1][3], "65536");
+    assert.equal(originQueries[1][1][2], '{"operation-65535"}');
+    assert.equal(originQueries[1][1][3], "2");
+    assert.equal(
+      originQueries[0][1][2].slice(2, -2).split('","').length,
+      65_535,
+    );
+    assert.equal(fixture.database.streamRowsEmitted, 1);
+    assert.equal(attachmentOriginOwnKeysCalls, 0);
+    assert.equal(attachmentOriginIsFrozenCalls, 0);
+    assert.equal(mapHighWater, 65_535);
 
-test("runtime projection performs one prepared query for an empty set", async () => {
+    fixture.database.operations.get(
+      fixture.lastOperationKey,
+    ).committed_record_sha256 = "0".repeat(64);
+    fixture.database.queries.length = 0;
+    fixture.database.streamRowsEmitted = 0;
+    await assert.rejects(
+      runtimeAuthority.compareProjection(request),
+      (error) =>
+        error instanceof RuntimeAuthorityError &&
+        error.code ===
+          "postgres_filesystem_image_provider_state_authority_state_invalid" &&
+        error.retryable === false &&
+        Object.isFrozen(error),
+    );
+    originQueries = fixture.database.queries.filter(([text]) =>
+      text.includes("operation_id = ANY($3::text[])"),
+    );
+    assert.equal(originQueries.length, 2);
+    assert.equal(fixture.database.streamRowsEmitted, 1);
+    assert.equal(attachmentOriginOwnKeysCalls, 0);
+    assert.equal(attachmentOriginIsFrozenCalls, 0);
+    assert.equal(mapHighWater, 65_535);
+  },
+);
+
+test("runtime projection performs one query for each empty projection", async () => {
   const fixture = projectionFixture({ originCount: 1, preparedCount: 0 });
   fixture.database.queries.length = 0;
   assert.notEqual(
-    await fixture.runtimeAuthority.compareProjection(fixture.request),
+    await fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: Object.freeze([]),
+    }),
     null,
   );
   assert.equal(
@@ -2322,9 +2411,15 @@ test("runtime projection performs one prepared query for an empty set", async ()
     ).length,
     1,
   );
+  const originQueries = fixture.database.queries.filter(([text]) =>
+    text.includes("operation_id = ANY($3::text[])"),
+  );
+  assert.equal(originQueries.length, 1);
+  assert.equal(originQueries[0][1][2], "{}");
+  assert.equal(originQueries[0][1][3], "1");
 });
 
-test("runtime projection rejects proxy and non-frozen array ABI inputs", async () => {
+test("runtime projection rejects proxy and mutable projection ABI inputs", async () => {
   const fixture = projectionFixture();
   const proxyRequest = new Proxy(fixture.request, {
     ownKeys() {
@@ -2353,6 +2448,17 @@ test("runtime projection rejects proxy and non-frozen array ABI inputs", async (
     fixture.runtimeAuthority.compareProjection({
       ...fixture.request,
       attachmentOrigins: [...fixture.attachmentOrigins],
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  await assert.rejects(
+    fixture.runtimeAuthority.compareProjection({
+      ...fixture.request,
+      attachmentOrigins: Object.freeze([
+        { ...fixture.attachmentOrigins[0] },
+      ]),
     }),
     authorityError(
       "invalid_postgres_filesystem_image_provider_state_authority_request",
