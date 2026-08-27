@@ -3195,11 +3195,13 @@ async function compareAndAdoptInTransaction(
 async function resolveAdoptionCommitOutcome(store, identity, input, code) {
   try {
     return await runSerializable(store, async (transaction) => {
+      // Order readback after any still-resolving writer; a serialization
+      // failure remains uncertain instead of misreporting an unchanged head.
       const observed = await readHeadSnapshotInTransaction(
         transaction,
         identity,
         code,
-        false,
+        true,
         FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
       );
       const selectedInput = selectedAdoptionForTarget(observed, input);

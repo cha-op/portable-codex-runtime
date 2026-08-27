@@ -3009,6 +3009,15 @@ test("adoption resolves a lost commit acknowledgement by exact readback", async 
     await fixture.adoptionAuthority.compareAndAdopt(fixture.request),
     true,
   );
+  assert.equal(
+    fixture.database.queries.filter(
+      ([text]) =>
+        text.includes(
+          "session_authority.filesystem_image_provider_heads",
+        ) && text.includes("FOR UPDATE"),
+    ).length,
+    2,
+  );
   assert.deepEqual(await fixture.runtimeAuthority.readHead(), fixture.nextHead);
 });
 
