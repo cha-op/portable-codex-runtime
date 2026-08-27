@@ -362,8 +362,8 @@ provider-state files, permanent operation rows, and external head must never
 be restored independently.
 
 The provider-state directory is a lossless canonical UTF-8 pathname of at most
-4,056 bytes, reserving the remaining 39 bytes of Linux's 4,095-byte pathname
-domain for `/` plus the longest generation checkpoint name. Every lock,
+4,050 bytes, reserving the remaining 45 bytes of Linux's 4,095-byte pathname
+domain for `/` plus the longest generation staging name. Every lock,
 checkpoint, and log pathname is built through module-load-captured `node:path`
 helpers and must still equal one exact direct child of that directory. The
 module likewise captures `node:crypto.createHash`, so post-import builtin
