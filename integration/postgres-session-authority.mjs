@@ -3903,15 +3903,8 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   try {
     await rejectedPostCutAdoptionClient.query("BEGIN");
     rejectedPostCutAdoptionTransactionOpen = true;
-    assert.equal(
-      (
-        await rejectedPostCutAdoptionClient.query(
-          adoptedInsertQuery,
-          adoptedInsertValues,
-        )
-      ).rowCount,
-      1,
-    );
+    // The adoption transaction already installed this committed row. Its
+    // legacy suffix cannot be replayed after the cut has committed.
     await assert.rejects(
       rejectedPostCutAdoptionClient.query(
         adoptedUpdateQuery,
