@@ -120,6 +120,7 @@ import {
 import {
   PostgresFilesystemImageProviderStateAuthorityError,
   createPostgresFilesystemImageProviderStateAdoptionAuthority,
+  createPostgresFilesystemImageProviderStatePagedAdoptionAuthority,
   createPostgresFilesystemImageProviderStateAuthority,
   createPostgresFilesystemImageProviderStateRuntimeAuthority,
 } from "../src/postgres-filesystem-image-provider-state-authority.mjs";
@@ -663,6 +664,12 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       providerId,
       anchorId: selectedAnchorId,
     });
+  const createPagedAdoptionAuthority = (selectedStore, selectedAnchorId) =>
+    createPostgresFilesystemImageProviderStatePagedAdoptionAuthority({
+      store: selectedStore,
+      providerId,
+      anchorId: selectedAnchorId,
+    });
   const genesis = {
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
     anchorRevision: "0",
@@ -790,6 +797,60 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       hash.update(`${bytes.length}\0`, "utf8").update(bytes);
     }
     return hash.digest("hex");
+  };
+  const createOperationPager = (operations, tracker = undefined) => {
+    const readPage = Object.freeze(
+      async function readPage({ afterOperationId, limit }) {
+        if (tracker !== undefined) {
+          tracker.operationRequests.push({ afterOperationId, limit });
+        }
+        const start =
+          afterOperationId === null
+            ? 0
+            : operations.findIndex(
+                ({ operationId }) => operationId > afterOperationId,
+              );
+        const normalizedStart = start === -1 ? operations.length : start;
+        const page = Object.freeze(
+          operations.slice(normalizedStart, normalizedStart + limit),
+        );
+        return Object.freeze({
+          operations: page,
+          nextAfterOperationId:
+            normalizedStart + page.length < operations.length
+              ? page[page.length - 1].operationId
+              : null,
+        });
+      },
+    );
+    return Object.freeze({ contractVersion: 1, readPage });
+  };
+  const createStoragePager = (storages, tracker = undefined) => {
+    const readPage = Object.freeze(
+      async function readPage({ afterStorageId, limit }) {
+        if (tracker !== undefined) {
+          tracker.storageRequests.push({ afterStorageId, limit });
+        }
+        const start =
+          afterStorageId === null
+            ? 0
+            : storages.findIndex(
+                ({ storage }) => storage.storageId > afterStorageId,
+              );
+        const normalizedStart = start === -1 ? storages.length : start;
+        const page = Object.freeze(
+          storages.slice(normalizedStart, normalizedStart + limit),
+        );
+        return Object.freeze({
+          storages: page,
+          nextAfterStorageId:
+            normalizedStart + page.length < storages.length
+              ? page[page.length - 1].storage.storageId
+              : null,
+        });
+      },
+    );
+    return Object.freeze({ contractVersion: 1, readPage });
   };
   const stableStorageProjectionChecksum = (storage) =>
     createHash("sha256")
@@ -3085,14 +3146,14 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     checkpointFrameCount: streamingOperationCount + 2,
   };
   assert.equal(
-    await createAdoptionAuthority(
+    await createPagedAdoptionAuthority(
       store,
       streamingAdoptionAnchorId,
     ).compareAndAdopt({
       expectedHead: streamingExpectedHead,
       nextHead: streamingCutHead,
-      operations: streamingOperations,
-      storages: [],
+      operationPager: createOperationPager(streamingOperations),
+      storagePager: createStoragePager([]),
     }),
     true,
   );
@@ -3966,49 +4027,45 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     { operations: [], nextAfterStorageId: null },
   );
 
-  const adoptionAcknowledgementLossPreparedHead = appendHead(
-    genesis,
-    "6".repeat(64),
-    512,
-  );
-  const adoptionAcknowledgementLossCommittedHead = appendHead(
-    adoptionAcknowledgementLossPreparedHead,
-    "7".repeat(64),
-    1024,
-  );
-  const adoptionAcknowledgementLossOperationId =
-    `provider-operation-adoption-ack-loss-${randomUUID()}`;
-  const adoptionAcknowledgementLossPrepared = preparedRecord({
-    checksum: adoptionAcknowledgementLossPreparedHead.lastChecksum,
-    operationId: adoptionAcknowledgementLossOperationId,
-    revision: adoptionAcknowledgementLossPreparedHead.stateRevision,
-    storageId: `provider-storage-adoption-ack-loss-${randomUUID()}`,
-  });
-  const adoptionAcknowledgementLossCommitted = committedRecord(
-    adoptionAcknowledgementLossPrepared,
-    adoptionAcknowledgementLossCommittedHead.stateRevision,
-  );
-  const adoptionAcknowledgementLossHeadAnchor = createHeadAnchor(
-    store,
-    adoptionAcknowledgementLossAnchorId,
-  );
+  const adoptionAcknowledgementLossOperations = [];
+  for (let index = 0; index < 5; index += 1) {
+    const ordinal = String(index + 1).padStart(4, "0");
+    const prepared = preparedRecord({
+      checksum: "6".repeat(64),
+      operationId: `provider-operation-adoption-ack-loss-${ordinal}`,
+      revision: String(index * 2 + 1),
+      storageId: `provider-storage-adoption-ack-loss-${ordinal}`,
+    });
+    adoptionAcknowledgementLossOperations.push(
+      committedRecord(prepared, String(index * 2 + 2)),
+    );
+  }
+  const adoptionAcknowledgementLossCommittedHead = {
+    ...genesis,
+    anchorRevision: "10",
+    stateRevision: "10",
+    frameCount: 10,
+    lastChecksum: "7".repeat(64),
+    ledgerBytes: 5_120,
+  };
   assert.equal(
-    await adoptionAcknowledgementLossHeadAnchor.compareAndAdvance({
-      expectedHead: genesis,
-      nextHead: adoptionAcknowledgementLossPreparedHead,
-    }),
-    true,
-  );
-  assert.equal(
-    await adoptionAcknowledgementLossHeadAnchor.compareAndAdvance({
-      expectedHead: adoptionAcknowledgementLossPreparedHead,
-      nextHead: adoptionAcknowledgementLossCommittedHead,
-    }),
-    true,
+    (
+      await pool.query(
+        rawHeadInsertQuery,
+        rawHeadInsertValues(
+          adoptionAcknowledgementLossAnchorId,
+          adoptionAcknowledgementLossCommittedHead,
+          null,
+        ),
+      )
+    ).rowCount,
+    1,
   );
   const adoptionAcknowledgementLossCutHead = {
     ...rotationHead(adoptionAcknowledgementLossCommittedHead),
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    checkpointBytes: 5_120,
+    checkpointFrameCount: 7,
   };
   const adoptionAcknowledgementLossPool =
     commitAcknowledgementLossAfterQueryPool(
@@ -4023,20 +4080,31 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     dedicatedPool: adoptionAcknowledgementLossPool,
     maxTransactionAttempts: 1,
   });
+  const adoptionAcknowledgementLossPagerTracker = {
+    operationRequests: [],
+    storageRequests: [],
+  };
+  const adoptionAcknowledgementLossStorages =
+    adoptionAcknowledgementLossOperations.map((operation) =>
+      Object.freeze({
+        currentAttachmentOriginOperationId: null,
+        storage: operation.storageState,
+      }));
   assert.equal(
-    await createAdoptionAuthority(
+    await createPagedAdoptionAuthority(
       adoptionAcknowledgementLossStore,
       adoptionAcknowledgementLossAnchorId,
     ).compareAndAdopt({
       expectedHead: adoptionAcknowledgementLossCommittedHead,
       nextHead: adoptionAcknowledgementLossCutHead,
-      operations: [adoptionAcknowledgementLossCommitted],
-      storages: [
-        {
-          currentAttachmentOriginOperationId: null,
-          storage: adoptionAcknowledgementLossCommitted.storageState,
-        },
-      ],
+      operationPager: createOperationPager(
+        adoptionAcknowledgementLossOperations,
+        adoptionAcknowledgementLossPagerTracker,
+      ),
+      storagePager: createStoragePager(
+        adoptionAcknowledgementLossStorages,
+        adoptionAcknowledgementLossPagerTracker,
+      ),
     }),
     true,
   );
@@ -4044,6 +4112,34 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     adoptionAcknowledgementLossPool.didLoseAcknowledgement(),
     true,
   );
+  assert.deepEqual(adoptionAcknowledgementLossPagerTracker.operationRequests, [
+    { afterOperationId: null, limit: 4 },
+    {
+      afterOperationId:
+        adoptionAcknowledgementLossOperations[3].operationId,
+      limit: 4,
+    },
+    { afterOperationId: null, limit: 4 },
+    {
+      afterOperationId:
+        adoptionAcknowledgementLossOperations[3].operationId,
+      limit: 4,
+    },
+  ]);
+  assert.deepEqual(adoptionAcknowledgementLossPagerTracker.storageRequests, [
+    { afterStorageId: null, limit: 4 },
+    {
+      afterStorageId:
+        adoptionAcknowledgementLossStorages[3].storage.storageId,
+      limit: 4,
+    },
+    { afterStorageId: null, limit: 4 },
+    {
+      afterStorageId:
+        adoptionAcknowledgementLossStorages[3].storage.storageId,
+      limit: 4,
+    },
+  ]);
   const durableAdoptionAcknowledgementLossAuthority = createRuntimeAuthority(
     store,
     adoptionAcknowledgementLossAnchorId,
@@ -4055,9 +4151,9 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   assert.deepEqual(
     await durableAdoptionAcknowledgementLossAuthority.readOperation({
       expectedHead: adoptionAcknowledgementLossCutHead,
-      operationId: adoptionAcknowledgementLossOperationId,
+      operationId: adoptionAcknowledgementLossOperations[0].operationId,
     }),
-    adoptionAcknowledgementLossCommitted,
+    adoptionAcknowledgementLossOperations[0],
   );
 
   const acknowledgementLossPool = commitAcknowledgementLossAfterQueryPool(

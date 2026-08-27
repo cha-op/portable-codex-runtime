@@ -367,8 +367,107 @@ function createFixedTrustedHeadAnchor(value) {
   });
 }
 
+function assertExactFrozenKeys(value, keys) {
+  assert.equal(Object.isFrozen(value), true);
+  assert.deepEqual(Reflect.ownKeys(value).sort(), [...keys].sort());
+}
+
+async function collectAdoptionPager({
+  cursorKey,
+  idForRecord,
+  pager,
+  recordsKey,
+  tracker,
+}) {
+  assertExactFrozenKeys(pager, ["contractVersion", "readPage"]);
+  assert.equal(pager.contractVersion, 1);
+  assert.equal(typeof pager.readPage, "function");
+  assert.equal(Object.isFrozen(pager.readPage), true);
+  const nextCursorKey =
+    cursorKey === "afterOperationId"
+      ? "nextAfterOperationId"
+      : "nextAfterStorageId";
+  const records = [];
+  let cursor = null;
+  let previousId = null;
+  for (;;) {
+    tracker.pageReads = (tracker.pageReads ?? 0) + 1;
+    const page = await pager.readPage(
+      Object.freeze({ [cursorKey]: cursor, limit: 4 }),
+    );
+    assertExactFrozenKeys(page, [recordsKey, nextCursorKey]);
+    const pageRecords = page[recordsKey];
+    assert.equal(Array.isArray(pageRecords), true);
+    assert.equal(Object.isFrozen(pageRecords), true);
+    assert.deepEqual(
+      Reflect.ownKeys(pageRecords),
+      [
+        ...Array.from({ length: pageRecords.length }, (_, index) =>
+          String(index),
+        ),
+        "length",
+      ],
+    );
+    assert(pageRecords.length <= 4);
+    for (const record of pageRecords) {
+      const recordId = idForRecord(record);
+      assert.equal(Object.isFrozen(record), true);
+      assert(previousId === null || previousId < recordId);
+      previousId = recordId;
+      records.push(record);
+    }
+    const nextCursor = page[nextCursorKey];
+    if (nextCursor === null) break;
+    assert(pageRecords.length > 0);
+    assert.equal(nextCursor, idForRecord(pageRecords.at(-1)));
+    assert.notEqual(nextCursor, cursor);
+    cursor = nextCursor;
+  }
+  return Object.freeze(records);
+}
+
+function adoptionTestKey(expectedHead, nextHead, operations, storages) {
+  const hash = createHash("sha256");
+  hash.update(canonicalJson({ expectedHead, nextHead }));
+  for (const operation of operations) {
+    hash.update("\0operation\0").update(canonicalJson(operation));
+  }
+  for (const storage of storages) {
+    hash.update("\0storage\0").update(canonicalJson(storage));
+  }
+  return hash.digest("hex");
+}
+
+function adoptionCanonicalMaterialBytes(operations, storages) {
+  let bytes = 0;
+  for (const operation of operations) {
+    bytes += Buffer.byteLength(canonicalJson(operation), "utf8");
+    if (operation.state === "committed") {
+      bytes += Buffer.byteLength(
+        canonicalJson({
+          kind: operation.kind,
+          operationId: operation.operationId,
+          preparedChecksum: operation.preparedChecksum,
+          preparedStateRevision: operation.preparedStateRevision,
+          request: operation.request,
+          state: "prepared",
+          storageId: operation.storageId,
+          storageStateBefore: operation.storageStateBefore,
+        }),
+        "utf8",
+      );
+    }
+  }
+  for (const storage of storages) {
+    bytes += Buffer.byteLength(canonicalJson(storage), "utf8");
+  }
+  return bytes;
+}
+
 function createExactStateAuthorities(options = {}) {
   const tracker = options.tracker ?? {};
+  const adoptionContractVersion = options.adoptionContractVersion ?? 1;
+  assert([1, 2].includes(adoptionContractVersion));
   let head = normalizeFilesystemImageProviderStateHead(
     options.head ?? v3GenesisHead(),
   );
@@ -540,21 +639,61 @@ function createExactStateAuthorities(options = {}) {
     },
   );
   const compareAndAdopt = Object.freeze(
-    async function compareAndAdopt({
-      expectedHead,
-      nextHead,
-      operations: adoptedOperations,
-      storages,
-    }) {
+    async function compareAndAdopt(...adoptionArgs) {
+      assert.equal(adoptionArgs.length, 1);
+      const request = adoptionArgs[0];
+      let expectedHead;
+      let nextHead;
+      let adoptedOperations;
+      let storages;
+      if (adoptionContractVersion === 1) {
+        ({ expectedHead, nextHead, operations: adoptedOperations, storages } =
+          request);
+      } else {
+        assertExactFrozenKeys(request, [
+          "expectedHead",
+          "nextHead",
+          "operationPager",
+          "storagePager",
+        ]);
+        ({ expectedHead, nextHead } = request);
+        tracker.adoptionRequests ??= [];
+        tracker.adoptionRequests.push(request);
+        if (tracker.requestMalformedAdoptionPage === true) {
+          await request.operationPager.readPage({
+            afterOperationId: null,
+            limit: 5,
+          });
+          assert.fail("malformed pager request unexpectedly succeeded");
+        }
+        adoptedOperations = await collectAdoptionPager({
+          cursorKey: "afterOperationId",
+          idForRecord: (record) => record.operationId,
+          pager: request.operationPager,
+          recordsKey: "operations",
+          tracker,
+        });
+        storages = await collectAdoptionPager({
+          cursorKey: "afterStorageId",
+          idForRecord: (record) => record.storage.storageId,
+          pager: request.storagePager,
+          recordsKey: "storages",
+          tracker,
+        });
+      }
       tracker.adoptions = (tracker.adoptions ?? 0) + 1;
       tracker.adoptionOperations = adoptedOperations;
       tracker.adoptionStorages = storages;
-      const adoptionKey = canonicalJson({
+      const adoptionKey = adoptionTestKey(
         expectedHead,
         nextHead,
-        operations: adoptedOperations,
+        adoptedOperations,
         storages,
-      });
+      );
+      if (tracker.returnMalformedAdoptionResult === true) {
+        tracker.returnMalformedAdoptionResult = false;
+        return "true";
+      }
       if (sameLedgerHead(head, nextHead)) {
         return adoptionKey === committedAdoptionKey;
       }
@@ -589,7 +728,10 @@ function createExactStateAuthorities(options = {}) {
   tracker.head = copyLedgerHead(head);
   tracker.operations = operations;
   return Object.freeze({
-    adoptionAuthority: Object.freeze({ contractVersion: 1, compareAndAdopt }),
+    adoptionAuthority: Object.freeze({
+      contractVersion: adoptionContractVersion,
+      compareAndAdopt,
+    }),
     stateAuthority: Object.freeze({
       contractVersion: 3,
       readHead,
@@ -892,7 +1034,11 @@ async function createRotatedFixture(t) {
   };
 }
 
-async function createRotatedV2AdoptionHarness(t, tracker) {
+async function createRotatedV2AdoptionHarness(
+  t,
+  tracker,
+  { adoptionContractVersion = 1 } = {},
+) {
   const legacy = await createFixture(t);
   const legacyState = legacy.createState({
     rotationPolicy: {
@@ -908,7 +1054,11 @@ async function createRotatedV2AdoptionHarness(t, tracker) {
   const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
   assert(sourceHead.generation !== "0");
   const candidateGeneration = String(BigInt(sourceHead.generation) + 1n);
-  const exact = createExactStateAuthorities({ head: sourceHead, tracker });
+  const exact = createExactStateAuthorities({
+    adoptionContractVersion,
+    head: sourceHead,
+    tracker,
+  });
   const createState = (overrides = {}) =>
     new FilesystemImageProviderState({
       acquireLock: legacy.acquireLock,
@@ -1016,6 +1166,9 @@ test("v2 and v3 head and frame hash domains remain fixed", async (t) => {
 
 test("production authority mode is exact, frozen, and cannot mix with a legacy anchor", async (t) => {
   const fixture = await createExactFixture(t);
+  const v2Authorities = createExactStateAuthorities({
+    adoptionContractVersion: 2,
+  });
   const base = {
     acquireLock: fixture.acquireLock,
     adoptionAuthority: fixture.adoptionAuthority,
@@ -1072,7 +1225,73 @@ test("production authority mode is exact, frozen, and cannot mix with a legacy a
       }),
     stateError("invalid_request"),
   );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: Object.freeze({
+          contractVersion: 3,
+          compareAndAdopt: v2Authorities.adoptionAuthority.compareAndAdopt,
+        }),
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: {
+          contractVersion: 2,
+          compareAndAdopt: v2Authorities.adoptionAuthority.compareAndAdopt,
+        },
+      }),
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () => {
+      const compareAndAdopt = async () => true;
+      return new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: Object.freeze({
+          contractVersion: 2,
+          compareAndAdopt,
+        }),
+      });
+    },
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () => {
+      const compareAndAdopt = Object.freeze(() => Promise.resolve(true));
+      return new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: Object.freeze({
+          contractVersion: 2,
+          compareAndAdopt,
+        }),
+      });
+    },
+    stateError("invalid_request"),
+  );
+  assert.throws(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: Object.freeze({
+          ...v2Authorities.adoptionAuthority,
+          extra: true,
+        }),
+      }),
+    stateError("invalid_request"),
+  );
   assert.doesNotThrow(() => new FilesystemImageProviderState(base));
+  assert.doesNotThrow(
+    () =>
+      new FilesystemImageProviderState({
+        ...base,
+        adoptionAuthority: v2Authorities.adoptionAuthority,
+      }),
+  );
 });
 
 test("rotates a prepared operation into a checkpoint before its commit", async (t) => {
@@ -1566,7 +1785,7 @@ test("v2 adoption materializes a v3 recovery generation before switching authori
   });
 
   await t.test(
-    "aggregate material over the adoption budget does not touch the candidate generation",
+    "v1 rejects over-budget material before candidate mutation and v2 pages it",
     async (t) => {
       const legacy = await createFixture(t);
       const payload = "x".repeat(700 * 1024);
@@ -1612,7 +1831,155 @@ test("v2 adoption materializes a v3 recovery generation before switching authori
       assert.deepEqual(exact.tracker.head, sourceHead);
       assert.deepEqual(await readFile(candidateCheckpoint), checkpointSentinel);
       assert.deepEqual(await readFile(candidateLedger), ledgerSentinel);
+
+      const paged = createExactStateAuthorities({
+        adoptionContractVersion: 2,
+        head: sourceHead,
+      });
+      const pagedState = new FilesystemImageProviderState({
+        acquireLock: legacy.acquireLock,
+        adoptionAuthority: paged.adoptionAuthority,
+        directory: legacy.directory,
+        stateAuthority: paged.stateAuthority,
+        ...TRUSTED_ACL_INSPECTORS,
+      });
+      const snapshot = await pagedState.snapshot();
+      assert.equal(snapshot.contractVersion, 3);
+      assert.equal(snapshot.stateRevision, "64");
+      assert.equal(snapshot.storages.length, 32);
+      assert.equal(paged.tracker.adoptions, 1);
+      assert.equal(paged.tracker.adoptionOperations.length, 32);
+      assert.equal(paged.tracker.adoptionStorages.length, 32);
+      assert(
+        adoptionCanonicalMaterialBytes(
+          paged.tracker.adoptionOperations,
+          paged.tracker.adoptionStorages,
+        ) >
+          64 * 1024 * 1024,
+      );
+      assert.notDeepEqual(
+        await readFile(candidateCheckpoint),
+        checkpointSentinel,
+      );
+      assert.deepEqual(await readFile(candidateLedger), Buffer.alloc(0));
     },
+  );
+});
+
+test("v2 adoption pagers are exact, frozen, ordered, and restartable", async (t) => {
+  const legacy = await createFixture(t);
+  for (const suffix of ["005", "001", "006", "003", "002", "004"]) {
+    const storageId = `storage-adoption-pager-${suffix}`;
+    await prepareAndCommit(legacy.state, {
+      operationId: `operation-adoption-pager-${suffix}`,
+      request: operationRequest("provision", storageId),
+      storage: storageState({ storageId }),
+    });
+  }
+  const sourceHead = copyLedgerHead(legacy.headAnchorTracker.head);
+  const exact = createExactStateAuthorities({
+    adoptionContractVersion: 2,
+    head: sourceHead,
+  });
+  const state = new FilesystemImageProviderState({
+    acquireLock: legacy.acquireLock,
+    adoptionAuthority: exact.adoptionAuthority,
+    directory: legacy.directory,
+    stateAuthority: exact.stateAuthority,
+    ...TRUSTED_ACL_INSPECTORS,
+  });
+  assert.equal((await state.snapshot()).storages.length, 6);
+  assert.equal(exact.tracker.adoptionRequests.length, 1);
+  const request = exact.tracker.adoptionRequests[0];
+  assertExactFrozenKeys(request, [
+    "expectedHead",
+    "nextHead",
+    "operationPager",
+    "storagePager",
+  ]);
+
+  const operationInput = Object.freeze({
+    afterOperationId: null,
+    limit: 4,
+  });
+  const firstOperations = await request.operationPager.readPage(operationInput);
+  const restartedOperations = await request.operationPager.readPage(
+    operationInput,
+  );
+  assert.notEqual(firstOperations, restartedOperations);
+  assert.deepEqual(firstOperations, restartedOperations);
+  assert.deepEqual(
+    firstOperations.operations.map((operation) => operation.operationId),
+    [
+      "operation-adoption-pager-001",
+      "operation-adoption-pager-002",
+      "operation-adoption-pager-003",
+      "operation-adoption-pager-004",
+    ],
+  );
+  assert.equal(
+    firstOperations.nextAfterOperationId,
+    "operation-adoption-pager-004",
+  );
+  const finalOperations = await request.operationPager.readPage(
+    Object.freeze({
+      afterOperationId: firstOperations.nextAfterOperationId,
+      limit: 4,
+    }),
+  );
+  assert.deepEqual(
+    finalOperations.operations.map((operation) => operation.operationId),
+    ["operation-adoption-pager-005", "operation-adoption-pager-006"],
+  );
+  assert.equal(finalOperations.nextAfterOperationId, null);
+  assert.deepEqual(
+    await request.operationPager.readPage(operationInput),
+    firstOperations,
+  );
+
+  const firstStorages = await request.storagePager.readPage(
+    Object.freeze({ afterStorageId: null, limit: 4 }),
+  );
+  assert.deepEqual(
+    firstStorages.storages.map((wrapper) => wrapper.storage.storageId),
+    [
+      "storage-adoption-pager-001",
+      "storage-adoption-pager-002",
+      "storage-adoption-pager-003",
+      "storage-adoption-pager-004",
+    ],
+  );
+  assert.equal(
+    firstStorages.nextAfterStorageId,
+    "storage-adoption-pager-004",
+  );
+  const finalStorages = await request.storagePager.readPage(
+    Object.freeze({
+      afterStorageId: firstStorages.nextAfterStorageId,
+      limit: 4,
+    }),
+  );
+  assert.deepEqual(
+    finalStorages.storages.map((wrapper) => wrapper.storage.storageId),
+    ["storage-adoption-pager-005", "storage-adoption-pager-006"],
+  );
+  assert.equal(finalStorages.nextAfterStorageId, null);
+
+  await assert.rejects(
+    request.operationPager.readPage({ afterOperationId: null, limit: 3 }),
+    stateError("io_failed"),
+  );
+  await assert.rejects(
+    request.operationPager.readPage({
+      afterOperationId: null,
+      extra: true,
+      limit: 4,
+    }),
+    stateError("io_failed"),
+  );
+  await assert.rejects(
+    request.storagePager.readPage({ afterStorageId: null }),
+    stateError("io_failed"),
   );
 });
 
@@ -1689,9 +2056,11 @@ test("v3 cold load rejects prepared-index and attachment-origin divergence", asy
   });
 });
 
-test("v2 adoption preserves target files across an uncertain acknowledgement", async (t) => {
+test("v2 authority adoption recreates pagers during cold pending recovery", async (t) => {
   const tracker = { loseNextAdoptionAcknowledgement: true };
-  const fixture = await createRotatedV2AdoptionHarness(t, tracker);
+  const fixture = await createRotatedV2AdoptionHarness(t, tracker, {
+    adoptionContractVersion: 2,
+  });
   await assert.rejects(
     fixture.state.snapshot(),
     stateError("commit_outcome_uncertain"),
@@ -1719,6 +2088,7 @@ test("v2 adoption preserves target files across an uncertain acknowledgement", a
   assert.equal((await lstat(pendingMarker)).isFile(), true);
   await assert.rejects(lstat(verifiedMarker), (error) => error.code === "ENOENT");
   assert.equal(fixture.exact.tracker.head.contractVersion, 3);
+  assert.equal(fixture.exact.tracker.adoptionRequests.length, 1);
   const recovered = await fixture.createState().snapshot();
   assert.deepEqual(recovered, {
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
@@ -1727,6 +2097,32 @@ test("v2 adoption preserves target files across an uncertain acknowledgement", a
   });
   assert.equal(fixture.exact.tracker.adoptions, 2);
   assert.equal(fixture.exact.tracker.operations.size, 1);
+  assert.equal(fixture.exact.tracker.adoptionRequests.length, 2);
+  const [firstRequest, recoveryRequest] =
+    fixture.exact.tracker.adoptionRequests;
+  assert.notEqual(firstRequest, recoveryRequest);
+  assert.notEqual(firstRequest.operationPager, recoveryRequest.operationPager);
+  assert.notEqual(
+    firstRequest.operationPager.readPage,
+    recoveryRequest.operationPager.readPage,
+  );
+  assert.notEqual(firstRequest.storagePager, recoveryRequest.storagePager);
+  assert.deepEqual(
+    await firstRequest.operationPager.readPage(
+      Object.freeze({ afterOperationId: null, limit: 4 }),
+    ),
+    await recoveryRequest.operationPager.readPage(
+      Object.freeze({ afterOperationId: null, limit: 4 }),
+    ),
+  );
+  assert.deepEqual(
+    await firstRequest.storagePager.readPage(
+      Object.freeze({ afterStorageId: null, limit: 4 }),
+    ),
+    await recoveryRequest.storagePager.readPage(
+      Object.freeze({ afterStorageId: null, limit: 4 }),
+    ),
+  );
   for (const name of [
     filesystemImageProviderStateCheckpointName(fixture.sourceHead.generation),
     filesystemImageProviderStateLedgerName(fixture.sourceHead.generation),
@@ -1740,6 +2136,54 @@ test("v2 adoption preserves target files across an uncertain acknowledgement", a
   assert.equal((await lstat(targetLedger)).isFile(), true);
   await assert.rejects(lstat(pendingMarker), (error) => error.code === "ENOENT");
   await assert.rejects(lstat(verifiedMarker), (error) => error.code === "ENOENT");
+});
+
+test("malformed v2 authority behavior fails closed with a durable pending cut", async (t) => {
+  for (const tracker of [
+    { requestMalformedAdoptionPage: true },
+    { returnMalformedAdoptionResult: true },
+  ]) {
+    const mode = Object.keys(tracker)[0];
+    await t.test(mode, async (t) => {
+      const fixture = await createRotatedV2AdoptionHarness(t, tracker, {
+        adoptionContractVersion: 2,
+      });
+      await assert.rejects(
+        fixture.state.snapshot(),
+        stateError("commit_outcome_uncertain"),
+      );
+      assert.deepEqual(fixture.exact.tracker.head, fixture.sourceHead);
+      assert.equal(fixture.exact.tracker.adoptionRequests.length, 1);
+      assert.equal(
+        await fileExists(
+          adoptionMarkerPath(
+            fixture.legacy.directory,
+            fixture.candidateGeneration,
+            "pending",
+          ),
+        ),
+        true,
+      );
+      assert.equal(
+        await fileExists(
+          adoptionMarkerPath(
+            fixture.legacy.directory,
+            fixture.candidateGeneration,
+            "verified",
+          ),
+        ),
+        false,
+      );
+      for (const name of [
+        filesystemImageProviderStateCheckpointName(
+          fixture.candidateGeneration,
+        ),
+        filesystemImageProviderStateLedgerName(fixture.candidateGeneration),
+      ]) {
+        assert.equal(await fileExists(join(fixture.legacy.directory, name)), true);
+      }
+    });
+  }
 });
 
 test("verified adoption marker completes cleanup after restart", async (t) => {

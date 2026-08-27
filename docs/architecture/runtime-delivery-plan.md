@@ -558,7 +558,16 @@ in one serializable transaction. A database-supplied transaction ID and
 deferred revision-coverage check prevent a copied receipt, partial row set, or
 head-only update from opening the legacy checksum exception. Commit
 acknowledgement loss is settled by exact head, marker, receipt, and full-row
-readback.
+readback. The original full-array adoption authority remains at contract
+version 1; the explicit paged authority is contract version 2. Restartable
+operation and storage cursors feed fixed four-item pages through staging and
+replay in `pg_temp` relations created with `ON COMMIT DROP` inside the same
+`SERIALIZABLE` transaction. Pager versions,
+cursors, and page boundaries are excluded from the manifest, preserving the
+exact version 1 manifest bytes independently of page partitioning. Migration
+011, its import window, and its deferred coverage checks remain unchanged, as
+do the candidate, `pending`, acknowledgement-loss, and `verified` recovery
+phases.
 An internal unique event-revision registry validates migrated indexed markers
 and maintains completeness inductively: ordinary writes append exactly one
 claimed revision or rotate without changing it, while adoption retains its
@@ -581,12 +590,13 @@ remain bounded per batch. It returns a domain-separated receipt only for an
 exact match. That receipt is cached only for the same exact loaded head and
 authority instance. Native writes continue to store
 `indexed-frame-v1`; the one adoption transaction alone may store
-`unavailable-adopted-v2`. The full-array adoption contract is operationally
-capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical
-operation/prepared-projection/storage material, and fails before candidate
-mutation. Those limits apply only to adoption, not to legal version 3 runtime
-projection; a future streaming contract is required for valid version 2 state
-outside those adoption limits. See
+`unavailable-adopted-v2`. The full-array adoption version 1 contract remains
+operationally capped at 65,535 operations, 65,535 storages, and 64 MiB of
+aggregate canonical operation/prepared-projection/storage material, and fails
+with `state_capacity_exhausted` before candidate mutation. Paged contract
+version 2 removes only those full-array version 1 transport limits. The 4 MiB
+record/frame-payload, active-tail 65,535-frame/64 MiB, uint32 checkpoint-count,
+and legal version 3 runtime-projection bounds remain distinct and unchanged. See
 `linux-ext4-physical-backend.md`. Later slices own
 power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
 export/compression, content-addressed distribution, encryption, registry trust,

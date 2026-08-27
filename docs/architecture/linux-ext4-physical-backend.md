@@ -442,14 +442,28 @@ committed row cannot change again, a row
 cannot be deleted while its anchor remains, and `TRUNCATE` is always rejected.
 Rotation changes the public head but retains the logical revision and marker.
 
-Migration 011 supplies the one-time version 2 adoption authority. While the
-provider lock is held, the runtime loads the complete version 2 checkpoint and
-active tail, verifies every payload sequence, orders prepared and committed
-events by uint64 revision, proves the exact `1..stateRevision` set, replays
-per-storage lineage with one pending operation per storage, and checks the
-derived final storage and attachment origins. It writes, syncs, and reads back
-the covering version 3 checkpoint and empty log before asking PostgreSQL to
-advance authority.
+Migration 011 supplies the one-time version 2 adoption authority and remains
+unchanged by the later transport expansion. While the provider lock is held,
+the runtime loads the complete version 2 checkpoint and active tail, verifies
+every payload sequence, orders prepared and committed events by uint64
+revision, proves the exact `1..stateRevision` set, replays per-storage lineage
+with one pending operation per storage, and checks the derived final storage
+and attachment origins. It writes, syncs, and reads back the covering version 3
+checkpoint and empty log before asking PostgreSQL to advance authority.
+
+`createPostgresFilesystemImageProviderStateAdoptionAuthority()` retains its
+exact full-array contract version 1. The separate
+`createPostgresFilesystemImageProviderStatePagedAdoptionAuthority()` exposes
+contract version 2 with the same one-method `compareAndAdopt` surface, but its
+request supplies restartable operation and storage pagers instead of arrays.
+Each pager accepts an exclusive item-ID cursor, the authority always requests a
+fixed limit of four, and the returned next cursor selects the following page.
+The authority normalises each page into `pg_temp` staging relations created
+with `ON COMMIT DROP`, derives the manifest and replays the staged rows, all in
+one `SERIALIZABLE` transaction. Pager contract versions, cursor values, and
+page boundaries are transport metadata and never enter the manifest; every
+valid page partition of the same canonical state produces the exact version 1
+manifest bytes and uses migration 011's existing import window and triggers.
 
 The adoption transaction binds a deterministic manifest digest to the provider,
 anchor, source and target heads, exact operation bytes and provenance, final
@@ -488,18 +502,23 @@ readback require a new comparison. Exact operation replay is always served
 from PostgreSQL; local prepared frames are recovery material, not an alternate
 replay authority.
 
-Adoption writes candidate files before the database cut. Exact old-head
-readback removes an inert candidate, exact target-head plus manifest and full
-row readback publishes it, and any other result preserves both generations and
-reports `commit_outcome_uncertain`. The full-array version 1 adoption API is
-capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical
-operation/prepared-projection/storage material. Those limits apply only to
-adoption, not to a legal version 3 runtime projection. A valid version 2 state
-outside those adoption limits reports `state_capacity_exhausted` before
-candidate cleanup or creation; supporting it requires a separately versioned
-streaming or paged adoption contract. A permanent anchor-lifecycle row owns the
-unique provider/anchor key. Complete teardown of any permanent operation
-history moves that row from active to immutable retired; every head insert must
+Adoption writes candidate files and the durable `pending` marker before the
+database cut. Exact old-head readback removes only the inert candidate and
+marker, exact target-head plus manifest and full-row readback advances through
+the durable `verified` phase, and any other result preserves both generations
+and reports `commit_outcome_uncertain`. Cold pending and verified recovery keep
+the same replay, projection validation, and source-cleanup ordering for both
+transport versions. The full-array version 1 adoption API remains capped at
+65,535 operations, 65,535 storages, and 64 MiB of aggregate canonical
+operation/prepared-projection/storage material; an oversized version 1 request
+still reports `state_capacity_exhausted` before candidate cleanup or creation.
+Paged contract version 2 removes only those adoption version 1 transport
+limits. It does not change the 4 MiB per-record/frame-payload bound, the active-log
+65,535-frame/64 MiB envelope, the uint32 checkpoint-count limits, or the
+separate legal version 3 runtime-projection bounds. A permanent anchor-
+lifecycle row owns the unique provider/anchor key. Complete teardown of any
+permanent operation history moves that row from active to immutable retired;
+every head insert must
 claim the same key, so both an explicit early
 `SET CONSTRAINTS ... IMMEDIATE` and a concurrent recreation are rejected.
 Every head deletion, including an empty

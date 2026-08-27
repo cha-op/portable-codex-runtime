@@ -268,13 +268,21 @@
   reads are not capped by the adoption version 1 operational envelope. The
   authority returns a domain-separated receipt; the provider caches it only for
   the same exact loaded head and authority instance.
-- [pending] Add a streaming or paged adoption contract for otherwise-valid
-  version 2 state containing more than 65,535 operations, 65,535 storages, or
-  64 MiB of aggregate canonical operation/prepared-projection/storage
-  material. The current full-array adoption v1 contract rejects that state
-  with `state_capacity_exhausted` before any candidate generation mutation;
-  its operational capacity applies only to adoption and must not be described
-  as either the version 2 format limit or a version 3 runtime projection limit.
+- [done] Added explicit paged adoption contract version 2 for otherwise-valid
+  version 2 state beyond the full-array transport capacity. Restartable
+  operation and storage cursor pages use fixed four-item work; one serializable
+  PostgreSQL transaction stages and replays them through `pg_temp` relations
+  with `ON COMMIT DROP` while reusing migration 011 unchanged. Pager metadata
+  and boundaries do not enter the manifest, so the same state preserves the
+  exact version 1 manifest bytes and the candidate/`pending`/acknowledgement-
+  loss/`verified` recovery semantics. Full-array contract version 1 remains
+  exact and capped at
+  65,535 operations, 65,535 storages, and 64 MiB aggregate canonical material,
+  failing oversized requests with `state_capacity_exhausted` before candidate
+  mutation. Only those version 1 transport limits are removed by version 2;
+  the 4 MiB record/frame-payload, active-tail 65,535-frame/64 MiB, uint32
+  checkpoint-count, and runtime-projection boundaries remain distinct and
+  unchanged.
 - [pending] Extend beyond that clean/manual-fencing boundary only in separately
   scoped work: power-loss/crash-prefix evidence, automatic stale-writer
   fencing, differential export/compression, content-addressed distribution,

@@ -547,7 +547,16 @@
   is an acknowledgement receipt rather than a write token. Native commits use
   `indexed-frame-v1`; only that adoption transaction can write
   `unavailable-adopted-v2`. Commit acknowledgement loss is resolved by exact
-  head, marker, manifest, and full-row readback.
+  head, marker, manifest, and full-row readback. Migration 011 is unchanged by
+  the adoption transport expansion. The original contract version 1 authority
+  still consumes exact full arrays. The explicit contract version 2 authority
+  consumes restartable operation and storage cursor pages with fixed four-item
+  page work, stages and replays them through `pg_temp` relations created with
+  `ON COMMIT DROP` in the same `SERIALIZABLE` transaction, and excludes pager
+  versions, cursors, and page boundaries from the manifest. Every partition of
+  the same canonical state therefore retains the exact version 1 manifest bytes
+  and the same durable candidate, `pending`, acknowledgement-loss, and
+  `verified` recovery semantics.
   Migration 011 also claims each prepared and committed revision in an
   internal unique event registry. It validates every migrated non-null marker
   once, then permits only a one-revision indexed append with its deferred event
@@ -563,12 +572,15 @@
   as retained local operations. Full-array adoption version 1 is deliberately
   capped at 65,535 operations, 65,535 storages, and 64 MiB of aggregate
   canonical operation/prepared-projection/storage material; those limits apply
-  only to adoption, not to legal version 3 runtime projection. A valid version
-  2 state over any adoption limit fails with `state_capacity_exhausted` before
-  candidate mutation and needs a future streaming adoption contract. A
-  permanent anchor-lifecycle row
-  serializes every head insert through the same unique key; full teardown of
-  any operation history moves that row from active to immutable retired, so
+  only to that adoption transport, which continues to fail an oversized request
+  with `state_capacity_exhausted` before candidate mutation. Paged adoption
+  version 2 removes those version 1 full-array transport limits without changing
+  the 4 MiB record/frame-payload bound, the active-tail 65,535-frame/64 MiB
+  envelope, uint32 checkpoint-count limits, or legal version 3 runtime-
+  projection bounds. A
+  permanent anchor-lifecycle row serializes every head insert through the same
+  unique key; full teardown of any operation history moves that row from active
+  to immutable retired, so
   neither an early deferred-constraint check nor a concurrent transaction can
   recycle the same provider/anchor identity. Every head deletion retires the
   row, including an empty head, to prevent durable-anchor ABA. Producer
@@ -641,6 +653,8 @@
   `docs/project_journal/2026/08/2026-08-20-provider-state-operation-index-c7e4a1.md`
 - Provider-state version 3 adoption:
   `docs/project_journal/2026/08/2026-08-20-provider-state-v3-adoption-9d4c2e.md`
+- Provider-state adoption capacity:
+  `docs/project_journal/2026/08/2026-08-28-provider-state-adoption-capacity-7b6d41.md`
 - Linux ext4 physical backend:
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - ext4-to-Podman attachment composition:
@@ -784,7 +798,7 @@
   commit is complete for both healthy-session callback quiescence and exact
   same-authorization session-loss overlap. The provider operation-index
   authority, atomic version 2-to-3 adoption, current attachment-origin binding,
-  and committed-history removal from local checkpoints are complete. The next
-  provider-state capacity slice is a streaming or paged adoption contract for
-  otherwise-valid version 2 state beyond the current 65,535-operation,
-  65,535-storage, or 64 MiB full-array adoption limits.
+  committed-history removal from local checkpoints, and restartable paged
+  adoption beyond the full-array version 1 transport limits are complete.
+  Remaining Linux/provider follow-up stays in the already-listed, separately
+  scoped clean/manual-fencing work; no additional feature is selected here.

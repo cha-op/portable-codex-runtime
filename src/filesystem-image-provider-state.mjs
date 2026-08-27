@@ -45,6 +45,7 @@ const ErrorConstructor = Error;
 const hashPrototype = Object.getPrototypeOf(createHashIntrinsic("sha256"));
 const hashDigestIntrinsic = hashPrototype.digest;
 const hashUpdateIntrinsic = hashPrototype.update;
+const isAsyncFunctionValue = utilTypes.isAsyncFunction;
 const isPromiseValue = utilTypes.isPromise;
 const isProxyValue = utilTypes.isProxy;
 const mapDeleteIntrinsic = Map.prototype.delete;
@@ -57,6 +58,7 @@ const mapSizeGetterIntrinsic = Object.getOwnPropertyDescriptor(
   "size",
 ).get;
 const MapConstructor = Map;
+const mathFloorIntrinsic = Math.floor;
 const mathMaxIntrinsic = Math.max;
 const mathMinIntrinsic = Math.min;
 const numberIsFiniteIntrinsic = Number.isFinite;
@@ -280,6 +282,7 @@ const MAX_CANONICAL_NODES = 16_384;
 const MAX_FRAME_PAYLOAD_BYTES = 4 * 1024 * 1024;
 const MAX_LEDGER_BYTES = 64 * 1024 * 1024;
 const MAX_FRAME_COUNT = 65_535;
+const ADOPTION_PAGE_SIZE = 4;
 const MAX_ADOPTION_MARKER_BYTES = 4 * 1024;
 const MAX_UINT32 = 4_294_967_295;
 const MAX_PATH_BYTES = 4_095;
@@ -1466,15 +1469,17 @@ function canonicalAdoptionAuthority(value, code) {
     code,
   );
   ensure(
-    authority.contractVersion === 1 &&
+    (authority.contractVersion === 1 || authority.contractVersion === 2) &&
       objectIsFrozenIntrinsic(value) &&
       typeof authority.compareAndAdopt === "function" &&
       !isProxyValue(authority.compareAndAdopt) &&
+      (authority.contractVersion === 1 ||
+        isAsyncFunctionValue(authority.compareAndAdopt)) &&
       objectIsFrozenIntrinsic(authority.compareAndAdopt),
     code,
   );
   return objectFreeze({
-    contractVersion: 1,
+    contractVersion: authority.contractVersion,
     compareAndAdopt: authority.compareAndAdopt,
   });
 }
@@ -4370,7 +4375,7 @@ function assertAdoptionCanonicalCapacity(operations, storages) {
   }
 }
 
-function v2AdoptionMaterial(sourceState) {
+function v2AdoptionMaterial(sourceState, adoptionContractVersion) {
   validateV2CheckpointState(sourceState, "corrupt_ledger");
   const targetState = v3RecoveryStateFromV2(sourceState);
   const sourceSnapshot = checkpointArrays(
@@ -4381,15 +4386,19 @@ function v2AdoptionMaterial(sourceState) {
     targetState,
     FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
   );
-  ensure(
-    sourceSnapshot.operations.length <= MAX_FRAME_COUNT &&
-      targetSnapshot.storages.length <= MAX_FRAME_COUNT,
-    "state_capacity_exhausted",
-  );
-  assertAdoptionCanonicalCapacity(
-    sourceSnapshot.operations,
-    targetSnapshot.storages,
-  );
+  if (adoptionContractVersion === 1) {
+    ensure(
+      sourceSnapshot.operations.length <= MAX_FRAME_COUNT &&
+        targetSnapshot.storages.length <= MAX_FRAME_COUNT,
+      "state_capacity_exhausted",
+    );
+    assertAdoptionCanonicalCapacity(
+      sourceSnapshot.operations,
+      targetSnapshot.storages,
+    );
+  } else {
+    ensure(adoptionContractVersion === 2, "corrupt_ledger");
+  }
   return objectFreeze({ sourceSnapshot, targetSnapshot, targetState });
 }
 
@@ -4405,16 +4414,128 @@ function assertExactAdoptionCandidate(candidateState, material) {
     FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
   );
   ensure(
-    canonicalEqual(
-      candidateSnapshot.operations,
-      material.targetSnapshot.operations,
-    ) &&
-      canonicalEqual(
-        candidateSnapshot.storages,
-        material.targetSnapshot.storages,
-      ),
+    candidateSnapshot.operations.length ===
+      material.targetSnapshot.operations.length &&
+      candidateSnapshot.storages.length ===
+        material.targetSnapshot.storages.length,
     "corrupt_ledger",
   );
+  for (let index = 0; index < candidateSnapshot.operations.length; index += 1) {
+    ensure(
+      canonicalEqual(
+        candidateSnapshot.operations[index],
+        material.targetSnapshot.operations[index],
+      ),
+      "corrupt_ledger",
+    );
+  }
+  for (let index = 0; index < candidateSnapshot.storages.length; index += 1) {
+    ensure(
+      canonicalEqual(
+        candidateSnapshot.storages[index],
+        material.targetSnapshot.storages[index],
+      ),
+      "corrupt_ledger",
+    );
+  }
+}
+
+function adoptionPage(records, afterId, recordId) {
+  let lower = 0;
+  let upper = records.length;
+  while (lower < upper) {
+    const middle = lower + mathFloorIntrinsic((upper - lower) / 2);
+    if (afterId !== null && recordId(records[middle]) <= afterId) {
+      lower = middle + 1;
+    } else {
+      upper = middle;
+    }
+  }
+  const end = mathMinIntrinsic(lower + ADOPTION_PAGE_SIZE, records.length);
+  const page = [];
+  for (let index = lower; index < end; index += 1) {
+    arrayPush(page, records[index]);
+  }
+  objectFreeze(page);
+  return objectFreeze({
+    nextAfterId:
+      end < records.length ? recordId(records[end - 1]) : null,
+    records: page,
+  });
+}
+
+function operationAdoptionPager(operations) {
+  const readPage = async function readPage(...pageArgs) {
+    ensure(pageArgs.length === 1, "io_failed");
+    const input = exactDataObject(
+      pageArgs[0],
+      ["afterOperationId", "limit"],
+      ["afterOperationId", "limit"],
+      "io_failed",
+    );
+    const afterOperationId =
+      input.afterOperationId === null
+        ? null
+        : canonicalOpaqueId(input.afterOperationId, "io_failed");
+    ensure(input.limit === ADOPTION_PAGE_SIZE, "io_failed");
+    const page = adoptionPage(
+      operations,
+      afterOperationId,
+      (operation) => operation.operationId,
+    );
+    return objectFreeze({
+      operations: page.records,
+      nextAfterOperationId: page.nextAfterId,
+    });
+  };
+  objectFreeze(readPage);
+  return objectFreeze({ contractVersion: 1, readPage });
+}
+
+function storageAdoptionPager(storages) {
+  const readPage = async function readPage(...pageArgs) {
+    ensure(pageArgs.length === 1, "io_failed");
+    const input = exactDataObject(
+      pageArgs[0],
+      ["afterStorageId", "limit"],
+      ["afterStorageId", "limit"],
+      "io_failed",
+    );
+    const afterStorageId =
+      input.afterStorageId === null
+        ? null
+        : canonicalOpaqueId(input.afterStorageId, "io_failed");
+    ensure(input.limit === ADOPTION_PAGE_SIZE, "io_failed");
+    const page = adoptionPage(
+      storages,
+      afterStorageId,
+      (storage) => storage.storage.storageId,
+    );
+    return objectFreeze({
+      storages: page.records,
+      nextAfterStorageId: page.nextAfterId,
+    });
+  };
+  objectFreeze(readPage);
+  return objectFreeze({ contractVersion: 1, readPage });
+}
+
+function adoptionRequest(adoptionAuthority, marker, material) {
+  if (adoptionAuthority.contractVersion === 1) {
+    return objectFreeze({
+      expectedHead: marker.expectedHead,
+      nextHead: marker.nextHead,
+      operations: material.sourceSnapshot.operations,
+      storages: material.targetSnapshot.storages,
+    });
+  }
+  ensure(adoptionAuthority.contractVersion === 2, "corrupt_ledger");
+  return objectFreeze({
+    expectedHead: marker.expectedHead,
+    nextHead: marker.nextHead,
+    operationPager: operationAdoptionPager(material.sourceSnapshot.operations),
+    storagePager: storageAdoptionPager(material.targetSnapshot.storages),
+  });
 }
 
 async function compareAndResolveAdoption(
@@ -4427,14 +4548,7 @@ async function compareAndResolveAdoption(
   try {
     adopted = await invokeNativePromise(
       adoptionAuthority.compareAndAdopt,
-      [
-        objectFreeze({
-          expectedHead: marker.expectedHead,
-          nextHead: marker.nextHead,
-          operations: material.sourceSnapshot.operations,
-          storages: material.targetSnapshot.storages,
-        }),
-      ],
+      [adoptionRequest(adoptionAuthority, marker, material)],
       "io_failed",
     );
   } catch {
@@ -4582,7 +4696,10 @@ async function recoverV2AdoptionMaterial({
     headAnchor: stateAuthority,
     lock,
   });
-  const material = v2AdoptionMaterial(source.state);
+  const material = v2AdoptionMaterial(
+    source.state,
+    adoptionAuthority.contractVersion,
+  );
   const candidate = await loadGenerationState({
     allowTruncate: false,
     authority,
@@ -4771,15 +4888,19 @@ async function adoptV2Generation({
     headAnchor: stateAuthority,
     lock,
   });
-  const material = v2AdoptionMaterial(source.state);
+  // Contract v1 is a bounded full-array handoff. Its capacity preflight runs
+  // here, before any candidate cleanup or creation. Contract v2 streams the
+  // same validated material and intentionally has no adoption-only aggregate
+  // or record-count cap.
+  const material = v2AdoptionMaterial(
+    source.state,
+    adoptionAuthority.contractVersion,
+  );
   const nextGeneration = incrementNonnegativeUint64(
     expectedHead.generation,
     "state_capacity_exhausted",
   );
   const baseHeadChecksum = headChecksum(expectedHead, "corrupt_ledger");
-  // Adoption contract v1 is a bounded full-array handoff. Reject before any
-  // candidate cleanup or creation so an over-cap source cannot be mistaken
-  // for an uncertain authority outcome and cannot mutate generation G+1.
   await lock.assertHeld();
   await authority.assertCurrent();
   const observedBeforeMaterialize = await readTrustedLedgerHead(stateAuthority);

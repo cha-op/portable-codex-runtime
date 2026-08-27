@@ -679,9 +679,22 @@ syncs a covering version 3 checkpoint and empty log, then atomically imports or
 verifies every operation while advancing the head and completeness marker. A
 database-supplied transaction ID closes the import window, and a deferred
 coverage trigger rejects a head-only, partial, duplicate, or mismatched cut.
+Migration 011 remains unchanged. The original
+`createPostgresFilesystemImageProviderStateAdoptionAuthority()` contract
+version 1 still accepts complete operation and storage arrays. The explicit
+`createPostgresFilesystemImageProviderStatePagedAdoptionAuthority()` contract
+version 2 instead collects restartable operation and storage cursor pages with
+fixed four-item page work. In one `SERIALIZABLE` transaction it normalises and
+spills those pages into `pg_temp` relations created with `ON COMMIT DROP`, then
+replays the staged material through migration 011's existing adoption window
+and coverage proof. Pager versions, cursors, and page boundaries do not enter
+the manifest, so every page partition for the same canonical state preserves
+the exact version 1 manifest bytes.
 The manifest digest is a durable receipt, not a write token. Commit
 acknowledgement loss is resolved by exact head, manifest, marker, and full-row
 readback; an ambiguous result preserves both generations and fails closed.
+Both adoption transports retain the same durable candidate, `pending`, and
+`verified` publication and recovery phases.
 An internal event-revision registry gives each prepared or committed revision
 one unique serialization point. Migration validates every preexisting
 non-null completeness marker, then normal indexed writes may advance the head
@@ -700,13 +713,15 @@ monotonic revisions from the origin state. `inspectCapacity()` counts only live
 prepared operations as retained local operations in version 3. The full-array
 adoption version 1 contract admits at most 65,535 operations, 65,535 storages,
 and 64 MiB of aggregate canonical operation/prepared-projection/storage
-material. Those are adoption-only operational limits, not limits on a valid
-version 3 runtime projection: runtime comparison uses the exact head's
-structural bound and fixed attachment-origin batches. A valid version 2 state
-above any adoption limit fails deterministically with
-`state_capacity_exhausted` before any candidate generation is changed and
-requires a future streaming adoption contract. The operation relation remains
-permanent while its anchor exists: `TRUNCATE` is rejected, committed rows are
+material; a valid version 2 state above any limit still fails that exact
+contract with `state_capacity_exhausted` before candidate mutation. Paged
+adoption version 2 removes only those full-array transport limits. It does not
+change the 4 MiB per-record/frame-payload bound, the active-tail envelope of
+65,535 frames and 64 MiB, the uint32 checkpoint-count limits, or the distinct
+version 3 runtime-projection bounds: runtime comparison continues to use the
+exact head's structural bound and fixed attachment-origin batches. The
+operation relation remains permanent while its anchor exists: `TRUNCATE` is
+rejected, committed rows are
 immutable, and deletion requires same-transaction teardown of the whole
 anchor. Teardown of any operation history permanently retires that
 provider/anchor in an immutable lifecycle registry. Every head insert claims

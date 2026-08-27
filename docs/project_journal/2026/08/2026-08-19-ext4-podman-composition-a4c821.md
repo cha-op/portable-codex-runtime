@@ -3,7 +3,7 @@ id: 20260819-a4c821
 title: ext4-to-Podman Attachment Composition
 status: completed
 created: 2026-08-19
-updated: 2026-08-20
+updated: 2026-08-28
 branch: wip/ext4-podman-composition
 pr:
 supersedes: []
@@ -56,8 +56,11 @@ superseded_by:
 
 - Version 3 provider-state adoption now retains and validates every current
   attachment's origin while PostgreSQL supplies permanent operation replay.
-  A future streaming adoption contract is still required for version 2 states
-  beyond the current 65,535-operation/storage full-array capacity.
+  The completed paged adoption version 2 contract now carries otherwise-valid
+  version 2 state beyond the 65,535-operation/storage and 64 MiB full-array
+  version 1 transport capacity without changing attachment-origin authority.
+- Keep power-loss/crash-prefix evidence and automatic stale-writer fencing in
+  their separately scoped clean/manual-fencing work.
 - Keep Git Summary deferred; it is not checkpoint or recovery authority.
 
 ## Evidence
