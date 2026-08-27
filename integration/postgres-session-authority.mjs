@@ -4499,7 +4499,6 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     ].join(" "),
     [providerId, anchorId],
   );
-  assert.equal(stored.rows.length, 2);
   const expectedStored = new Map([
     [
       operationA,
@@ -4517,28 +4516,60 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
         prepared: preparedZ,
       },
     ],
+    [
+      projectionOriginOperationId,
+      {
+        committed: projectionOriginCommitted,
+        committedChecksum: projectionOriginCommittedHead.lastChecksum,
+        prepared: projectionOriginPrepared,
+      },
+    ],
+    [
+      projectionPrepared.operationId,
+      {
+        committed: null,
+        committedChecksum: null,
+        prepared: projectionPrepared,
+      },
+    ],
   ]);
+  assert.equal(stored.rows.length, expectedStored.size);
   for (const row of stored.rows) {
     const expected = expectedStored.get(row.operation_id);
     assert.notEqual(expected, undefined);
-    assert.equal(row.state, "committed");
+    const committed = expected.committed !== null;
+    assert.equal(row.state, committed ? "committed" : "prepared");
     assert.equal(row.prepared_checksum, expected.prepared.preparedChecksum);
-    assert.equal(row.committed_checksum_provenance, "indexed-frame-v1");
-    assert.equal(row.committed_checksum, expected.committedChecksum);
     assert.equal(row.prepared_bytes > 0, true);
-    assert.equal(row.committed_bytes > row.prepared_bytes, true);
     assert.deepEqual(
       JSON.parse(row.prepared_record_bytes.toString("utf8")),
       expected.prepared,
     );
-    assert.deepEqual(
-      JSON.parse(row.committed_record_bytes.toString("utf8")),
-      expected.committed,
-    );
-    for (const [bytes, digest] of [
+    if (committed) {
+      assert.equal(row.committed_checksum_provenance, "indexed-frame-v1");
+      assert.equal(row.committed_checksum, expected.committedChecksum);
+      assert.equal(row.committed_bytes > row.prepared_bytes, true);
+      assert.deepEqual(
+        JSON.parse(row.committed_record_bytes.toString("utf8")),
+        expected.committed,
+      );
+    } else {
+      assert.equal(row.committed_checksum_provenance, null);
+      assert.equal(row.committed_checksum, null);
+      assert.equal(row.committed_record_bytes, null);
+      assert.equal(row.committed_bytes, null);
+      assert.equal(row.committed_record_sha256, null);
+    }
+    const materials = [
       [row.prepared_record_bytes, row.prepared_record_sha256],
-      [row.committed_record_bytes, row.committed_record_sha256],
-    ]) {
+    ];
+    if (committed) {
+      materials.push([
+        row.committed_record_bytes,
+        row.committed_record_sha256,
+      ]);
+    }
+    for (const [bytes, digest] of materials) {
       assert.equal(
         createHash("sha256")
           .update(
