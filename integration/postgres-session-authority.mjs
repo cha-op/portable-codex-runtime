@@ -3565,13 +3565,15 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     await rejectedAdoptionTeardownReinsertClient.query(
       "SET CONSTRAINTS session_authority.fs_image_heads_adoption_complete IMMEDIATE",
     );
+    // Reinsert the valid pre-adoption V2 head so the lifecycle claim, rather
+    // than the V3 initial-progress guard, owns this rejection.
     await assert.rejects(
       rejectedAdoptionTeardownReinsertClient.query(
         rawHeadInsertQuery,
         rawHeadInsertValues(
           adoptedAnchorId,
-          adoptedCutHead,
-          adoptedCutHead.stateRevision,
+          adoptedCommittedHead,
+          null,
         ),
       ),
       (error) => {
