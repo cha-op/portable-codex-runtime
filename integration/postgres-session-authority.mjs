@@ -4597,9 +4597,14 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   );
   assert.notEqual(permanentHistoryBeforeTruncate.rows[0].head_count, "0");
   assert.notEqual(permanentHistoryBeforeTruncate.rows[0].operation_count, "0");
+  // Include each target's explicit FK closure so PostgreSQL reaches its first
+  // listed BEFORE TRUNCATE guard instead of rejecting the statement early.
   await assert.rejects(
     pool.query(
-      "TRUNCATE TABLE session_authority.filesystem_image_provider_operations",
+      [
+        "TRUNCATE TABLE session_authority.filesystem_image_provider_operations,",
+        "session_authority.filesystem_image_provider_operation_events",
+      ].join(" "),
     ),
     (error) => {
       assert.equal(error.code, "55000");
@@ -4612,7 +4617,11 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   );
   await assert.rejects(
     pool.query(
-      "TRUNCATE TABLE session_authority.filesystem_image_provider_heads",
+      [
+        "TRUNCATE TABLE session_authority.filesystem_image_provider_heads,",
+        "session_authority.filesystem_image_provider_operations,",
+        "session_authority.filesystem_image_provider_operation_events",
+      ].join(" "),
     ),
     (error) => {
       assert.equal(error.code, "55000");
