@@ -7388,32 +7388,38 @@ function commitAcknowledgementLossAfterQueryPool(
       const client = await pool.connect();
       return {
         connection: client.connection,
-        async query(...args) {
+        query(...args) {
           const input = args[0];
           const text =
             typeof input === "string" ? input : input?.text;
-          const result = await Reflect.apply(
+          const result = Reflect.apply(
             client.query,
             client,
             args,
           );
-          if (
-            typeof text === "string" &&
-            matches(text)
-          ) {
-            armed = true;
-          }
-          if (
-            text === "COMMIT" &&
-            armed &&
-            !acknowledgementLost
-          ) {
-            acknowledgementLost = true;
-            throw new Error(
-              `synthetic ${label} COMMIT acknowledgement loss`,
-            );
-          }
-          return result;
+          // A custom pg.Query must be returned synchronously with its identity
+          // intact so the bounded row-stream path can observe its protocol.
+          if (result === input) return result;
+          return (async () => {
+            const value = await result;
+            if (
+              typeof text === "string" &&
+              matches(text)
+            ) {
+              armed = true;
+            }
+            if (
+              text === "COMMIT" &&
+              armed &&
+              !acknowledgementLost
+            ) {
+              acknowledgementLost = true;
+              throw new Error(
+                `synthetic ${label} COMMIT acknowledgement loss`,
+              );
+            }
+            return value;
+          })();
         },
         release(...args) {
           return Reflect.apply(client.release, client, args);
