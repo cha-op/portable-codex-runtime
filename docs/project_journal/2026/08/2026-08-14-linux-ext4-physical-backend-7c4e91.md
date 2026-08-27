@@ -689,14 +689,14 @@ change and does not attest the current head:
   state, filesystem, or Podman dispatch; a valid surrogate pair at the existing
   4096-code-unit value boundary is preserved exactly.
 - The same review closed provider-state and inspection namespace gaps.
-  Provider-state now reserves 39 pathname bytes for the longest generation
-  checkpoint name, validates every derived lock/checkpoint/log path as an exact
+  Provider-state now reserves 45 pathname bytes for the longest generation
+  staging name, validates every derived lock/checkpoint/log path as an exact
   direct child through captured `node:path` helpers, and captures
   `node:crypto.createHash` so hostile post-import builtin replacement cannot
   redirect durable files or change SHA-256 identities across restart. The
   inspector rejects pairwise-overlapping trusted roots at construction, before
   a durable operation can be prepared against an ambiguous root selection.
-  Tests cover ASCII and multibyte 4,056/4,057-byte boundaries, 1 MiB early
+  Tests cover ASCII and multibyte 4,050/4,051-byte boundaries, 1 MiB early
   rejection, hostile path/hash replacement with fresh-import replay, both root
   orders, and disjoint-root admission. These are lexical containment,
   nameability, and durable checksum properties; they do not treat ordinary

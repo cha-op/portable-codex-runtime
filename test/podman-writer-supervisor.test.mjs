@@ -980,7 +980,7 @@ function persistentCurrentReceipt(rootPath, bindingSha256 = "7".repeat(64)) {
 
 function persistentFilesystemAuthority(rootPath, events, settings = {}) {
   return exact({
-    contractVersion: 1,
+    contractVersion: 2,
     async verify(input) {
       assert.deepEqual(Reflect.ownKeys(input), ["attachment"]);
       assert.equal(Object.getPrototypeOf(input), null);
@@ -1132,7 +1132,7 @@ async function preparingFixture(t) {
 
 test("filesystem authority composition is exact, branded, and default-runner-only", async (t) => {
   const persistentAuthority = exact({
-    contractVersion: 1,
+    contractVersion: 2,
     async verify() {
       return exact({
         bindingSha256: null,
@@ -1169,11 +1169,11 @@ test("filesystem authority composition is exact, branded, and default-runner-onl
       persistentAuthority,
     })),
     () => createPodmanWriterFilesystemAuthorityComposition(exact({
-      persistentAuthority: exact({ ...persistentAuthority, contractVersion: 2 }),
+      persistentAuthority: exact({ ...persistentAuthority, contractVersion: 1 }),
     })),
     () => createPodmanWriterFilesystemAuthorityComposition(exact({
       persistentAuthority: exact({
-        contractVersion: 1,
+        contractVersion: 2,
         verify: function* verify() {},
       }),
     })),
@@ -3013,7 +3013,7 @@ test("Linux composed authority makes post-start persistent failures outcome-unce
       });
       let verifyCount = 0;
       const persistentAuthority = exact({
-        contractVersion: 1,
+        contractVersion: 2,
         async verify() {
           verifyCount += 1;
           if (existsSync(startedPath)) {
@@ -3149,7 +3149,7 @@ test("Linux composed authority maps persistent receipts and closes failed acquis
       });
       let receiver = null;
       const persistentAuthority = exact({
-        contractVersion: 1,
+        contractVersion: 2,
         verify(input) {
           receiver = this;
           assert.deepEqual(Reflect.ownKeys(input), ["attachment"]);
@@ -3195,7 +3195,7 @@ test("Linux composed authority does not hide holder-close uncertainty behind a p
     useDefaultFilesystemAuthority: true,
   });
   const persistentAuthority = exact({
-    contractVersion: 1,
+    contractVersion: 2,
     async verify() {
       const holderPid = Number(readFileSync(holderPidPath, "utf8").trim());
       process.kill(-holderPid, "SIGKILL");

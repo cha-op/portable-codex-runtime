@@ -2473,9 +2473,10 @@ image format, mount, sync, and loop-detach work bound to pinned descriptor
 authority below host-owned `rprivate` carriers; clean unmount closes the
 mounted-root descriptor before its non-lazy dispatch while retaining the
 pinned parent/direct-child authority;
-provider mutations and maintenance rotation require a version 2 generation
-head anchored outside the replaceable image; and publication checks separately
-authorized persistent control identities. That head binds monotonic anchor and
+provider mutations and maintenance rotation require a versioned generation
+head and permanent operation index anchored outside the replaceable image; and
+publication checks separately authorized persistent control identities. That
+head binds monotonic anchor and
 logical state revisions, generation and previous-head digest, a streamed
 provider-state checkpoint boundary/digest, and the bounded active delta log.
 Rotation syncs the new checkpoint, empty log, and parent directory before its
@@ -2484,10 +2485,10 @@ the anchor revision and generation. Default soft rotation occurs at 8 MiB or
 8,192 active frames, before the 64 MiB and 65,535-frame hard envelope.
 The hot-path cache is not authority: only an exact head and pinned unchanged
 metadata can reuse it, while metadata change triggers content revalidation and
-does not alone prove mutation. The checkpoint retains every prepared and
-committed operation for exact replay, current storage records, and destroyed
-tombstones; a committed delta references its prepared operation instead of
-repeating the request.
+does not alone prove mutation. A version 3 checkpoint retains current storage,
+destroyed tombstones, attachment-origin IDs, and the live prepared recovery
+working set. Committed exact replay comes from PostgreSQL rather than being
+copied into every later checkpoint.
 A database row, published directory, restore journal record, checkpoint
 descriptor, catalogue entry, committed generation, serialized measurement,
 discovery result, or durable attempt alone is never writable-launch authority.
@@ -2512,11 +2513,11 @@ after stop, and retires the user-wide pause namespace before ext4 detach. A
 shared engine cannot use this global release operation; production must own the
 whole engine lifecycle or provide another scoped namespace-release proof.
 
-The provider-state checkpoint above is a control-plane replay snapshot, not a
-physical image checkpoint, published checkpoint artifact, or content root.
-Automatic rotation bounds only the active delta log. Permanent exact replay in
-version 2 makes later checkpoints and aggregate persistent storage grow with
-unique operations.
+The provider-state checkpoint above is a control-plane recovery snapshot, not
+a physical image checkpoint, published checkpoint artifact, or content root.
+Automatic rotation bounds the active delta log. Version 3 also stops completed
+operation history from growing local checkpoints: the local retained set is
+current storage plus destroyed tombstones and unresolved prepared work.
 
 Migration 010 (schema version 10) adds the PostgreSQL operation-index
 foundation without changing that serving path. It keeps existing version 2
@@ -2526,9 +2527,8 @@ prepared bytes, their domain-separated digest, logical revision, operation and
 storage identity, and prepared checksum. A prepared row may acquire matching
 committed bytes, digest, revision, and checksum provenance exactly once. Native
 commits use `indexed-frame-v1` plus the exact committed-frame checksum.
-Migration 010 neither represents nor permits a rotated-version-2 suffix whose
-checksum no longer exists. Updates cannot rewrite the prepared prefix;
-committed history is immutable. Migration 008 already requires
+Updates cannot rewrite the prepared prefix; committed history is immutable.
+Migration 008 already requires
 every non-null value in the three version 2 head checksum columns to be an exact
 64-byte lowercase-hex value. Migration 010 normalizes those valid values to
 `varchar(64)` before version 3 and defines the four operation checksum/digest
@@ -2571,26 +2571,108 @@ than five prepared/committed record pairs. Migration 010's schema and current
 version 2 adapter accept only `indexed-frame-v1`; an active operation tail also
 requires equality with `head.lastChecksum`.
 
-The parent-head predicate is an at-rest consistency gate, not checkpoint
-provenance by itself. A covering version 3 head or transaction token alone is
-not write capability. PR-B migration 011 must atomically introduce the
-`unavailable-adopted-v2` provenance and write path only with the complete
-version 2 checkpoint-and-tail validator, proof that the imported set is unique
-and covers the claimed revision boundary, imported rows, covering checkpoint
-head, and exact completeness marker in one serializable transaction.
+Migration 011 (schema version 11) adds the one-time adoption receipt and
+transaction window. The provider-locked reducer validates the complete version
+2 checkpoint and active tail, including payload sequence, exact revision
+coverage, one pending operation per storage, full before-state lineage, final
+projection, and attachment origins. It writes and syncs a covering version 3
+checkpoint and empty log before the adoption authority performs its database
+cut.
 
-This foundation is not retention by itself. Production version 2 still writes
-complete local history, so deployment hosts must monitor `inspectCapacity()`
-and the backing directory. The next version 3 cut must atomically adopt all
-version 2 operations into the index and install the covering checkpoint head
-with its exact completeness marker in the same transaction. Only then may it
-keep current storage and destroyed tombstones locally while serving exact
-operation replay from PostgreSQL. It
-must retain the origin operation referenced by each current attachment so the
-committed attachment identity remains reconstructable. Migration 011 must add
-any unavailable legacy suffix only in the same atomic cut that installs its
-validator-approved rows, version 3 checkpoint head, and marker, so the database
-constraint and reader both reject a partial adoption.
+The deterministic manifest binds the provider and anchor, both heads, every
+canonical operation and chosen checksum provenance, all final storages, and
+their attachment origins. It is a durable acknowledgement receipt, not a write
+token. PostgreSQL sets a private xid on the exact version 2-to-3 head rotation;
+only that transaction may import tagged rows or write
+`unavailable-adopted-v2`. A deferred constraint trigger compares the final
+stored head with that exact rotation and proves that the union of prepared and
+committed revisions contains every integer from one through the checkpoint
+boundary exactly once. Head-only, partial, duplicate, extra, cross-manifest,
+or later-transaction writes roll back. Already-indexed source and target
+history are each revalidated with one ordered row stream; only the legacy
+history import retains fixed 64-row write batches.
+
+Cold adoption recovery identifies the retained predecessor from either its
+checkpoint or its active ledger. Checkpoint envelopes bind their generation;
+delta-ledger envelopes bind sequence and revision but carry no generation
+field, so recovery does not invent a checkpoint-only generation requirement
+for a generation-zero or otherwise ledger-only predecessor.
+
+The version 3 runtime authority has the exact frozen surface
+`{ contractVersion: 3, readHead, readOperation, readOperationsPage,
+readPreparedOperationsPage, compareProjection, compareAndAdvance }`.
+`compareProjection()` accepts the exact head, the count and domain-separated
+digest of all locally loaded prepared records, and storage-sorted attachment
+origin summaries. In one serializable transaction it validates the exact head
+and completeness marker, then independently streams and fully normalizes every
+prepared row in one data `SELECT` whose `LIMIT` is derived from the exact
+stored head's structural bound. It validates attachment-origin input and named
+origin query results in independent fixed batches of at most 65,535 IDs. A
+first sequential pass validates the frozen input, global storage ordering, and
+incremental checksum with constant authority-owned working memory. A second
+pass materializes only the current batch's normalized origins and IDs. Each
+origin must be a committed `attach` or `restore-attach` for the named storage;
+its complete canonical storage state must equal the current state after
+normalizing only a legal monotonic revision increase. The prepared and origin
+streams use separate length-prefixed projection digests, and the authority
+returns a domain-separated receipt only when both equal the caller's projection
+under that exact head. A mismatch returns no receipt; corrupt authority
+material remains state-invalid.
+
+The provider caches that receipt only inside the same authority instance and
+for the exact unchanged loaded generation and head. A definite normal append
+or rotation obtains the receipt for its new head before publishing the next
+cache. A cold parse, version 2 adoption, or acknowledgement-loss readback does
+not infer the receipt and must run a new comparison. Once a normal append's
+exact authority CAS is known to have advanced, a later projection failure
+preserves its `io_failed` or `corrupt_ledger` cause but reports
+`commitState: "committed"`, because the new head and operation row are already
+durable. For `A` attachment origins,
+projection validation uses one exact-head `SELECT`, one prepared data `SELECT`,
+and `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements in the
+same serializable transaction. The store rechecks transaction identity once
+after each statement. Streaming keeps database operation material bounded to
+one fully validated row at a time, while each origin batch bounds SQL parameters
+and additional comparison memory. The prepared statement count is independent
+of prepared cardinality; origin statement count grows only by fixed 65,535-ID
+batches. This path is bound to the repository-pinned `pg@8.22.0` extended
+query portal with 1,024-row fetches. Completion requires one `RowDescription`,
+one `SELECT` command completion, exactly 1,024 observed rows before every
+`PortalSuspended`, a terminal `SELECT` count for the final partial batch, no
+accumulated `Result.rows`, and the transaction-identity recheck. An exact
+multiple therefore terminates with `SELECT 0` after its final suspension. A
+server `ErrorResponse` on that portal sends exactly one protocol `Sync`, waits
+for `ReadyForQuery`, and only then permits the queued rollback. A client-side
+query timeout or a failed protocol sync destroys the dedicated connection
+instead of queueing a rollback behind an unrecoverable active query. Normal
+version 3 appends keep `indexed-frame-v1`; arbitrary-age reads come from the
+permanent index. An adopted prepared row may later acquire a native indexed
+suffix.
+
+Filesystem candidate publication precedes the database adoption. Exact target
+head, marker, manifest, and full-row readback proves success after a lost COMMIT
+acknowledgement; exact unchanged source proves failure; every other observation
+preserves both generations and reports uncertainty. The full-array adoption
+version 1 API admits at most 65,535 operations, 65,535 storages, and 64 MiB of
+aggregate canonical operation/prepared-projection/storage material. Those
+limits apply only to adoption, not to a legal version 3 runtime projection.
+Valid version 2 state outside those adoption limits fails with
+`state_capacity_exhausted` before candidate mutation and requires a future
+streaming contract. Migration 011
+claims every prepared and committed revision in an internal unique event
+registry. Existing non-null markers are validated during migration; later
+indexed heads can append only one claimed revision or rotate without changing
+the revision, while bulk adoption keeps its full-range deferred proof. A raw
+head insert or jump therefore cannot claim complete permanent history. Stored
+heads exclude revision zero, and a database-managed progress transaction ID
+prevents an early constraint check from authorizing a second head mutation.
+Migration 011 also keeps one permanent anchor-lifecycle row per identity.
+Every head insert claims that same unique key, while complete teardown of
+operation history changes the row from active
+to immutable retired. The database conflict serializes concurrent recreation,
+and the identity also cannot be reinserted after forcing its deferred delete
+check early. Every head deletion retires the row, including an empty head, so a
+delete-and-reinsert sequence cannot create durable-anchor ABA.
 
 The resulting scope is deliberately clean and manually fenced. Two hosted
 Ubuntu runners independently anchor the archive mount-root and artifact-child

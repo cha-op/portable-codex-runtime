@@ -8,7 +8,6 @@ import {
   assertExt4FilesystemImageMountPathCapacity,
 } from "./ext4-filesystem-image-paths.mjs";
 import {
-  FILESYSTEM_IMAGE_PROVIDER_STATE_CONTRACT_VERSION,
   FilesystemImageProviderState,
 } from "./filesystem-image-provider-state.mjs";
 import {

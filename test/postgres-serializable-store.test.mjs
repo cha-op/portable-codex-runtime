@@ -7,12 +7,13 @@ import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 
-import { DatabaseError } from "pg";
+import { Client as PgClient, DatabaseError, Query } from "pg";
 
 import {
   PostgresSerializableStore,
   PostgresSerializableStoreError,
   SESSION_AUTHORITY_MIGRATION_VERSION,
+  consumePostgresSerializableTransactionRows,
   isPostgresSerializableStore,
 } from "../src/postgres-serializable-store.mjs";
 
@@ -76,6 +77,10 @@ const AUTHORITY_MIGRATION_URLS = Object.freeze([
     "../migrations/authority/010-filesystem-image-provider-operations.sql",
     import.meta.url,
   ),
+  new URL(
+    "../migrations/authority/011-filesystem-image-provider-state-v3-adoption.sql",
+    import.meta.url,
+  ),
 ]);
 
 class FakeClient {
@@ -89,6 +94,18 @@ class FakeClient {
     } = {},
   ) {
     this.connection = new EventEmitter();
+    this.portalExecutions = [];
+    this.portalFlushes = 0;
+    this.portalSyncs = 0;
+    this.connection.execute = (config) => {
+      this.portalExecutions.push(config);
+    };
+    this.connection.flush = () => {
+      this.portalFlushes += 1;
+    };
+    this.connection.sync = () => {
+      this.portalSyncs += 1;
+    };
     this.durabilityBoundaryPending = false;
     this.durabilityBoundarySteps =
       durabilityBoundarySteps === undefined
@@ -103,7 +120,7 @@ class FakeClient {
     this.steps = [...steps];
   }
 
-  async query(...args) {
+  query(...args) {
     this.queries.push(args);
     const text = queryText(args);
     if (text === "DISCARD ALL") {
@@ -180,7 +197,7 @@ class FakeClient {
     }
     assert.notEqual(this.steps.length, 0, `unexpected query: ${text}`);
     const step = this.steps.shift();
-    if (typeof step === "function") return step(args);
+    if (typeof step === "function") return step(args, this);
     if (step instanceof Error) {
       if (step instanceof DatabaseError) {
         this.connection.emit("errorMessage", step);
@@ -213,6 +230,134 @@ class FakeClient {
   }
 }
 
+class PgTimeoutFakeClient extends FakeClient {
+  constructor(steps, queryTimeout) {
+    super(steps);
+    this._Promise = Promise;
+    this._ending = false;
+    this._queryQueue = [];
+    this._queryable = true;
+    this._types = undefined;
+    this.binary = false;
+    this.connectionParameters = { query_timeout: queryTimeout };
+    this.pendingStreamSteps = [];
+    this.streamPulseCalls = 0;
+  }
+
+  query(...args) {
+    const query = args[0];
+    if (
+      query !== null &&
+      typeof query === "object" &&
+      query.queryMode === "extended" &&
+      query.rows === 1024 &&
+      typeof query.submit === "function"
+    ) {
+      this.queries.push(args);
+      assert.notEqual(this.steps.length, 0, "missing stream query step");
+      this.pendingStreamSteps.push(this.steps.shift());
+      return Reflect.apply(PgClient.prototype.query, this, args);
+    }
+    return super.query(...args);
+  }
+
+  _pulseQueryQueue() {
+    this.streamPulseCalls += 1;
+    const query = this._queryQueue.shift();
+    if (query === undefined) return;
+    const step = this.pendingStreamSteps.shift();
+    assert.equal(typeof step, "function");
+    step([query], this);
+  }
+}
+
+class PgProtocolLifecycleFakeClient extends PgTimeoutFakeClient {
+  constructor(steps, queryTimeout, { syncError } = {}) {
+    super(steps, queryTimeout);
+    this._activeQuery = null;
+    this._connecting = false;
+    this.readyForQuery = true;
+    this.pendingProtocolSteps = [];
+    this.protocolReadyMessages = 0;
+    this.rollbackSubmissionStates = [];
+    this.syncError = syncError;
+    this.errorMessageHandler = (message) =>
+      Reflect.apply(PgClient.prototype._handleErrorMessage, this, [
+        message,
+      ]);
+    this.readyForQueryHandler = (message) => {
+      this.protocolReadyMessages += 1;
+      return Reflect.apply(PgClient.prototype._handleReadyForQuery, this, [
+        message,
+      ]);
+    };
+    this.connection.on("errorMessage", this.errorMessageHandler);
+    this.connection.on("readyForQuery", this.readyForQueryHandler);
+    this.connection.sync = () => {
+      this.portalSyncs += 1;
+      if (this.syncError !== undefined) throw this.syncError;
+      queueMicrotask(() => {
+        this.connection.emit("readyForQuery", { status: "E" });
+      });
+    };
+  }
+
+  query(...args) {
+    if (queryText(args) === "ROLLBACK") {
+      this.queries.push(args);
+      this.rollbackSubmissionStates.push(this.readyForQuery);
+      assert.notEqual(this.steps.length, 0, "missing ROLLBACK step");
+      this.pendingProtocolSteps.push(this.steps.shift());
+      return Reflect.apply(PgClient.prototype.query, this, args);
+    }
+    return super.query(...args);
+  }
+
+  _getActiveQuery() {
+    return this._activeQuery;
+  }
+
+  _pulseQueryQueue() {
+    this.streamPulseCalls += 1;
+    if (this.readyForQuery !== true) return;
+    const query = this._queryQueue.shift();
+    if (query === undefined) return;
+    this._activeQuery = query;
+    this.readyForQuery = false;
+    if (query.rows === 1024 && query.queryMode === "extended") {
+      const step = this.pendingStreamSteps.shift();
+      assert.equal(typeof step, "function");
+      step([query], this);
+      return;
+    }
+    assert.equal(query.text, "ROLLBACK");
+    const step = this.pendingProtocolSteps.shift();
+    assert.equal(step?.command, "ROLLBACK");
+    queueMicrotask(() => {
+      query.handleCommandComplete(
+        { text: step.command },
+        this.connection,
+      );
+      this.connection.emit("readyForQuery", { status: "I" });
+    });
+  }
+
+  assertExhausted() {
+    this.connection.removeListener(
+      "errorMessage",
+      this.errorMessageHandler,
+    );
+    this.connection.removeListener(
+      "readyForQuery",
+      this.readyForQueryHandler,
+    );
+    assert.deepEqual(this.pendingProtocolSteps, []);
+    assert.deepEqual(this.pendingStreamSteps, []);
+    assert.deepEqual(this._queryQueue, []);
+    super.assertExhausted();
+  }
+}
+
 class FakePool {
   constructor(connections) {
     this.connectCalls = 0;
@@ -240,6 +385,130 @@ function transactionIdResult(value = "100") {
 
 function queryText(args) {
   return typeof args[0] === "string" ? args[0] : args[0]?.text;
+}
+
+function streamedRowsStep(
+  rows,
+  {
+    afterRow,
+    afterTerminal,
+    beforeCommand,
+    beforeReady,
+    commandMessages,
+    error,
+    inspectQuery,
+    protocolRows = 0,
+    rawRows = false,
+    returnWrongIdentity = false,
+    schedule = queueMicrotask,
+    throwAfterTerminal,
+  } = {},
+) {
+  let fieldNames = [];
+  if (!rawRows && rows.length !== 0) {
+    fieldNames = Object.keys(rows[0]);
+    for (let index = 0; index < rows.length; index += 1) {
+      assert.deepEqual(Object.keys(rows[index]), fieldNames);
+    }
+  }
+  const fieldDescriptions = fieldNames.map((name) => ({
+    dataTypeID:
+      typeof rows[0][name] === "number" ? 23 : 25,
+    format: "text",
+    name,
+  }));
+  const rowMessages = rawRows
+    ? []
+    : rows.map((row) => ({
+        fields: fieldNames.map((name) =>
+          row[name] === null ? null : String(row[name]),
+        ),
+      }));
+  const totalRows = protocolRows + rows.length;
+  return (args, client) => {
+    assert.equal(args.length, 1);
+    const query = args[0];
+    assert.equal(query.queryMode, "extended");
+    assert.equal(query.rows, 1024);
+    assert.equal(typeof query.submit, "function");
+    assert.equal(query.listeners("row").length, 1);
+    inspectQuery?.(query);
+    schedule(() => {
+      query.handleRowDescription({ fields: fieldDescriptions });
+      assert.equal(query._accumulateRows, false);
+      let deliveredRows = 0;
+      const recordDelivery = () => {
+        deliveredRows += 1;
+        if (deliveredRows % 1024 === 0) {
+          query.handlePortalSuspended(client.connection);
+        }
+      };
+      for (let index = 0; index < protocolRows; index += 1) {
+        query.handleDataRow({ fields: [] });
+        recordDelivery();
+      }
+      for (let index = 0; index < rows.length; index += 1) {
+        if (rawRows) {
+          query.emit("row", rows[index], query._result);
+        } else {
+          query.handleDataRow(rowMessages[index]);
+        }
+        afterRow?.(rows[index], index);
+        recordDelivery();
+      }
+      assert.deepEqual(query._result.rows, []);
+      if (error !== undefined) {
+        if (error instanceof DatabaseError) {
+          client.connection.emit("errorMessage", error);
+        }
+        query.handleError(error, client.connection);
+      } else {
+        beforeCommand?.(query, client);
+        const messages =
+          commandMessages ?? [{ text: `SELECT ${totalRows % 1024}` }];
+        for (let index = 0; index < messages.length; index += 1) {
+          query.handleCommandComplete(messages[index], client.connection);
+        }
+        beforeReady?.(query, client);
+        query.handleReadyForQuery(client.connection);
+      }
+      afterTerminal?.(query, client);
+    });
+    if (throwAfterTerminal !== undefined) throw throwAfterTerminal;
+    return returnWrongIdentity ? Object.freeze({}) : query;
+  };
+}
+
+function protocolErrorResponseStep(error, inspectQuery) {
+  return (args, client) => {
+    assert.equal(args.length, 1);
+    const query = args[0];
+    assert.equal(query.queryMode, "extended");
+    assert.equal(query.rows, 1024);
+    assert.equal(client._activeQuery, query);
+    assert.equal(client.readyForQuery, false);
+    inspectQuery?.(query);
+    client.connection.emit("errorMessage", error);
+    return query;
+  };
+}
+
+function primeStreamParserFailure(query, error) {
+  query.handleRowDescription({
+    fields: [
+      {
+        dataTypeID: 23,
+        format: "text",
+        name: "value",
+      },
+    ],
+  });
+  query._result._parsers[0] = () => {
+    throw error;
+  };
+  query.handleDataRow({ fields: ["1"] });
+  assert.equal(query._canceledDueToError, error);
+  assert.deepEqual(query._result.rows, []);
 }
 
 function nonResetQueries(client) {
@@ -341,6 +610,1293 @@ test("runSerializable binds query and database time to one released client", asy
       commitState: "not-committed",
     },
   );
+});
+
+test("row streaming is exact, branded, native, and absent from the transaction surface", async () => {
+  assert.equal(consumePostgresSerializableTransactionRows.length, 4);
+  assert.equal(
+    Object.isFrozen(consumePostgresSerializableTransactionRows),
+    true,
+  );
+  await assertStoreError(
+    consumePostgresSerializableTransactionRows(
+      Object.freeze({ now: "2026-07-23T10:11:12.000Z", query() {} }),
+      "SELECT 1",
+      [],
+      () => undefined,
+    ),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  await assertStoreError(
+    consumePostgresSerializableTransactionRows({}, "SELECT 1", []),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([]),
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  let retainedTransaction;
+  const result = await store.runSerializable(async (transaction) => {
+    retainedTransaction = transaction;
+    assert.deepEqual(Reflect.ownKeys(transaction), ["now", "query"]);
+    const completion = consumePostgresSerializableTransactionRows(
+      transaction,
+      "SELECT 1 WHERE false",
+      [],
+      () => undefined,
+    );
+    assert.equal(Object.getPrototypeOf(completion), Promise.prototype);
+    assert.equal(await completion, undefined);
+    return "committed";
+  });
+  assert.equal(result, "committed");
+  await assertStoreError(
+    consumePostgresSerializableTransactionRows(
+      retainedTransaction,
+      "SELECT 1",
+      [],
+      () => undefined,
+    ),
+    {
+      code: "transaction_query_inactive",
+      commitState: "not-committed",
+    },
+  );
+  client.assertExhausted();
+});
+
+test("row streaming copies 0, 1, and 65535 primitive parameters", async (t) => {
+  for (const count of [0, 1, 65_535]) {
+    await t.test(String(count), async () => {
+      const values = new Array(count).fill(count);
+      const client = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:12.000Z"),
+        streamedRowsStep([], {
+          inspectQuery(query) {
+            assert.equal(query.text, "SELECT $1");
+            assert.equal(query.values.length, count);
+            assert.equal(Object.isFrozen(query.values), true);
+            if (count !== 0) {
+              assert.equal(query.values[0], count);
+              assert.equal(query.values[count - 1], count);
+            }
+          },
+        }),
+        transactionIdResult(),
+        COMMIT_RESULT,
+      ]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: new FakePool([client]),
+      });
+      await store.runSerializable((transaction) =>
+        consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT $1",
+          values,
+          () => undefined,
+        ),
+      );
+      client.assertExhausted();
+    });
+  }
+});
+
+test(
+  "row streaming counts complete portal fetches without accumulating Result rows",
+  async (t) => {
+    for (const rowCount of [1_024, 1_025, 2_048, 2_049]) {
+      await t.test(String(rowCount), async () => {
+        const client = new FakeClient([
+          {},
+          timestampResult("2026-07-23T10:11:12.000Z"),
+          streamedRowsStep([], { protocolRows: rowCount }),
+          transactionIdResult(),
+          COMMIT_RESULT,
+        ]);
+        const store = new PostgresSerializableStore({
+          dedicatedPool: new FakePool([client]),
+        });
+        let count = 0;
+        await store.runSerializable((transaction) =>
+          consumePostgresSerializableTransactionRows(
+            transaction,
+            "SELECT operation_id FROM session_authority.operations",
+            [],
+            () => {
+              count += 1;
+            },
+          ),
+        );
+        assert.equal(count, rowCount);
+        assert.equal(
+          nonResetQueries(client).filter(
+            (args) =>
+              queryText(args) ===
+              "SELECT operation_id FROM session_authority.operations",
+          ).length,
+          1,
+        );
+        const portalSuspensionCount = Math.floor(rowCount / 1024);
+        assert.deepEqual(
+          client.portalExecutions,
+          new Array(portalSuspensionCount).fill({ portal: "", rows: 1024 }),
+        );
+        assert.equal(client.portalFlushes, portalSuspensionCount);
+        assert.equal(client.portalSyncs, 1);
+        client.assertExhausted();
+      });
+    }
+  },
+);
+
+test("pg Client.query keeps streaming callbacks hidden with and without a global timeout", async (t) => {
+  for (const queryTimeout of [0, 25]) {
+    await t.test(
+      queryTimeout === 0 ? "no-timeout-wrapper" : "global-timeout-cleared",
+      async () => {
+        const rowCount = queryTimeout === 0 ? 1 : 2_049;
+        let terminalRows;
+        const client = new PgTimeoutFakeClient(
+          [
+            {},
+            timestampResult("2026-07-23T10:11:12.000Z"),
+            streamedRowsStep([], {
+              afterTerminal(query) {
+                terminalRows = query._result.rows;
+              },
+              inspectQuery(query) {
+                assert.equal(query.callback, undefined);
+                const descriptor = Object.getOwnPropertyDescriptor(
+                  query,
+                  "callback",
+                );
+                assert.equal(typeof descriptor.get, "function");
+                assert.equal(typeof descriptor.set, "function");
+              },
+              protocolRows: rowCount,
+              schedule: setImmediate,
+            }),
+            transactionIdResult(),
+            COMMIT_RESULT,
+          ],
+          queryTimeout,
+        );
+        const store = new PostgresSerializableStore({
+          dedicatedPool: new FakePool([client]),
+        });
+        let observedRows = 0;
+        await store.runSerializable(async (transaction) => {
+          await consumePostgresSerializableTransactionRows(
+            transaction,
+            "SELECT value FROM streamed_rows",
+            [],
+            () => {
+              observedRows += 1;
+            },
+          );
+          await new Promise((resolve) =>
+            setTimeout(resolve, queryTimeout === 0 ? 5 : 50),
+          );
+        });
+        assert.equal(observedRows, rowCount);
+        assert.deepEqual(terminalRows, []);
+        assert.equal(client.streamPulseCalls, 1);
+        client.assertExhausted();
+      },
+    );
+  }
+});
+
+test("pg ErrorResponse synchronizes once and pulses a real queued ROLLBACK", async () => {
+  const serverError = pgError("23505", "streamed duplicate");
+  let streamedQuery;
+  const client = new PgProtocolLifecycleFakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      protocolErrorResponseStep(serverError, (query) => {
+        streamedQuery = query;
+      }),
+      ROLLBACK_RESULT,
+    ],
+    25,
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_query_failed",
+      commitState: "not-committed",
+      omittedText: serverError.message,
+    },
+  );
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  assert.deepEqual(streamedQuery._result.rows, []);
+  assert.equal(client.portalSyncs, 1);
+  assert.equal(client.protocolReadyMessages, 2);
+  assert.deepEqual(client.rollbackSubmissionStates, [true]);
+  assert.equal(client.readyForQuery, true);
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "COMMIT"),
+    false,
+  );
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a malformed ErrorResponse SQLSTATE still synchronizes before fail-closed rollback", async () => {
+  const serverError = pgError("invalid", "malformed SQLSTATE");
+  const client = new PgProtocolLifecycleFakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      protocolErrorResponseStep(serverError),
+      ROLLBACK_RESULT,
+    ],
+    0,
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: serverError.message,
+    },
+  );
+  assert.equal(client.portalSyncs, 1);
+  assert.equal(client.protocolReadyMessages, 2);
+  assert.deepEqual(client.rollbackSubmissionStates, [true]);
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "COMMIT"),
+    false,
+  );
+  assert.equal(client.releaseCalls.length, 1);
+  assert.equal(client.releaseCalls[0].length, 1);
+  client.assertExhausted();
+});
+
+test("a synchronous protocol sync failure preserves the server error and destroys without queuing rollback", async () => {
+  const serverError = pgError("23505", "primary server error");
+  const syncError = new Error("protocol sync failed");
+  let emittedError;
+  const client = new PgProtocolLifecycleFakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      protocolErrorResponseStep(serverError, (query) => {
+        Reflect.apply(EventEmitter.prototype.on, query, [
+          "error",
+          (error) => {
+            emittedError ??= error;
+          },
+        ]);
+      }),
+    ],
+    0,
+    { syncError },
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: syncError.message,
+    },
+  );
+  assert.equal(emittedError, serverError);
+  assert.equal(client.portalSyncs, 1);
+  assert.equal(client.protocolReadyMessages, 0);
+  assert.deepEqual(client.rollbackSubmissionStates, []);
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "ROLLBACK"),
+    false,
+  );
+  assert.equal(client.releaseCalls.length, 1);
+  assert.equal(client.releaseCalls[0].length, 1);
+  client.assertExhausted();
+});
+
+test("a server ErrorResponse remains authoritative after a primitive stream parser failure", async () => {
+  const parserError = "stream parser failed";
+  const serverError = pgError("23505", "primary server error");
+  let emittedError;
+  const client = new PgProtocolLifecycleFakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      protocolErrorResponseStep(serverError, (query) => {
+        primeStreamParserFailure(query, parserError);
+        Reflect.apply(EventEmitter.prototype.on, query, [
+          "error",
+          (error) => {
+            emittedError ??= error;
+          },
+        ]);
+      }),
+      ROLLBACK_RESULT,
+    ],
+    0,
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_query_failed",
+      commitState: "not-committed",
+      omittedText: parserError,
+    },
+  );
+  assert.equal(emittedError, parserError);
+  assert.equal(client.portalSyncs, 1);
+  assert.equal(client.protocolReadyMessages, 2);
+  assert.deepEqual(client.rollbackSubmissionStates, [true]);
+  assert.deepEqual(client.releaseCalls, [[]]);
+  client.assertExhausted();
+});
+
+test("a sync failure after a primitive stream parser failure destroys without queuing rollback", async () => {
+  const parserError = "stream parser failed";
+  const serverError = pgError("23505", "primary server error");
+  const syncError = new Error("protocol sync failed");
+  let emittedError;
+  const client = new PgProtocolLifecycleFakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      protocolErrorResponseStep(serverError, (query) => {
+        primeStreamParserFailure(query, parserError);
+        Reflect.apply(EventEmitter.prototype.on, query, [
+          "error",
+          (error) => {
+            emittedError ??= error;
+          },
+        ]);
+      }),
+    ],
+    0,
+    { syncError },
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: syncError.message,
+    },
+  );
+  assert.equal(emittedError, parserError);
+  assert.equal(client.portalSyncs, 1);
+  assert.equal(client.protocolReadyMessages, 0);
+  assert.deepEqual(client.rollbackSubmissionStates, []);
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "ROLLBACK"),
+    false,
+  );
+  assert.equal(client.releaseCalls.length, 1);
+  assert.equal(client.releaseCalls[0].length, 1);
+  client.assertExhausted();
+});
+
+test("pg global query_timeout fails a stalled row stream without accumulating rows", async () => {
+  let streamedQuery;
+  const client = new PgProtocolLifecycleFakeClient(
+    [
+      {},
+      timestampResult("2026-07-23T10:11:12.000Z"),
+      (args) => {
+        streamedQuery = args[0];
+        assert.equal(streamedQuery.callback, undefined);
+        return streamedQuery;
+      },
+    ],
+    5,
+  );
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM stalled_rows",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: "Query read timeout",
+    },
+  );
+  assert.deepEqual(streamedQuery._result.rows, []);
+  assert.equal(client.streamPulseCalls, 2);
+  assert.equal(client.portalSyncs, 0);
+  assert.deepEqual(client.rollbackSubmissionStates, []);
+  assert.equal(client.readyForQuery, false);
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "ROLLBACK"),
+    false,
+  );
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "COMMIT"),
+    false,
+  );
+  assert.equal(client.releaseCalls.length, 1);
+  assert.equal(client.releaseCalls[0].length, 1);
+  client.assertExhausted();
+});
+
+test("row streaming rejects malformed or incomplete terminal results", async (t) => {
+  const scenarios = [
+    {
+      name: "missing-command-complete",
+      options: { commandMessages: [] },
+    },
+    {
+      name: "non-select-command",
+      options: { commandMessages: [{ text: "UPDATE 1" }] },
+    },
+    {
+      name: "row-count-mismatch",
+      options: { commandMessages: [{ text: "SELECT 2" }] },
+    },
+    {
+      name: "terminal-portal-row-count-mismatch",
+      options: {
+        commandMessages: [{ text: "SELECT 2" }],
+        protocolRows: 1_024,
+      },
+    },
+    {
+      name: "misaligned-portal-suspension",
+      options: {
+        beforeCommand(query, client) {
+          query.handlePortalSuspended(client.connection);
+        },
+      },
+    },
+    {
+      name: "multiple-command-results",
+      options: {
+        commandMessages: [{ text: "SELECT 1" }, { text: "SELECT 0" }],
+      },
+    },
+    {
+      name: "duplicate-row-description",
+      options: {
+        beforeCommand(query) {
+          query.handleRowDescription({
+            fields: [{ dataTypeID: 23, format: "text", name: "value" }],
+          });
+        },
+      },
+    },
+    {
+      name: "end-result-identity-mismatch",
+      options: {
+        beforeReady(query) {
+          query._results = Object.freeze({ command: "SELECT", rowCount: 1 });
+        },
+      },
+    },
+    {
+      name: "accumulated-result-row",
+      options: {
+        beforeReady(query) {
+          query._result.rows.push(Object.freeze({ value: 1 }));
+        },
+      },
+    },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const client = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:12.000Z"),
+        streamedRowsStep([{ value: 1 }], scenario.options),
+        transactionIdResult(),
+        {},
+      ]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: new FakePool([client]),
+      });
+      await assertStoreError(
+        store.runSerializable((transaction) =>
+          consumePostgresSerializableTransactionRows(
+            transaction,
+            "SELECT value FROM streamed_rows",
+            [],
+            () => undefined,
+          ),
+        ),
+        {
+          code: "transaction_query_invalid",
+          commitState: "not-committed",
+        },
+      );
+      assert.equal(
+        nonResetQueries(client).some(
+          (args) => queryText(args) === "COMMIT",
+        ),
+        false,
+      );
+      client.assertExhausted();
+    });
+  }
+});
+
+test("synchronous terminal events cannot hide submission failures", async (t) => {
+  const postEndError = new Error("post-end submission failure");
+  const scenarios = [
+    {
+      name: "wrong-query-identity",
+      options: {
+        returnWrongIdentity: true,
+        schedule(callback) {
+          callback();
+        },
+      },
+    },
+    {
+      name: "post-end-throw",
+      options: {
+        schedule(callback) {
+          callback();
+        },
+        throwAfterTerminal: postEndError,
+      },
+    },
+  ];
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const client = new FakeClient([
+        {},
+        timestampResult("2026-07-23T10:11:12.000Z"),
+        streamedRowsStep([{ value: 1 }], scenario.options),
+        {},
+      ]);
+      const store = new PostgresSerializableStore({
+        dedicatedPool: new FakePool([client]),
+      });
+      await assertStoreError(
+        store.runSerializable((transaction) =>
+          consumePostgresSerializableTransactionRows(
+            transaction,
+            "SELECT value FROM streamed_rows",
+            [],
+            () => undefined,
+          ),
+        ),
+        {
+          code: "transaction_boundary_lost",
+          commitState: "uncertain",
+          omittedText: postEndError.message,
+        },
+      );
+      assert.equal(
+        nonResetQueries(client).some(
+          (args) => queryText(args) === "COMMIT",
+        ),
+        false,
+      );
+      client.assertExhausted();
+    });
+  }
+});
+
+test("a synchronous post-end query error remains primary", async () => {
+  const serverError = pgError("23505", "post-end server failure");
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ value: 1 }], {
+      afterTerminal(query, streamClient) {
+        streamClient.connection.emit("errorMessage", serverError);
+        query.handleError(serverError, streamClient.connection);
+      },
+      schedule(callback) {
+        callback();
+      },
+    }),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_query_failed",
+      commitState: "not-committed",
+      omittedText: serverError.message,
+    },
+  );
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "COMMIT"),
+    false,
+  );
+  client.assertExhausted();
+});
+
+test("row streams and ordinary queries share one ordered transaction queue", async () => {
+  const order = [];
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    () => {
+      order.push("query-1");
+      return { rows: [{ value: 1 }] };
+    },
+    transactionIdResult(),
+    streamedRowsStep([{ value: 2 }], {
+      inspectQuery() {
+        order.push("stream-submit");
+      },
+    }),
+    transactionIdResult(),
+    () => {
+      order.push("query-3");
+      return { rows: [{ value: 3 }] };
+    },
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await store.runSerializable(async (transaction) => {
+    const first = transaction.query("SELECT 1");
+    const stream = consumePostgresSerializableTransactionRows(
+      transaction,
+      "SELECT 2",
+      [],
+      (row) => {
+        order.push(`row-${row.value}`);
+      },
+    );
+    const third = transaction.query("SELECT 3");
+    await Promise.all([first, stream, third]);
+  });
+  assert.deepEqual(order, ["query-1", "stream-submit", "row-2", "query-3"]);
+  client.assertExhausted();
+});
+
+test("a thrown row callback drains the stream and forbids commit when suppressed", async () => {
+  const callbackError = new Error("row callback failed");
+  let emitted = 0;
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ value: 1 }, { value: 2 }, { value: 3 }], {
+      afterRow() {
+        emitted += 1;
+      },
+    }),
+    transactionIdResult(),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assert.rejects(
+    store.runSerializable(async (transaction) => {
+      try {
+        await consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT value FROM streamed_rows",
+          [],
+          () => {
+            throw callbackError;
+          },
+        );
+      } catch (error) {
+        assert.equal(error, callbackError);
+      }
+      return "must-not-commit";
+    }),
+    (error) => error === callbackError,
+  );
+  assert.equal(emitted, 3);
+  assert.equal(client.portalSyncs, 1);
+  assert.deepEqual(nonResetQueries(client).map(queryText), [
+    "BEGIN ISOLATION LEVEL SERIALIZABLE READ WRITE",
+    "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
+    "SELECT value FROM streamed_rows",
+    "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id",
+    "ROLLBACK",
+  ]);
+  client.assertExhausted();
+});
+
+test("a local row parser failure uses the completed portal sync only once", async () => {
+  const parseError = new Error("local row parser failed");
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ value: 1 }], {
+      inspectQuery(query) {
+        query._result._types = {
+          getTypeParser() {
+            return () => {
+              throw parseError;
+            };
+          },
+        };
+      },
+    }),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => assert.fail("a parser failure cannot emit a row"),
+      ),
+    ),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+      omittedText: parseError.message,
+    },
+  );
+  assert.equal(client.portalSyncs, 1);
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "COMMIT"),
+    false,
+  );
+  client.assertExhausted();
+});
+
+test("a non-undefined row callback result is observed and cannot commit", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ value: 1 }, { value: 2 }]),
+    transactionIdResult(),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      try {
+        await consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT value FROM streamed_rows",
+          [],
+          () => Promise.reject(new Error("owned callback rejection")),
+        );
+      } catch {
+        return "must-not-commit";
+      }
+      return assert.fail("stream must reject");
+    }),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+      omittedText: "owned callback rejection",
+    },
+  );
+  client.assertExhausted();
+});
+
+test("a stream server error takes priority over an earlier callback error", async () => {
+  const serverError = pgError("23505", "private streamed duplicate");
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ value: 1 }], { error: serverError }),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      try {
+        await consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT value FROM streamed_rows",
+          [],
+          () => {
+            throw new Error("lower-priority callback failure");
+          },
+        );
+      } catch {
+        return "must-not-commit";
+      }
+    }),
+    {
+      code: "transaction_query_failed",
+      commitState: "not-committed",
+      omittedText: "private streamed duplicate",
+    },
+  );
+  assert.equal(client.portalSyncs, 1);
+  client.assertExhausted();
+});
+
+test("a retryable stream server error takes priority and retries", async () => {
+  let attempts = 0;
+  const first = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ attempt: 1 }], { error: pgError("40001") }),
+    {},
+  ]);
+  const second = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:13.000Z"),
+    streamedRowsStep([{ attempt: 2 }]),
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([first, second]),
+    maxTransactionAttempts: 2,
+  });
+  assert.equal(
+    await store.runSerializable(async (transaction) => {
+      attempts += 1;
+      try {
+        await consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT attempt FROM streamed_rows",
+          [],
+          () => {
+            if (attempts === 1) throw new Error("superseded callback");
+          },
+        );
+      } catch {
+        // A trusted 40001, not the suppressed callback error, decides retry.
+      }
+      return attempts;
+    }),
+    2,
+  );
+  assert.equal(attempts, 2);
+  first.assertExhausted();
+  second.assertExhausted();
+});
+
+test("a retryable boundary rollback takes priority over a row callback error", async () => {
+  const retryableBoundary = pgError("40001");
+  let attempts = 0;
+  const first = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ attempt: 1 }]),
+    retryableBoundary,
+  ]);
+  const second = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:13.000Z"),
+    streamedRowsStep([{ attempt: 2 }]),
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([first, second]),
+    maxTransactionAttempts: 2,
+  });
+  assert.equal(
+    await store.runSerializable(async (transaction) => {
+      attempts += 1;
+      try {
+        await consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT attempt FROM streamed_rows",
+          [],
+          () => {
+            if (attempts === 1) throw new Error("superseded callback");
+          },
+        );
+      } catch {
+        // The boundary result, not this suppressed local error, decides retry.
+      }
+      return attempts;
+    }),
+    2,
+  );
+  assert.equal(attempts, 2);
+  first.assertExhausted();
+  second.assertExhausted();
+});
+
+test("a lost boundary takes priority over a row callback error", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ value: 1 }]),
+    pgError("08006"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable(async (transaction) => {
+      try {
+        await consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT value FROM streamed_rows",
+          [],
+          () => {
+            throw new Error("superseded callback");
+          },
+        );
+      } catch {
+        return "must-not-commit";
+      }
+    }),
+    {
+      code: "transaction_boundary_lost",
+      commitState: "uncertain",
+    },
+  );
+  client.assertExhausted();
+});
+
+test("an unsettled row stream is drained and reported pending", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([{ value: 1 }], { schedule: setImmediate }),
+    transactionIdResult(),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) => {
+      void consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT value FROM streamed_rows",
+        [],
+        () => undefined,
+      );
+    }),
+    {
+      code: "transaction_query_pending",
+      commitState: "not-committed",
+    },
+  );
+  client.assertExhausted();
+});
+
+test("row streaming rejects PREPARE TRANSACTION before submission", async () => {
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  await assertStoreError(
+    store.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "/* guarded */ PREPARE TRANSACTION 'escape'",
+        [],
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  assert.equal(
+    nonResetQueries(client).some(
+      (args) => queryText(args).includes("PREPARE TRANSACTION"),
+    ),
+    false,
+  );
+  client.assertExhausted();
+});
+
+test("row streaming rejects an inserted Result prototype parent before construction", async () => {
+  const resultPrototype = Object.getPrototypeOf(
+    new Query({
+      queryMode: "extended",
+      rows: 1024,
+      text: "SELECT 1",
+      values: [],
+    })._result,
+  );
+  const originalParent = Object.getPrototypeOf(resultPrototype);
+  let setterCalls = 0;
+  const insertedParent = Object.create(originalParent);
+  Object.defineProperty(insertedParent, "rows", {
+    configurable: true,
+    set() {
+      setterCalls += 1;
+    },
+  });
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  Object.setPrototypeOf(resultPrototype, insertedParent);
+  try {
+    await assertStoreError(
+      store.runSerializable((transaction) =>
+        consumePostgresSerializableTransactionRows(
+          transaction,
+          "SELECT 1",
+          [],
+          () => undefined,
+        ),
+      ),
+      {
+        code: "transaction_query_invalid",
+        commitState: "not-committed",
+      },
+    );
+  } finally {
+    Object.setPrototypeOf(resultPrototype, originalParent);
+  }
+  assert.equal(setterCalls, 0);
+  assert.equal(
+    nonResetQueries(client).some((args) => queryText(args) === "SELECT 1"),
+    false,
+  );
+  client.assertExhausted();
+});
+
+test("row streaming rejects hostile data and pins direct protocol methods", async () => {
+  const invalidClient = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    {},
+  ]);
+  const invalidStore = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([invalidClient]),
+  });
+  const hostileValues = new Proxy([], {
+    get() {
+      assert.fail("hostile values must not be inspected through proxy traps");
+    },
+    getOwnPropertyDescriptor() {
+      assert.fail("hostile values must not expose descriptors");
+    },
+  });
+  await assertStoreError(
+    invalidStore.runSerializable((transaction) =>
+      consumePostgresSerializableTransactionRows(
+        transaction,
+        "SELECT 1",
+        hostileValues,
+        () => undefined,
+      ),
+    ),
+    {
+      code: "transaction_query_invalid",
+      commitState: "not-committed",
+    },
+  );
+  invalidClient.assertExhausted();
+
+  const targetText = "SELECT hostile_row FROM streamed_rows";
+  let rowTrapCalls = 0;
+  const hostileRow = new Proxy(Object.create(null), {
+    get() {
+      rowTrapCalls += 1;
+      throw new Error("row trap escaped");
+    },
+  });
+  const client = new FakeClient([
+    {},
+    timestampResult("2026-07-23T10:11:12.000Z"),
+    streamedRowsStep([hostileRow], { protocolRows: 1, rawRows: true }),
+    transactionIdResult(),
+    COMMIT_RESULT,
+  ]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: new FakePool([client]),
+  });
+  const queryDescriptor = Object.getOwnPropertyDescriptor(
+    Query.prototype,
+    "handleReadyForQuery",
+  );
+  const emitDescriptor = Object.getOwnPropertyDescriptor(
+    EventEmitter.prototype,
+    "emit",
+  );
+  const listenersDescriptor = Object.getOwnPropertyDescriptor(
+    EventEmitter.prototype,
+    "listeners",
+  );
+  const resultPrototype = Object.getPrototypeOf(
+    new Query({
+      queryMode: "extended",
+      rows: 1024,
+      text: "SELECT 1",
+      values: [],
+    })._result,
+  );
+  const resultMethodNames = [
+    "addFields",
+    "parseRow",
+    "addCommandComplete",
+  ];
+  const resultDescriptors = new Map(
+    resultMethodNames.map((name) => [
+      name,
+      Object.getOwnPropertyDescriptor(resultPrototype, name),
+    ]),
+  );
+  let nativeRows = 0;
+  try {
+    await store.runSerializable((transaction) => {
+      Object.defineProperty(Query.prototype, "handleReadyForQuery", {
+        ...queryDescriptor,
+        value() {
+          assert.fail("poisoned Query prototype escaped");
+        },
+      });
+      Object.defineProperty(EventEmitter.prototype, "emit", {
+        ...emitDescriptor,
+        value(...args) {
+          if (this?.text === targetText) {
+            assert.fail("poisoned EventEmitter.emit escaped");
+          }
+          return Reflect.apply(emitDescriptor.value, this, args);
+        },
+      });
+      Object.defineProperty(EventEmitter.prototype, "listeners", {
+        ...listenersDescriptor,
+        value(...args) {
+          if (this?.text === targetText) {
+            assert.fail("poisoned EventEmitter.listeners escaped");
+          }
+          return Reflect.apply(listenersDescriptor.value, this, args);
+        },
+      });
+      for (const name of resultMethodNames) {
+        Object.defineProperty(resultPrototype, name, {
+          ...resultDescriptors.get(name),
+          value() {
+            assert.fail(`poisoned Result.${name} escaped`);
+          },
+        });
+      }
+      return consumePostgresSerializableTransactionRows(
+        transaction,
+        targetText,
+        [],
+        (row) => {
+          if (row === hostileRow) return;
+          assert.deepEqual(row, {});
+          nativeRows += 1;
+        },
+      );
+    });
+  } finally {
+    Object.defineProperty(
+      Query.prototype,
+      "handleReadyForQuery",
+      queryDescriptor,
+    );
+    Object.defineProperty(EventEmitter.prototype, "emit", emitDescriptor);
+    Object.defineProperty(
+      EventEmitter.prototype,
+      "listeners",
+      listenersDescriptor,
+    );
+    for (const name of resultMethodNames) {
+      Object.defineProperty(
+        resultPrototype,
+        name,
+        resultDescriptors.get(name),
+      );
+    }
+  }
+  assert.equal(rowTrapCalls, 0);
+  assert.equal(nativeRows, 1);
+  client.assertExhausted();
 });
 
 test("runSerializable restores durable synchronous commit before COMMIT", async () => {
@@ -2424,6 +3980,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   const stablePlanMigration = migrations[6];
   const imageProviderMigration = migrations[7];
   const stateGcMigration = migrations[8];
+  const operationIndexMigration = migrations[9];
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
     {},
@@ -2431,6 +3988,8 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
@@ -2526,12 +4085,17 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
     [9, stateGcMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[24], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[24], [operationIndexMigration.sql]);
   assert.deepEqual(migrationQueries[25], [
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
-    [10, latestMigration.checksum],
+    [10, operationIndexMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[26], ["COMMIT"]);
+  assert.deepEqual(migrationQueries[26], [latestMigration.sql]);
+  assert.deepEqual(migrationQueries[27], [
+    "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+    [11, latestMigration.checksum],
+  ]);
+  assert.deepEqual(migrationQueries[28], ["COMMIT"]);
   assert.deepEqual(client.queries.at(0), ["DISCARD ALL"]);
   assert.deepEqual(client.queries.at(-1), ["DISCARD ALL"]);
   assert.deepEqual(client.releaseCalls, [[]]);
@@ -2817,6 +4381,8 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.doesNotMatch(imageProviderMigration.sql, /\bsequence\b/u);
   assert.doesNotMatch(imageProviderMigration.sql, /jsonb/u);
+  {
+    const latestMigration = operationIndexMigration;
   for (const checksumColumn of [
     "base_head_checksum",
     "checkpoint_checksum",
@@ -3053,6 +4619,179 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     /CREATE TRIGGER filesystem_image_provider_operations_truncate_guard[\s\S]+BEFORE TRUNCATE ON session_authority\.filesystem_image_provider_operations[\s\S]+FOR EACH STATEMENT[\s\S]+EXECUTE FUNCTION session_authority\.reject_filesystem_image_provider_operation_truncate/u,
   );
   assert.doesNotMatch(latestMigration.sql, /\bjsonb\b|pgcrypto|\bdigest\s*\(/u);
+  }
+  assert.match(
+    latestMigration.sql,
+    /ADD COLUMN operation_index_adoption_id[\s\S]+ADD COLUMN operation_index_adoption_xid xid8/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /ADD COLUMN adoption_id character varying\(64\) COLLATE pg_catalog\."C"/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TABLE session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+retired_xid xid8,[\s\S]+PRIMARY KEY \(provider_id, anchor_id\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /INSERT INTO session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+SELECT provider_id, anchor_id, NULL[\s\S]+FROM session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_fs_image_anchor_lifecycle[\s\S]+TG_OP = 'INSERT'[\s\S]+NEW\.retired_xid IS NULL[\s\S]+pg_trigger_depth\(\) = 2[\s\S]+TG_OP = 'UPDATE'[\s\S]+OLD\.retired_xid IS NULL[\s\S]+NEW\.retired_xid = pg_current_xact_id\(\)[\s\S]+filesystem_image_provider_heads[\s\S]+filesystem_image_provider_operations[\s\S]+fs_image_anchor_lifecycle_immutable[\s\S]+BEFORE INSERT OR UPDATE OR DELETE[\s\S]+BEFORE TRUNCATE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_filesystem_image_provider_operation_delete[\s\S]+filesystem_image_provider_operations AS operation[\s\S]+UPDATE session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+SET retired_xid = pg_current_xact_id\(\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /claim_fs_image_anchor_lifecycle[\s\S]+INSERT INTO session_authority\.filesystem_image_provider_anchor_lifecycle[\s\S]+ON CONFLICT \(provider_id, anchor_id\) DO UPDATE[\s\S]+RETURNING retired_xid INTO lifecycle_retired_xid[\s\S]+fs_image_head_retired[\s\S]+CREATE TRIGGER fs_image_heads_lifecycle_claim[\s\S]+AFTER INSERT ON session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.provider_id IS DISTINCT FROM OLD\.provider_id[\s\S]+NEW\.anchor_id IS DISTINCT FROM OLD\.anchor_id[\s\S]+fs_image_head_identity_immutable/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /retire_fs_image_anchor[\s\S]+SET retired_xid = pg_current_xact_id\(\)[\s\S]+CREATE TRIGGER fs_image_heads_retirement_guard[\s\S]+AFTER DELETE ON session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /reject_fs_image_head_truncate[\s\S]+fs_image_heads_truncate_forbidden[\s\S]+CREATE TRIGGER fs_image_heads_truncate_guard[\s\S]+BEFORE TRUNCATE ON session_authority\.filesystem_image_provider_heads/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /IF NOT FOUND THEN[\s\S]+filesystem_image_provider_anchor_lifecycle AS lifecycle[\s\S]+lifecycle\.retired_xid = pg_current_xact_id\(\)[\s\S]+fs_image_adoption_teardown/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /committed_checksum_provenance = 'unavailable-adopted-v2'[\s\S]+committed_checksum IS NULL[\s\S]+adoption_id IS NOT NULL/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /head\.operation_index_adoption_xid = pg_current_xact_id\(\)/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE UNIQUE INDEX fs_image_operations_prepared_revision_uniq[\s\S]+prepared_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE UNIQUE INDEX fs_image_operations_committed_revision_uniq[\s\S]+committed_state_revision[\s\S]+WHERE state = 'committed'/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /fs_image_operations_revision_cross_unique[\s\S]+operation\.committed_state_revision = NEW\.prepared_state_revision[\s\S]+operation\.prepared_state_revision = NEW\.committed_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE TABLE session_authority\.filesystem_image_provider_operation_events[\s\S]+PRIMARY KEY \(provider_id, anchor_id, event_revision\)[\s\S]+UNIQUE \(provider_id, anchor_id, operation_id, phase\)[\s\S]+FOREIGN KEY \(provider_id, anchor_id, operation_id\)[\s\S]+ON DELETE CASCADE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /INSERT INTO session_authority\.filesystem_image_provider_operation_events[\s\S]+SELECT provider_id, anchor_id, operation_id, 'prepared', prepared_state_revision[\s\S]+UNION ALL[\s\S]+SELECT provider_id, anchor_id, operation_id, 'committed', committed_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /validate_fs_image_existing_event_cover[\s\S]+coalesce\(sum\(1::numeric\), 0\)[\s\S]+operation_index_state_revision IS NOT NULL[\s\S]+operation_index_state_revision = 0[\s\S]+first_revision <> 1[\s\S]+last_revision <> head\.operation_index_state_revision[\s\S]+fs_image_operation_events_existing_cover/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /enforce_fs_image_operation_event[\s\S]+TG_OP = 'INSERT'[\s\S]+pg_trigger_depth\(\) = 2[\s\S]+NEW\.phase = 'prepared'[\s\S]+NEW\.phase = 'committed'[\s\S]+TG_OP = 'DELETE'[\s\S]+NOT EXISTS[\s\S]+fs_image_operation_events_immutable[\s\S]+BEFORE INSERT OR UPDATE OR DELETE[\s\S]+BEFORE TRUNCATE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /claim_fs_image_operation_events[\s\S]+TG_OP = 'INSERT'[\s\S]+NEW\.prepared_state_revision[\s\S]+NEW\.state = 'committed'[\s\S]+NEW\.committed_state_revision[\s\S]+CREATE TRIGGER fs_image_operations_event_claim[\s\S]+AFTER INSERT OR UPDATE/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.prepared_state_revision <= head\.state_revision[\s\S]+NEW\.committed_state_revision <= head\.checkpoint_state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /OLD\.contract_version = 2[\s\S]+NEW\.contract_version = 3[\s\S]+NEW\.checkpoint_state_revision = OLD\.state_revision[\s\S]+NEW\.operation_index_state_revision = OLD\.state_revision/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CONSTRAINT fs_image_heads_stored_non_genesis[\s\S]+state_revision BETWEEN 1 AND 18446744073709551615/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.state_revision = 0[\s\S]+fs_image_head_initial_progress[\s\S]+OLD\.state_revision > 0[\s\S]+NEW\.state_revision > 0/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /OLD\.operation_index_adoption_xid = pg_current_xact_id\(\)[\s\S]+fs_image_head_adoption_same_xact_update/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /ADD COLUMN operation_index_progress_xid xid8[\s\S]+NEW\.operation_index_progress_xid IS NOT NULL[\s\S]+NEW\.operation_index_progress_xid := pg_current_xact_id\(\)[\s\S]+OLD\.operation_index_progress_xid = pg_current_xact_id\(\)[\s\S]+fs_image_head_same_xact_update[\s\S]+NEW\.operation_index_progress_xid IS DISTINCT FROM OLD\.operation_index_progress_xid[\s\S]+fs_image_head_progress_xid_managed/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /NEW\.operation_index_state_revision IS NOT NULL[\s\S]+NEW\.anchor_revision = 1[\s\S]+NEW\.state_revision = 1[\s\S]+fs_image_head_initial_progress/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /OLD\.operation_index_state_revision IS NULL[\s\S]+fs_image_head_index_activation[\s\S]+NEW\.state_revision = OLD\.state_revision \+ 1[\s\S]+NEW\.frame_count = OLD\.frame_count \+ 1[\s\S]+NEW\.ledger_bytes > OLD\.ledger_bytes[\s\S]+NEW\.generation = OLD\.generation \+ 1[\s\S]+fs_image_head_incremental_progress/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /CREATE CONSTRAINT TRIGGER fs_image_heads_adoption_complete[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /validate_fs_image_head_progress[\s\S]+stored_head\.provider_id IS DISTINCT FROM NEW\.provider_id[\s\S]+stored_head\.operation_index_adoption_xid IS DISTINCT FROM NEW\.operation_index_adoption_xid[\s\S]+fs_image_head_progress_final[\s\S]+event\.event_revision = NEW\.state_revision[\s\S]+event\.phase = 'prepared'[\s\S]+operation\.prepared_checksum = NEW\.last_checksum[\s\S]+event\.phase = 'committed'[\s\S]+operation\.committed_checksum = NEW\.last_checksum[\s\S]+fs_image_head_append_event[\s\S]+CREATE CONSTRAINT TRIGGER fs_image_heads_progress_complete[\s\S]+AFTER INSERT OR UPDATE[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
+  assert.match(
+    latestMigration.sql,
+    /coalesce\(sum\(1::numeric\), 0\)[\s\S]+GROUP BY revision[\s\S]+HAVING sum\(1::numeric\) <> 1/u,
+  );
+  assert.doesNotMatch(latestMigration.sql, /count\(\*\)/u);
+  assert.match(
+    latestMigration.sql,
+    /selected_mode = 1[\s\S]+operation\.adoption_id IS DISTINCT FROM selected_adoption_id[\s\S]+selected_mode = 0[\s\S]+operation\.adoption_id IS NOT NULL[\s\S]+committed_checksum_provenance[\s\S]+indexed-frame-v1/u,
+  );
+  for (const column of [
+    "provider_id",
+    "anchor_id",
+    "contract_version",
+    "anchor_revision",
+    "generation",
+    "state_revision",
+    "base_head_checksum",
+    "checkpoint_state_revision",
+    "checkpoint_frame_count",
+    "checkpoint_checksum",
+    "checkpoint_bytes",
+    "frame_count",
+    "last_checksum",
+    "ledger_bytes",
+    "operation_index_state_revision",
+    "operation_index_adoption_id",
+    "operation_index_adoption_xid",
+    "operation_index_progress_xid",
+  ]) {
+    assert.match(
+      latestMigration.sql,
+      new RegExp(
+        `stored_head\\.${column} IS DISTINCT FROM NEW\\.${column}`,
+        "u",
+      ),
+    );
+  }
+  const adoptionDdlIdentifiers = [
+    ...latestMigration.sql.matchAll(
+      /\b(?:(?:ADD|ALTER)\s+COLUMN|(?:(?:ADD|DROP)\s+)?CONSTRAINT|CREATE\s+(?:UNIQUE\s+)?INDEX|CREATE\s+(?:CONSTRAINT\s+)?TRIGGER|CREATE\s+(?:TABLE|FUNCTION))\s+(?:session_authority\.)?([A-Za-z_][A-Za-z0-9_]*)/gu,
+    ),
+  ].map((match) => match[1]);
+  for (const identifier of adoptionDdlIdentifiers) {
+    assert.ok(
+      Buffer.byteLength(identifier, "utf8") <= 63,
+      `PostgreSQL DDL identifier exceeds 63 bytes: ${identifier}`,
+    );
+  }
   assert.match(
     stateGcMigration.sql,
     /LOCK TABLE session_authority\.sessions IN EXCLUSIVE MODE;[\s\S]+LOCK TABLE session_authority\.operation_claims IN ACCESS EXCLUSIVE MODE;[\s\S]+writer_supervisor_state_owner_migration[\s\S]+launch\.kind = 'writer-launch-attempt-v1'[\s\S]+launch\.state IN \('starting', 'uncertain'\)[\s\S]+FROM session_authority\.sessions AS session[\s\S]+session\.document #> '\{launch\}' IS NOT NULL[\s\S]+session\.document #> '\{launch\}' <> 'null'::jsonb[\s\S]+writer_supervisor_state_owners_require_quiescent_launches[\s\S]+CREATE TABLE session_authority\.writer_supervisor_state_owners/u,
@@ -3228,6 +4967,8 @@ test("migrate destroys a client when its post-COMMIT reset fails", async () => {
       {},
       {},
       {},
+      {},
+      {},
       COMMIT_RESULT,
     ],
     { resetSteps: [DISCARD_RESULT, resetFailure] },
@@ -3284,7 +5025,7 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v1 ledger through v10", async () => {
+test("migrate upgrades an exact v1 ledger through v11", async () => {
   const migrations = await readAuthorityMigrations();
   const firstMigration = migrations[0];
   const latestMigration = migrations.at(-1);
@@ -3301,6 +5042,8 @@ test("migrate upgrades an exact v1 ledger through v10", async () => {
         },
       ],
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -3371,6 +5114,11 @@ test("migrate upgrades an exact v1 ledger through v10", async () => {
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[8].version, migrations[8].checksum],
     ],
+    [migrations[9].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[9].version, migrations[9].checksum],
+    ],
     [latestMigration.sql],
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
@@ -3382,7 +5130,7 @@ test("migrate upgrades an exact v1 ledger through v10", async () => {
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v2 ledger through v10", async () => {
+test("migrate upgrades an exact v2 ledger through v11", async () => {
   const migrations = await readAuthorityMigrations();
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
@@ -3396,6 +5144,8 @@ test("migrate upgrades an exact v2 ledger through v10", async () => {
         version,
       })),
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -3458,6 +5208,11 @@ test("migrate upgrades an exact v2 ledger through v10", async () => {
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[8].version, migrations[8].checksum],
+    ],
+    [migrations[9].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[9].version, migrations[9].checksum],
     ],
     [latestMigration.sql],
     [
@@ -3628,7 +5383,7 @@ test("migrate rejects a future-only migration ledger", async () => {
     {},
     {},
     {},
-    { rows: [{ checksum: "0".repeat(64), version: 11 }] },
+    { rows: [{ checksum: "0".repeat(64), version: 12 }] },
     {},
   ]);
   const store = new PostgresSerializableStore({
@@ -3654,7 +5409,7 @@ test("migrate rejects an exact latest prefix accompanied by an extra version", a
     {
       rows: [
         ...migrations.map(({ checksum, version }) => ({ checksum, version })),
-        { checksum: "0".repeat(64), version: 11 },
+        { checksum: "0".repeat(64), version: 12 },
       ],
     },
     {},
@@ -3797,6 +5552,8 @@ test("migrate rejects a COMMIT acknowledgement that reports ROLLBACK", async () 
     {},
     {},
     {},
+    {},
+    {},
     { command: "ROLLBACK" },
   ]);
   const store = new PostgresSerializableStore({
@@ -3820,6 +5577,8 @@ test("migrate treats a failed COMMIT as uncertain and never reapplies", async ()
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},

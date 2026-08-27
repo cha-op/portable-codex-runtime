@@ -4,6 +4,7 @@ import test from "node:test";
 
 import {
   FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   filesystemImageProviderStateHeadChecksum,
 } from "../src/filesystem-image-provider-state.mjs";
 import {
@@ -18,7 +19,7 @@ import {
 } from "../src/postgres-serializable-store.mjs";
 
 const GENESIS = Object.freeze({
-  contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   anchorRevision: "0",
   generation: "0",
   stateRevision: "0",
@@ -341,7 +342,7 @@ test("reads canonical genesis and exposes an exact receiver-safe native-Promise 
 test("round-trips uint64 head revisions as canonical decimal strings", async () => {
   const { anchor, database } = createFixture();
   const maximumRevisionHead = {
-    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
     anchorRevision: "18446744073709551615",
     generation: "18446744073709551614",
     stateRevision: "1",
@@ -378,6 +379,30 @@ test("treats row absence only as exact v2 genesis", async () => {
     true,
   );
   assert.deepEqual(await anchor.readHead(), GENESIS);
+});
+
+test("fails closed on version 3 rows and requests", async () => {
+  const { anchor, database } = createFixture();
+  const version3Genesis = {
+    ...GENESIS,
+    contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  };
+  const version3First = appendHead(version3Genesis, "a", 512);
+
+  database.malformedReadRow = storedRow(version3First);
+  await assert.rejects(
+    anchor.readHead(),
+    anchorError("postgres_filesystem_image_provider_head_anchor_state_invalid"),
+  );
+
+  database.malformedReadRow = undefined;
+  await assert.rejects(
+    anchor.compareAndAdvance({
+      expectedHead: version3Genesis,
+      nextHead: version3First,
+    }),
+    anchorError("invalid_postgres_filesystem_image_provider_head_anchor_request"),
+  );
 });
 
 test("inserts genesis, reads across adapter restart, and advances by exact CAS", async () => {

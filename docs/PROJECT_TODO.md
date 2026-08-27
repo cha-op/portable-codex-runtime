@@ -242,22 +242,39 @@
   and gives all four new operation checksum/digest columns the same exact
   format. Existing valid version 2 heads remain unchanged and production
   serving is unchanged.
-- [pending] Third-b, switch provider state to version 3. PR-B migration 011 must
-  atomically introduce the `unavailable-adopted-v2` provenance and its write
-  path only after the provider-locked complete v2 validator proves revision
-  coverage and uniqueness, imports the rows, installs the covering version 3
-  checkpoint head, and sets its exact operation-index completeness marker in
-  the same transaction. A transaction token or covering head alone is not
-  write capability. Only then keep current storage records and destroyed
-  tombstones in local
-  checkpoints. Exact operation replay must come from the
-  permanent index, and each current attachment must retain and verify its
-  origin operation. The cut must place every unavailable legacy committed
-  suffix at or before the version 3 checkpoint boundary before it becomes
-  readable. Until that cut lands, monitor checkpoint bytes, retained
-  operation counts, and aggregate provider-state storage; automatic active-log
-  rotation and the additive index foundation are not retention or garbage
-  collection.
+- [done] Third-b, switch provider state to version 3. Migration 011 introduces
+  the `unavailable-adopted-v2` suffix only inside one database-identified
+  adoption transaction. Under the provider lock, the complete version 2
+  reducer proves revision coverage, per-storage lineage, pending uniqueness,
+  final storage, and attachment origins; the filesystem writes and verifies a
+  covering version 3 checkpoint before PostgreSQL atomically imports or verifies
+  every operation and advances the head plus completeness marker. A deferred
+  database trigger rejects incomplete, duplicate, extra, or cross-manifest
+  cuts, while an internal unique event-revision registry makes later indexed
+  completeness inductive across one-revision appends and pure rotations. A
+  database-managed progress transaction ID fences a second head mutation after
+  an early constraint check, and stored heads exclude canonical revision zero.
+  Exact readback settles commit acknowledgement loss. Version 3
+  checkpoints retain current storage, destroyed tombstones, attachment-origin
+  IDs, and the live prepared recovery working set, but no committed history.
+  Arbitrary-age exact replay comes from the permanent PostgreSQL index. The
+  contract-version-3 runtime authority first reads the exact head through one
+  `SELECT`, then uses one streamed prepared data `SELECT` whose `LIMIT` comes
+  from that head's structural bound. It validates `A` attachment origins in
+  independent fixed 65,535-ID batches through
+  `max(1, ceil(A / 65,535))` streamed origin data `SELECT` statements in the
+  same serializable transaction. SQL parameters and
+  additional memory remain bounded per batch, and these runtime projection
+  reads are not capped by the adoption version 1 operational envelope. The
+  authority returns a domain-separated receipt; the provider caches it only for
+  the same exact loaded head and authority instance.
+- [pending] Add a streaming or paged adoption contract for otherwise-valid
+  version 2 state containing more than 65,535 operations, 65,535 storages, or
+  64 MiB of aggregate canonical operation/prepared-projection/storage
+  material. The current full-array adoption v1 contract rejects that state
+  with `state_capacity_exhausted` before any candidate generation mutation;
+  its operational capacity applies only to adoption and must not be described
+  as either the version 2 format limit or a version 3 runtime projection limit.
 - [pending] Extend beyond that clean/manual-fencing boundary only in separately
   scoped work: power-loss/crash-prefix evidence, automatic stale-writer
   fencing, differential export/compression, content-addressed distribution,

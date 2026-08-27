@@ -3,9 +3,9 @@ import { EventEmitter } from "node:events";
 import { readFile } from "node:fs/promises";
 import { isPromise, isProxy } from "node:util/types";
 
-import { DatabaseError } from "pg";
+import { DatabaseError, Query } from "pg";
 
-export const SESSION_AUTHORITY_MIGRATION_VERSION = 10;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 11;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
 export const MAX_TRANSACTION_ATTEMPTS = 16;
 
@@ -16,6 +16,7 @@ const TRANSACTION_ID_QUERY =
   "SELECT pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
 const TRANSACTION_TIMESTAMP_QUERY =
   "SELECT pg_catalog.transaction_timestamp() AS transaction_timestamp, pg_catalog.pg_current_xact_id()::pg_catalog.text AS transaction_id";
+const POSTGRES_ROW_STREAM_FETCH_SIZE = 1024;
 const ArrayConstructor = Array;
 const arrayEveryIntrinsic = Array.prototype.every;
 const arrayIncludesIntrinsic = Array.prototype.includes;
@@ -29,6 +30,8 @@ const dateToISOStringIntrinsic = Date.prototype.toISOString;
 const databaseErrorPrototype = DatabaseError.prototype;
 const ErrorConstructor = Error;
 const eventEmitterEmitIntrinsic = EventEmitter.prototype.emit;
+const eventEmitterListenersIntrinsic = EventEmitter.prototype.listeners;
+const eventEmitterOnIntrinsic = EventEmitter.prototype.on;
 const eventEmitterPrependListenerIntrinsic =
   EventEmitter.prototype.prependListener;
 const eventEmitterPrototype = EventEmitter.prototype;
@@ -52,6 +55,7 @@ const objectIsPrototypeOfIntrinsic = Object.prototype.isPrototypeOf;
 const objectPrototype = Object.prototype;
 const PromiseConstructor = Promise;
 const reflectApply = Reflect.apply;
+const reflectConstruct = Reflect.construct;
 const reflectDeleteProperty = Reflect.deleteProperty;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
@@ -76,6 +80,118 @@ const WeakMapConstructor = WeakMap;
 const weakSetAddIntrinsic = WeakSet.prototype.add;
 const weakSetHasIntrinsic = WeakSet.prototype.has;
 const WeakSetConstructor = WeakSet;
+const postgresQueryConstructor = Query;
+const postgresQueryPrototype = Query.prototype;
+const bootstrapPostgresQuery = new Query({
+  queryMode: "extended",
+  rows: POSTGRES_ROW_STREAM_FETCH_SIZE,
+  text: "SELECT 1",
+  values: objectFreeze([]),
+});
+const postgresResultPrototype = objectGetPrototypeOf(
+  ownDataValue(bootstrapPostgresQuery, "_result"),
+);
+const postgresResultPrototypeParent = objectGetPrototypeOf(
+  postgresResultPrototype,
+);
+const POSTGRES_QUERY_METHOD_NAMES = objectFreeze([
+  "requiresPreparation",
+  "_checkForMultirow",
+  "handleRowDescription",
+  "handleDataRow",
+  "handleCommandComplete",
+  "handleEmptyQuery",
+  "handleError",
+  "handleReadyForQuery",
+  "submit",
+  "hasBeenParsed",
+  "handlePortalSuspended",
+  "_getRows",
+  "prepare",
+  "handleCopyInResponse",
+  "handleCopyData",
+]);
+const POSTGRES_RESULT_METHOD_NAMES = objectFreeze([
+  "addCommandComplete",
+  "_parseRowAsArray",
+  "parseRow",
+  "addRow",
+  "addFields",
+]);
+const POSTGRES_RESULT_FIELD_NAMES = objectFreeze([
+  "command",
+  "rowCount",
+  "oid",
+  "rows",
+  "fields",
+  "_parsers",
+  "_types",
+  "RowCtor",
+  "rowAsArray",
+  "_prebuiltEmptyResultObject",
+]);
+const postgresQueryHandleCommandCompleteIntrinsic =
+  objectGetOwnPropertyDescriptor(
+    postgresQueryPrototype,
+    "handleCommandComplete",
+  ).value;
+const postgresQueryHandleErrorIntrinsic = objectGetOwnPropertyDescriptor(
+  postgresQueryPrototype,
+  "handleError",
+).value;
+const postgresQueryHandlePortalSuspendedIntrinsic =
+  objectGetOwnPropertyDescriptor(
+    postgresQueryPrototype,
+    "handlePortalSuspended",
+  ).value;
+const postgresQueryHandleRowDescriptionIntrinsic =
+  objectGetOwnPropertyDescriptor(
+    postgresQueryPrototype,
+    "handleRowDescription",
+  ).value;
+const capturedPostgresResultMethods = objectCreate(null);
+for (let index = 0; index < POSTGRES_RESULT_METHOD_NAMES.length; index += 1) {
+  const name = POSTGRES_RESULT_METHOD_NAMES[index];
+  objectDefineProperty(capturedPostgresResultMethods, name, {
+    configurable: false,
+    enumerable: true,
+    value: objectGetOwnPropertyDescriptor(postgresResultPrototype, name).value,
+    writable: false,
+  });
+}
+objectFreeze(capturedPostgresResultMethods);
+const safePostgresQueryPrototype = objectCreate(null);
+for (let index = 0; index < POSTGRES_QUERY_METHOD_NAMES.length; index += 1) {
+  const name = POSTGRES_QUERY_METHOD_NAMES[index];
+  objectDefineProperty(safePostgresQueryPrototype, name, {
+    configurable: false,
+    enumerable: false,
+    value: objectGetOwnPropertyDescriptor(postgresQueryPrototype, name).value,
+    writable: false,
+  });
+}
+objectDefineProperties(safePostgresQueryPrototype, {
+  emit: {
+    configurable: false,
+    enumerable: false,
+    value: eventEmitterEmitIntrinsic,
+    writable: false,
+  },
+  listeners: {
+    configurable: false,
+    enumerable: false,
+    value: eventEmitterListenersIntrinsic,
+    writable: false,
+  },
+});
+objectFreeze(safePostgresQueryPrototype);
+function SafePostgresQueryTarget() {}
+objectDefineProperty(SafePostgresQueryTarget, "prototype", {
+  configurable: false,
+  enumerable: false,
+  value: safePostgresQueryPrototype,
+  writable: false,
+});
 const protocolEmitDescriptor = objectFreeze({
   configurable: true,
   enumerable: false,
@@ -152,6 +268,13 @@ const MIGRATION_SOURCES = objectFreeze([
       import.meta.url,
     ),
     version: 10,
+  }),
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/011-filesystem-image-provider-state-v3-adoption.sql",
+      import.meta.url,
+    ),
+    version: 11,
   }),
 ]);
 
@@ -300,8 +423,11 @@ const COMMIT_STATES = new SetConstructor([
   "uncertain",
 ]);
 const PROTOCOL_ERROR_SQLSTATES = new WeakMapConstructor();
+const POSTGRES_ROW_STREAM_QUERY_FAILURES = new WeakMapConstructor();
 const STORE_ERRORS = new WeakSetConstructor();
 const POSTGRES_SERIALIZABLE_STORES = new WeakSetConstructor();
+const POSTGRES_SERIALIZABLE_TRANSACTION_ROW_STREAMS =
+  new WeakMapConstructor();
 const ERROR_MESSAGES = objectFreeze({
   client_reset_failed: "PostgreSQL client reset failed",
   client_release_failed: "PostgreSQL client release failed",
@@ -404,6 +530,34 @@ export function isPostgresSerializableStore(value) {
   } catch {
     return false;
   }
+}
+
+export function consumePostgresSerializableTransactionRows(
+  transaction,
+  text,
+  values,
+  onRow,
+) {
+  if (arguments.length !== 4) {
+    return observedRejectedPromise(
+      storeError("transaction_query_invalid"),
+    );
+  }
+  let consumeRows;
+  try {
+    consumeRows = weakMapGet(
+      POSTGRES_SERIALIZABLE_TRANSACTION_ROW_STREAMS,
+      transaction,
+    );
+  } catch {
+    consumeRows = undefined;
+  }
+  if (consumeRows === undefined) {
+    return observedRejectedPromise(
+      storeError("transaction_query_invalid"),
+    );
+  }
+  return consumeRows(text, values, onRow);
 }
 
 function observedRejectedPromise(error) {
@@ -781,6 +935,446 @@ async function clientQuery(client, ...args) {
   }
 }
 
+function postgresResultConstructionIsSafe() {
+  if (
+    objectGetPrototypeOf(postgresResultPrototype) !==
+    postgresResultPrototypeParent
+  ) {
+    return false;
+  }
+  for (let index = 0; index < POSTGRES_RESULT_FIELD_NAMES.length; index += 1) {
+    const name = POSTGRES_RESULT_FIELD_NAMES[index];
+    if (
+      objectGetOwnPropertyDescriptor(postgresResultPrototype, name) !==
+        undefined ||
+      objectGetOwnPropertyDescriptor(objectPrototype, name) !== undefined
+    ) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function hardenPostgresQueryResult(query) {
+  const result = ownDataValue(query, "_result");
+  if (
+    result === undefined ||
+    objectGetPrototypeOf(result) !== postgresResultPrototype ||
+    !objectIs(ownDataValue(query, "_results"), result)
+  ) {
+    throw new TypeErrorConstructor("PostgreSQL Query result shape changed");
+  }
+  for (let index = 0; index < POSTGRES_RESULT_METHOD_NAMES.length; index += 1) {
+    const name = POSTGRES_RESULT_METHOD_NAMES[index];
+    objectDefineProperty(result, name, {
+      configurable: false,
+      enumerable: false,
+      value: capturedPostgresResultMethods[name],
+      writable: false,
+    });
+  }
+}
+
+function createPostgresRowStreamQuery(text, values) {
+  if (!postgresResultConstructionIsSafe()) {
+    throw new TypeErrorConstructor(
+      "PostgreSQL Result construction prototype changed",
+    );
+  }
+  // Reflect.construct invokes the pinned Query constructor with `new Query`
+  // semantics while selecting a null-based prototype made from captured
+  // direct pg@8.22.0 and EventEmitter methods. This pins the expected method
+  // identities and shapes; it is not an isolation boundary for arbitrary
+  // same-process code.
+  const query = reflectConstruct(
+    postgresQueryConstructor,
+    [
+      objectFreeze({
+        queryMode: "extended",
+        rows: POSTGRES_ROW_STREAM_FETCH_SIZE,
+        text,
+        values,
+      }),
+    ],
+    SafePostgresQueryTarget,
+  );
+  hardenPostgresQueryResult(query);
+  return query;
+}
+
+function isDenseEmptyBuiltInArray(value) {
+  try {
+    if (
+      isProxy(value) ||
+      !arrayIsArray(value) ||
+      objectGetPrototypeOf(value) !== ArrayConstructor.prototype
+    ) {
+      return false;
+    }
+    const keys = reflectOwnKeys(value);
+    const lengthDescriptor = objectGetOwnPropertyDescriptor(
+      value,
+      "length",
+    );
+    return (
+      keys.length === 1 &&
+      keys[0] === "length" &&
+      lengthDescriptor?.configurable === false &&
+      lengthDescriptor.enumerable === false &&
+      lengthDescriptor.value === 0 &&
+      lengthDescriptor.writable === true
+    );
+  } catch {
+    return false;
+  }
+}
+
+async function clientQueryRows(client, query, onRow, transactionError) {
+  const connection = client.connection;
+  const expectedResult = ownDataValue(query, "_result");
+  const priorEmitDescriptor = objectGetOwnPropertyDescriptor(
+    connection,
+    "emit",
+  );
+  const observed = new WeakMapConstructor();
+  const observedProtocolErrors = new WeakSetConstructor();
+  const observeProtocolError = (error) => {
+    try {
+      const name = ownDataValue(error, "name");
+      const code = ownDataValue(error, "code");
+      if (
+        objectIsPrototypeOf(databaseErrorPrototype, error) &&
+        name === "error"
+      ) {
+        weakSetAdd(observedProtocolErrors, error);
+      }
+      if (
+        weakSetHas(observedProtocolErrors, error) &&
+        typeof code === "string" &&
+        regexpTest(/^[0-9A-Z]{5}$/u, code)
+      ) {
+        weakMapSet(observed, error, code);
+      }
+    } catch {
+      // An invalid event payload cannot become trusted protocol evidence.
+    }
+  };
+
+  objectDefineProperty(connection, "emit", protocolEmitDescriptor);
+  let commandCompleteCount = 0;
+  let endCount = 0;
+  let endResult;
+  let completedPortalRowCount = 0;
+  let portalSuspendedSequenceInvalid = false;
+  let rowDescriptionCount = 0;
+  let listenerAttached = false;
+  let callbackFailure;
+  let observedRowCount = 0;
+  let rowResultMismatch = false;
+  let submissionFailure;
+  let terminalQueryFailure;
+  let protocolErrorSyncRequested = false;
+  let protocolErrorSyncFailed = false;
+  let protocolError;
+  let protocolErrorSqlState;
+  let driverCallback;
+  let driverCallbackInvoked = false;
+  let driverCallbackShapeInvalid = false;
+  let driverTimeoutExpired = false;
+  const settleDriverCallback = (error, result) => {
+    if (driverCallback === undefined || driverCallbackInvoked) return;
+    driverCallbackInvoked = true;
+    reflectApply(driverCallback, undefined, [error, result]);
+  };
+  const preserveProtocolError = (error) => {
+    try {
+      weakMapDelete(PROTOCOL_ERROR_SQLSTATES, error);
+      const sqlState = weakMapGet(observed, error);
+      if (sqlState !== undefined) {
+        weakMapSet(PROTOCOL_ERROR_SQLSTATES, error, sqlState);
+      }
+    } catch {
+      // Preserve the query failure without protocol provenance.
+    }
+  };
+  objectDefineProperty(query, "callback", {
+    configurable: false,
+    enumerable: true,
+    get() {
+      return undefined;
+    },
+    set(value) {
+      if (typeof value !== "function") {
+        driverCallbackShapeInvalid = true;
+        return;
+      }
+      if (driverCallback === undefined) {
+        driverCallback = value;
+      } else {
+        // pg@8.22.0 replaces its timeout wrapper with a no-op after the
+        // timer fires and before the queued handleError call runs.
+        driverTimeoutExpired = true;
+      }
+    },
+  });
+  objectDefineProperty(query, "handleError", {
+    configurable: false,
+    enumerable: false,
+    value(error, errorConnection) {
+      if (
+        !protocolErrorSyncRequested &&
+        error !== null &&
+        arrayIncludes(["object", "function"], typeof error) &&
+        objectIs(errorConnection, connection) &&
+        weakSetHas(observedProtocolErrors, error)
+      ) {
+        protocolErrorSyncRequested = true;
+        protocolError = error;
+        protocolErrorSqlState = weakMapGet(observed, error);
+        try {
+          const sync = errorConnection?.sync;
+          if (typeof sync !== "function") {
+            throw new TypeErrorConstructor(
+              "PostgreSQL protocol connection cannot synchronize",
+            );
+          }
+          reflectApply(sync, errorConnection, []);
+        } catch {
+          protocolErrorSyncFailed = true;
+          // The protocol error remains primary; boundary recovery will fail
+          // closed without queueing a ROLLBACK behind an unavailable
+          // ReadyForQuery transition.
+        }
+      }
+      return reflectApply(postgresQueryHandleErrorIntrinsic, query, [
+        error,
+        errorConnection,
+      ]);
+    },
+    writable: false,
+  });
+  objectDefineProperty(query, "handleCommandComplete", {
+    configurable: false,
+    enumerable: false,
+    value(message, commandConnection) {
+      commandCompleteCount += 1;
+      return reflectApply(
+        postgresQueryHandleCommandCompleteIntrinsic,
+        query,
+        [message, commandConnection],
+      );
+    },
+    writable: false,
+  });
+  objectDefineProperty(query, "handleRowDescription", {
+    configurable: false,
+    enumerable: false,
+    value(message) {
+      rowDescriptionCount += 1;
+      return reflectApply(
+        postgresQueryHandleRowDescriptionIntrinsic,
+        query,
+        [message],
+      );
+    },
+    writable: false,
+  });
+  objectDefineProperty(query, "handlePortalSuspended", {
+    configurable: false,
+    enumerable: false,
+    value(portalConnection) {
+      const nextCompletedPortalRowCount =
+        completedPortalRowCount + POSTGRES_ROW_STREAM_FETCH_SIZE;
+      if (
+        numberIsSafeInteger(nextCompletedPortalRowCount) &&
+        observedRowCount === nextCompletedPortalRowCount
+      ) {
+        completedPortalRowCount = nextCompletedPortalRowCount;
+      } else {
+        portalSuspendedSequenceInvalid = true;
+      }
+      return reflectApply(
+        postgresQueryHandlePortalSuspendedIntrinsic,
+        query,
+        [portalConnection],
+      );
+    },
+    writable: false,
+  });
+  try {
+    callIntrinsic(
+      eventEmitterPrependListenerIntrinsic,
+      connection,
+      ["errorMessage", observeProtocolError],
+    );
+    listenerAttached = true;
+    await protectPromise(
+      new PromiseConstructor((resolve, reject) => {
+        const onError = (error) => {
+          try {
+            settleDriverCallback(error, undefined);
+          } catch (callbackError) {
+            submissionFailure ??= objectFreeze({ error: callbackError });
+          }
+          preserveProtocolError(error);
+          if (terminalQueryFailure === undefined) {
+            const signal = objectFreeze(objectCreate(null));
+            const reportedError =
+              protocolErrorSqlState === undefined
+                ? error
+                : protocolError;
+            weakMapSet(
+              POSTGRES_ROW_STREAM_QUERY_FAILURES,
+              signal,
+              objectFreeze({
+                error: reportedError,
+                protocolSqlState: protocolErrorSqlState,
+                rollbackUnsafe:
+                  protocolErrorSyncFailed || driverTimeoutExpired,
+              }),
+            );
+            terminalQueryFailure = objectFreeze({ error, signal });
+          }
+          reject(terminalQueryFailure.signal);
+        };
+        const onEnd = (result) => {
+          endCount += 1;
+          endResult = result;
+          try {
+            settleDriverCallback(undefined, result);
+          } catch (error) {
+            submissionFailure ??= objectFreeze({ error });
+          }
+          resolve();
+        };
+        const onStreamRow = (row, result) => {
+          if (!objectIs(result, expectedResult)) {
+            rowResultMismatch = true;
+          }
+          if (numberIsSafeInteger(observedRowCount + 1)) {
+            observedRowCount += 1;
+          } else {
+            rowResultMismatch = true;
+          }
+          if (callbackFailure !== undefined) return;
+          let callbackResult;
+          try {
+            callbackResult = reflectApply(onRow, undefined, [row]);
+          } catch (error) {
+            callbackFailure = objectFreeze({ error });
+            return;
+          }
+          if (callbackResult !== undefined) {
+            if (isPromise(callbackResult)) {
+              void (async () => {
+                try {
+                  await callbackResult;
+                } catch {
+                  // The synchronous callback contract owns this rejection.
+                }
+              })();
+            }
+            callbackFailure = objectFreeze({
+              error: transactionError("transaction_query_invalid"),
+            });
+          }
+        };
+
+        // A row listener must exist before submission so node-postgres does
+        // not retain streamed rows in Result.rows.
+        callIntrinsic(eventEmitterOnIntrinsic, query, ["row", onStreamRow]);
+        callIntrinsic(eventEmitterOnIntrinsic, query, ["error", onError]);
+        callIntrinsic(eventEmitterOnIntrinsic, query, ["end", onEnd]);
+        try {
+          const submitted = reflectApply(client.query, client, [query]);
+          if (!objectIs(submitted, query)) {
+            submissionFailure = objectFreeze({
+              error: new ErrorConstructor(
+                "PostgreSQL client rejected the Query identity path",
+              ),
+            });
+            reject(submissionFailure.error);
+          }
+        } catch (error) {
+          preserveProtocolError(error);
+          submissionFailure = objectFreeze({ error });
+          reject(error);
+        }
+      }),
+    );
+    if (terminalQueryFailure !== undefined) {
+      try {
+        settleDriverCallback(terminalQueryFailure.error, undefined);
+      } catch {
+        // The terminal query failure remains primary.
+      }
+      throw terminalQueryFailure.signal;
+    }
+    try {
+      settleDriverCallback(undefined, endResult);
+    } catch (error) {
+      submissionFailure ??= objectFreeze({ error });
+    }
+    if (submissionFailure !== undefined) {
+      throw submissionFailure.error;
+    }
+    const currentResult = ownDataValue(query, "_result");
+    const currentResults = ownDataValue(query, "_results");
+    const resultRows = ownDataValue(expectedResult, "rows");
+    const terminalRowCount = ownDataValue(expectedResult, "rowCount");
+    let reportedTotalRowCount = numberNaN;
+    if (
+      !portalSuspendedSequenceInvalid &&
+      numberIsSafeInteger(terminalRowCount) &&
+      terminalRowCount >= 0 &&
+      terminalRowCount < POSTGRES_ROW_STREAM_FETCH_SIZE
+    ) {
+      const totalRowCount = completedPortalRowCount + terminalRowCount;
+      if (numberIsSafeInteger(totalRowCount)) {
+        reportedTotalRowCount = totalRowCount;
+      }
+    }
+    if (
+      endCount !== 1 ||
+      !objectIs(endResult, expectedResult) ||
+      !objectIs(currentResult, expectedResult) ||
+      !objectIs(currentResults, expectedResult) ||
+      rowResultMismatch ||
+      driverCallbackShapeInvalid ||
+      rowDescriptionCount !== 1 ||
+      commandCompleteCount !== 1 ||
+      ownDataValue(expectedResult, "command") !== "SELECT" ||
+      reportedTotalRowCount !== observedRowCount ||
+      !isDenseEmptyBuiltInArray(resultRows)
+    ) {
+      callbackFailure = objectFreeze({
+        error: transactionError("transaction_query_invalid"),
+      });
+    }
+  } finally {
+    try {
+      if (listenerAttached) {
+        callIntrinsic(
+          eventEmitterRemoveListenerIntrinsic,
+          connection,
+          ["errorMessage", observeProtocolError],
+        );
+      }
+    } finally {
+      if (priorEmitDescriptor === undefined) {
+        if (!reflectDeleteProperty(connection, "emit")) {
+          throw new TypeErrorConstructor(
+            "PostgreSQL protocol emitter could not be restored",
+          );
+        }
+      } else {
+        objectDefineProperty(connection, "emit", priorEmitDescriptor);
+      }
+    }
+  }
+  return callbackFailure;
+}
+
 async function acquireClient(pool) {
   let client;
   try {
@@ -934,11 +1528,17 @@ async function releaseAfterServerRollback(client, release, transactionError) {
   );
 }
 
-async function failBoundaryUncertain(client, release) {
-  try {
-    await protectPromise(clientQuery(client, "ROLLBACK"));
-  } catch {
-    // The original transaction boundary is already unproven.
+async function failBoundaryUncertain(
+  client,
+  release,
+  rollbackCanBeSubmitted = true,
+) {
+  if (rollbackCanBeSubmitted) {
+    try {
+      await protectPromise(clientQuery(client, "ROLLBACK"));
+    } catch {
+      // The original transaction boundary is already unproven.
+    }
   }
   try {
     await protectPromise(
@@ -1018,6 +1618,7 @@ function createTransactionCapability(
 ) {
   let active = true;
   let boundaryLost = false;
+  let boundaryRollbackUnsafe = false;
   let firstQueryFailure;
   let queryQueue = protectPromise((async () => undefined)());
   let retryableBoundaryRollback;
@@ -1030,8 +1631,11 @@ function createTransactionCapability(
     terminalQueryError ??= error;
     return error;
   };
-  const markQueryError = (error) => {
-    const sqlState = observedProtocolSqlState(error);
+  const markQueryError = (error, protocolSqlState) => {
+    const sqlState =
+      protocolSqlState === undefined
+        ? observedProtocolSqlState(error)
+        : protocolSqlState;
     if (!isTrustedUserQueryRejectionSqlState(sqlState)) {
       boundaryLost = true;
       return transactionError(
@@ -1039,7 +1643,12 @@ function createTransactionCapability(
         "uncertain",
       );
     }
-    firstQueryFailure ??= objectFreeze({ error, source: "server" });
+    if (
+      firstQueryFailure === undefined ||
+      firstQueryFailure.source === "local"
+    ) {
+      firstQueryFailure = objectFreeze({ error, source: "server" });
+    }
     if (
       error !== null &&
       arrayIncludes(["object", "function"], typeof error)
@@ -1058,6 +1667,65 @@ function createTransactionCapability(
       "transaction_boundary_lost",
       "uncertain",
     );
+  };
+  const enqueueOperation = (execute) => {
+    const previousQuery = queryQueue;
+    const execution = protectPromise(
+      (async () => {
+        await protectPromise(previousQuery);
+        if (terminalQueryError !== undefined) throw terminalQueryError;
+        if (boundaryLost) {
+          throw transactionError(
+            "transaction_boundary_lost",
+            "uncertain",
+          );
+        }
+        if (retryableBoundaryRollback !== undefined) {
+          throw transactionError("transaction_rolled_back");
+        }
+        return await protectPromise(execute());
+      })(),
+    );
+    let operation;
+    operation = protectPromise(
+      (async () => {
+        try {
+          return await protectPromise(execution);
+        } finally {
+          setDelete(pending, operation);
+        }
+      })(),
+    );
+    queryQueue = protectPromise(
+      (async () => {
+        try {
+          await protectPromise(operation);
+        } catch {
+          // A rejected operation does not prevent the queue from draining.
+        }
+      })(),
+    );
+    setAdd(pending, operation);
+    void (async () => {
+      try {
+        await protectPromise(operation);
+      } catch {
+        // The caller observes the original operation rejection.
+      }
+    })();
+    return operation;
+  };
+  const recheckBoundary = async () => {
+    try {
+      const boundaryResult = await protectPromise(
+        clientQuery(client, TRANSACTION_ID_QUERY),
+      );
+      if (canonicalTransactionId(boundaryResult) !== transactionId) {
+        throw new ErrorConstructor("transaction identifier changed");
+      }
+    } catch (error) {
+      throw markBoundaryRecheckError(error);
+    }
   };
 
   const query = (...args) => {
@@ -1091,76 +1759,110 @@ function createTransactionCapability(
       text: args[0],
       values,
     });
-    const previousQuery = queryQueue;
-    const execution = protectPromise(
-      (async () => {
-        await protectPromise(previousQuery);
-        if (terminalQueryError !== undefined) throw terminalQueryError;
-        if (boundaryLost) {
-          throw transactionError(
-            "transaction_boundary_lost",
-            "uncertain",
-          );
-        }
-        if (retryableBoundaryRollback !== undefined) {
-          throw transactionError("transaction_rolled_back");
-        }
-
-        let result;
-        try {
-          result = await protectPromise(
-            clientQuery(client, queryConfig),
-          );
-        } catch (error) {
-          terminalQueryError = markQueryError(error);
-          throw terminalQueryError;
-        }
-
-        let boundaryResult;
-        try {
-          boundaryResult = await protectPromise(
-            clientQuery(client, TRANSACTION_ID_QUERY),
-          );
-          if (canonicalTransactionId(boundaryResult) !== transactionId) {
-            throw new ErrorConstructor("transaction identifier changed");
-          }
-        } catch (error) {
-          throw markBoundaryRecheckError(error);
-        }
-        return result;
-      })(),
-    );
-    let operation;
-    operation = protectPromise(
-      (async () => {
-        try {
-          return await protectPromise(execution);
-        } finally {
-          setDelete(pending, operation);
-        }
-      })(),
-    );
-    queryQueue = protectPromise(
-      (async () => {
-        try {
-          await protectPromise(operation);
-        } catch {
-          // A rejected query does not prevent the queue from draining.
-        }
-      })(),
-    );
-    setAdd(pending, operation);
-    void (async () => {
+    return enqueueOperation(async () => {
+      let result;
       try {
-        await protectPromise(operation);
-      } catch {
-        // The caller observes the original operation rejection.
+        result = await protectPromise(
+          clientQuery(client, queryConfig),
+        );
+      } catch (error) {
+        terminalQueryError = markQueryError(error);
+        throw terminalQueryError;
       }
-    })();
-    return operation;
+      await protectPromise(recheckBoundary());
+      return result;
+    });
+  };
+
+  const consumeRows = (...args) => {
+    if (!active) {
+      return observedRejectedPromise(
+        transactionError("transaction_query_inactive"),
+      );
+    }
+    if (
+      args.length !== 3 ||
+      typeof args[0] !== "string" ||
+      args[0].length === 0 ||
+      isPrepareTransactionStatement(args[0]) ||
+      typeof args[2] !== "function"
+    ) {
+      return observedRejectedPromise(markLocalQueryError());
+    }
+    if (terminalQueryError !== undefined) {
+      return observedRejectedPromise(terminalQueryError);
+    }
+
+    let values;
+    try {
+      values = copyQueryValues(args[1]);
+    } catch {
+      return observedRejectedPromise(markLocalQueryError());
+    }
+
+    return enqueueOperation(async () => {
+      let streamQuery;
+      try {
+        streamQuery = createPostgresRowStreamQuery(args[0], values);
+      } catch {
+        throw markLocalQueryError();
+      }
+      let callbackFailure;
+      try {
+        callbackFailure = await protectPromise(
+          clientQueryRows(
+            client,
+            streamQuery,
+            args[2],
+            transactionError,
+          ),
+        );
+      } catch (error) {
+        let rollbackUnsafe = false;
+        let reportedError = error;
+        let protocolSqlState;
+        if (
+          error !== null &&
+          arrayIncludes(["object", "function"], typeof error)
+        ) {
+          const streamFailure = weakMapGet(
+            POSTGRES_ROW_STREAM_QUERY_FAILURES,
+            error,
+          );
+          if (streamFailure !== undefined) {
+            weakMapDelete(POSTGRES_ROW_STREAM_QUERY_FAILURES, error);
+            reportedError = streamFailure.error;
+            protocolSqlState = streamFailure.protocolSqlState;
+            rollbackUnsafe = streamFailure.rollbackUnsafe;
+          }
+        }
+        if (rollbackUnsafe) {
+          boundaryLost = true;
+          boundaryRollbackUnsafe = true;
+        }
+        terminalQueryError = markQueryError(
+          reportedError,
+          protocolSqlState,
+        );
+        throw terminalQueryError;
+      }
+      await protectPromise(recheckBoundary());
+      if (callbackFailure !== undefined) {
+        firstQueryFailure ??= objectFreeze({
+          error: callbackFailure.error,
+          source: "local",
+        });
+        throw callbackFailure.error;
+      }
+    });
   };
 
   const transaction = objectFreeze({ now, query });
+  weakMapSet(
+    POSTGRES_SERIALIZABLE_TRANSACTION_ROW_STREAMS,
+    transaction,
+    consumeRows,
+  );
   return objectFreeze({
     close: async () => {
       active = false;
@@ -1180,6 +1882,7 @@ function createTransactionCapability(
       }
       return objectFreeze({
         boundaryLost,
+        boundaryRollbackUnsafe,
         firstQueryFailure,
         queryPending,
         retryableBoundaryRollback,
@@ -1537,7 +2240,11 @@ export class PostgresSerializableStore {
       }
       if (closedCapability.boundaryLost) {
         await protectPromise(
-          failBoundaryUncertain(client, release),
+          failBoundaryUncertain(
+            client,
+            release,
+            !closedCapability.boundaryRollbackUnsafe,
+          ),
         );
       }
       if (!callbackFailed && closedCapability.queryPending) {
@@ -1646,3 +2353,4 @@ export class PostgresSerializableStore {
 }
 
 objectFreeze(isPostgresSerializableStore);
+objectFreeze(consumePostgresSerializableTransactionRows);

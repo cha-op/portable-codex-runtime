@@ -2097,7 +2097,7 @@ export function createPodmanWriterFilesystemAuthorityComposition(...args) {
     PERSISTENT_AUTHORITY_KEYS,
     code,
   );
-  ensure(persistent.contractVersion === 1, code);
+  ensure(persistent.contractVersion === 2, code);
   const persistentAuthority = frozenRecord({
     contractVersion: persistent.contractVersion,
     verify: assertFunction(persistent.verify, code),

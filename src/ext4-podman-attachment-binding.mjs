@@ -32,6 +32,7 @@ const arrayJoinIntrinsic = Array.prototype.join;
 const arrayPushIntrinsic = Array.prototype.push;
 const arraySortIntrinsic = Array.prototype.sort;
 const bufferByteLengthIntrinsic = Buffer.byteLength;
+const BigIntConstructor = BigInt;
 const createHashIntrinsic = createHash;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
@@ -93,8 +94,8 @@ const MAX_CANONICAL_DEPTH = 32;
 const MAX_CANONICAL_NODES = 32_768;
 const MAX_CANONICAL_BYTES = 4 * 1024 * 1024;
 
-export const EXT4_PODMAN_ATTACHMENT_BINDING_CONTRACT_VERSION = 1;
-export const EXT4_PODMAN_PERSISTENT_AUTHORITY_CONTRACT_VERSION = 1;
+export const EXT4_PODMAN_ATTACHMENT_BINDING_CONTRACT_VERSION = 2;
+export const EXT4_PODMAN_PERSISTENT_AUTHORITY_CONTRACT_VERSION = 2;
 
 function callIntrinsic(intrinsic, receiver, args) {
   return reflectApplyIntrinsic(intrinsic, receiver, args);
@@ -316,7 +317,7 @@ function canonicalSerialize(value) {
 function sha256(value) {
   const hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
   callIntrinsic(hashUpdateIntrinsic, hash, [
-    "portable-codex-runtime/ext4-podman-attachment-binding/v1\0",
+    "portable-codex-runtime/ext4-podman-attachment-binding/v2\0",
     "utf8",
   ]);
   callIntrinsic(hashUpdateIntrinsic, hash, [value, "utf8"]);
@@ -414,10 +415,39 @@ function sessionAttachmentFromOperation(record) {
   return null;
 }
 
+function sameStorageAtOriginRevision(committed, current) {
+  if (
+    typeof committed.revision !== "string" ||
+    !regexpTest(POSITIVE_DECIMAL_PATTERN, committed.revision) ||
+    typeof current.revision !== "string" ||
+    !regexpTest(POSITIVE_DECIMAL_PATTERN, current.revision)
+  ) {
+    return false;
+  }
+  let committedRevision;
+  let currentRevision;
+  try {
+    committedRevision = BigIntConstructor(committed.revision);
+    currentRevision = BigIntConstructor(current.revision);
+  } catch {
+    return false;
+  }
+  if (currentRevision < committedRevision) return false;
+  const normalizedCurrent = frozenRecord({
+    ...current,
+    revision: committed.revision,
+  });
+  return canonicalSerialize(committed) === canonicalSerialize(normalizedCurrent);
+}
+
 function currentStorageStatus(record, attachment) {
-  if (record === null || record.state === "prepared") return "missing";
+  if (record === null) return "missing";
+  if (record.state === "prepared") return "mismatch";
   if (record.state !== "committed") {
     throw new TypeError("invalid ext4 Podman provider operation state");
+  }
+  if (record.currentAttachmentOriginOperationId !== record.operationId) {
+    return "mismatch";
   }
   const operationAttachment = sessionAttachmentFromOperation(record);
   if (operationAttachment === null) return "mismatch";
@@ -434,7 +464,7 @@ function currentStorageStatus(record, attachment) {
     committed === null ||
     committed.lifecycle !== "attached" ||
     committed.attachment === null ||
-    canonicalSerialize(committed) !== canonicalSerialize(current)
+    !sameStorageAtOriginRevision(committed, current)
   ) {
     return "mismatch";
   }

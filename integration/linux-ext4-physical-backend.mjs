@@ -23,7 +23,7 @@ import {
   createExt4FilesystemImagePaths,
 } from "../src/ext4-filesystem-image-paths.mjs";
 import {
-  FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   FilesystemImageProviderState,
   normalizeFilesystemImageProviderStateHead,
 } from "../src/filesystem-image-provider-state.mjs";
@@ -114,8 +114,11 @@ if (
 ) {
   throw new TypeError("invalid external Linux ext4 producer UID");
 }
+// This physical transport harness has no PostgreSQL authority. It deliberately
+// exercises the supported version 2 compatibility path; version 3 adoption is
+// covered by the PostgreSQL and provider-state integration matrices.
 const GENESIS_PROVIDER_STATE_HEAD = exact({
-  contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+  contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
   anchorRevision: "0",
   generation: "0",
   stateRevision: "0",
