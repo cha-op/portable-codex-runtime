@@ -615,8 +615,10 @@
   group.
 - A separate root-only Ubuntu conformance job now kills and joins one writer
   after it has fsynced complete plain-JSONL records and one synthetic partial
-  suffix on ext4, then atomically snapshots it through LVM/device-mapper. That
-  mounted-origin operation automatically freezes and flushes the filesystem.
+  suffix plus its rollout directory on ext4, then atomically snapshots the
+  mounted origin through LVM/device-mapper. The harness does not independently
+  verify a whole-filesystem freeze/flush; its durable fixture evidence is
+  limited to the explicitly fsynced rollout bytes and directory entry.
   It exports the snapshot as a fixed raw artifact, repairs only an independent
   writable raw copy, proves no abort marker was invented, and appends and
   rereads one synced valid event. This
@@ -809,11 +811,10 @@
   and supply no
   differential/compressed export, encryption, provider-state retention, or
   registry trust. A separate root-only LVM job now covers the narrower stopped-
-  writer, fsynced-rollout, LVM-managed filesystem-freeze/flush, atomic-
-  snapshot, and detached-writable-copy tail-repair sequence. Because its
-  snapshot boundary deliberately includes that coordinated freeze/flush, it
-  is not sudden-power-loss or controller-cache-loss evidence and does not
-  change production capabilities. Terminal
+  writer, explicitly fsynced rollout, atomic block snapshot, and detached-
+  writable-copy tail-repair sequence. It makes no independently verified
+  whole-filesystem freeze/flush claim, is not sudden-power-loss or controller-
+  cache-loss evidence, and does not change production capabilities. Terminal
   supervisor-state GC safety after PostgreSQL terminal
   commit is complete for both healthy-session callback quiescence and exact
   same-authorization session-loss overlap. The provider operation-index

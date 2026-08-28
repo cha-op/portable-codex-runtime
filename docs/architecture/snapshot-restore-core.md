@@ -211,9 +211,10 @@ is user context and is not part of checkpoint correctness. The separately
 injected Linux ext4 and rootless Podman components now supply the clean/manual-
 fencing physical boundary without moving those responsibilities into this
 core. An independent LVM harness now proves one stopped, non-forking fixture's
-fsynced crash prefix can pass through filesystem freeze/flush, atomic snapshot,
-and tail repair on a detached writable copy. It neither calls this core nor
-emits a checkpoint descriptor; see `linux-ext4-physical-backend.md`.
+fsynced crash prefix can pass through an atomic block snapshot and tail repair
+on a detached writable copy. It does not independently verify a whole-
+filesystem freeze/flush, call this core, or emit a checkpoint descriptor; see
+`linux-ext4-physical-backend.md`.
 
 ## Dependency History and Remaining Order
 

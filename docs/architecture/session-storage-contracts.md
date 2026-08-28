@@ -445,9 +445,10 @@ fence evidence through worker admission. These rules belong to adapter
 conformance tests rather than a metadata-only validator.
 
 The evidence-only LVM harness covers just the physical middle of that rule for
-one source-audited, non-forking fixture: exact process exit, mounted-origin
-filesystem freeze/flush, atomic block snapshot, read-only raw-artifact byte
-stability and readback, and repair on an independent writable copy. It does not
+one source-audited, non-forking fixture: exact process exit, explicit rollout-
+file and directory fsync, atomic mounted-origin block snapshot, read-only raw-
+artifact byte stability and readback, and repair on an independent writable
+copy. It does not independently verify a whole-filesystem freeze/flush,
 construct a checkpoint descriptor, obtain a newer canonical epoch, retain a
 production fence through admission, or implement an adapter.
 

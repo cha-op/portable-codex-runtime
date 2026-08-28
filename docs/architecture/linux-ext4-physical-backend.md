@@ -932,10 +932,12 @@ A separate root-only Ubuntu conformance job covers a narrower evidence-only
 path. One source-audited, non-forking fixture fsyncs complete plain-JSONL
 records and one synthetic partial suffix on a mounted ext4 origin LV. The
 harness sends `SIGKILL`, waits for that exact process to exit, and only then
-asks LVM to create an atomic device-mapper snapshot. That mounted-origin
-snapshot boundary includes LVM's filesystem freeze/flush. The snapshot LV is
-required to remain read-only and below COW exhaustion. A full raw artifact is
-then exported and fsynced, attached to a read-only loop, and observed only
+asks LVM to create an atomic device-mapper snapshot. The fixture explicitly
+fsyncs the rollout file and its containing directory before signalling ready;
+the harness does not call `fsfreeze`, independently observe LVM's internal
+freeze coordination, or claim whole-filesystem flush evidence. The snapshot LV
+is required to remain read-only and below COW exhaustion. A full raw artifact
+is then exported and fsynced, attached to a read-only loop, and observed only
 through an ext4 `ro,noload` mount.
 
 The raw artifact's size and SHA-256 are recorded before recovery. Tail repair
@@ -962,8 +964,9 @@ Container stop/removal alone is not loop-detach evidence.
 They do not simulate sudden power loss, storage-controller cache loss,
 partitioned stale-writer revocation, or an automatic force fence. The separate
 LVM harness proves a stopped-fixture crash-prefix recovery sequence only under
-its explicit fsync plus filesystem-freeze/flush boundary; it does not widen the
-production capability tuple. Production crash-prefix checkpointing,
+its explicit fixture-file and rollout-directory fsync plus block-level
+point-in-time snapshot boundary; it does not widen the production capability
+tuple. Production crash-prefix checkpointing,
 epoch-enforced fencing, differential export, compression, encryption,
 retention, registry signature policy, and remote image transport remain
 outside this backend's declared capabilities.

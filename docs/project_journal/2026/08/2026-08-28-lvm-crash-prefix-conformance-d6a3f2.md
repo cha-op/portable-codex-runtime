@@ -16,8 +16,9 @@ superseded_by:
 
 - Added a root-only Ubuntu 24.04 conformance harness for one deliberately
   narrow recovery boundary: a stopped writer, an fsynced plain-JSONL rollout,
-  LVM/device-mapper's automatic filesystem freeze/flush around its atomic
-  snapshot, and offline tail repair on a detached writable copy.
+  an atomic LVM/device-mapper block snapshot, and offline tail repair on a
+  detached writable copy. The harness makes no independently verified whole-
+  filesystem freeze/flush claim.
 - Kept the production Linux ext4 backend capability tuple and public
   checkpoint surfaces unchanged.
 
@@ -25,8 +26,8 @@ superseded_by:
 
 - The harness writes complete fsynced JSONL records followed by one fsynced
   synthetic partial suffix on an ext4 origin LV, kills and joins that exact
-  writer, then creates an LVM/device-mapper snapshot whose mounted-origin
-  operation automatically freezes and flushes the filesystem.
+  writer, fsyncs the rollout directory, then creates an atomic mounted-origin
+  LVM/device-mapper block snapshot.
 - The read-only snapshot is exported and fsynced as a raw artifact. That
   artifact is mode `0400`, attached to a read-only loop, and mounted with
   journal replay disabled. Its size and SHA-256 remain fixed while
@@ -42,10 +43,11 @@ superseded_by:
 
 ## Safety Boundary
 
-- The LVM/device-mapper snapshot operation supplies the automatic filesystem
-  freeze/flush barrier; the harness does not issue a second explicit freeze.
-  This does not simulate sudden host power loss, storage-controller cache loss,
-  or a device that violates acknowledged-write durability.
+- The harness does not independently verify a whole-filesystem freeze/flush.
+  Its durable evidence is limited to the rollout file and directory entry
+  explicitly fsynced before the block snapshot. This does not simulate sudden
+  host power loss, storage-controller cache loss, or a device that violates
+  acknowledged-write durability.
 - Stopping and joining the exact writer is required. The harness neither
   fences a partitioned stale writer nor proves automatic failover.
 - This is conformance evidence, not a production adapter. It does not emit or

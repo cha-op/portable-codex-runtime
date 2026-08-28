@@ -141,6 +141,13 @@ jobs:
         env:
           LINUX_EXT4_CRASH_PREFIX_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-crash-prefix-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
+          mount_targets=""
+          mount_probe_status=0
+          mount_targets="$(/usr/bin/findmnt -rn -o TARGET)" || mount_probe_status="$?"
+          if ((mount_probe_status != 0)); then
+            echo "findmnt probe failed with status $mount_probe_status" >&2
+            exit 1
+          fi
           while IFS= read -r target; do
             case "$target" in
               "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT"/*)
@@ -148,14 +155,31 @@ jobs:
                 exit 1
                 ;;
             esac
-          done < <(/usr/bin/findmnt -rn -o TARGET)
+          done <<< "$mount_targets"
+
+          volume_groups=""
+          vgs_probe_status=0
+          volume_groups="$(sudo /usr/sbin/vgs --noheadings -o vg_name)" || vgs_probe_status="$?"
+          if ((vgs_probe_status != 0)); then
+            echo "vgs probe failed with status $vgs_probe_status" >&2
+            exit 1
+          fi
           while IFS= read -r vg; do
             vg="${vg//[[:space:]]/}"
             if [[ "$vg" =~ ^pcrcp_[0-9]+_[0-9a-f]{8}$ ]]; then
               echo "scoped volume group remains: $vg" >&2
               exit 1
             fi
-          done < <(sudo /usr/sbin/vgs --noheadings -o vg_name)
+          done <<< "$volume_groups"
+
+          loop_devices=""
+          losetup_probe_status=0
+          loop_devices="$(sudo /usr/sbin/losetup --list --noheadings --output NAME,BACK-FILE)" || \
+            losetup_probe_status="$?"
+          if ((losetup_probe_status != 0)); then
+            echo "losetup probe failed with status $losetup_probe_status" >&2
+            exit 1
+          fi
           while read -r loop backing; do
             case "$backing" in
               "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT"/*)
@@ -163,9 +187,19 @@ jobs:
                 exit 1
                 ;;
             esac
-          done < <(sudo /usr/sbin/losetup --list --noheadings --output NAME,BACK-FILE)
-          if sudo test -e "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT" || \
-            sudo test -L "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT"; then
+          done <<< "$loop_devices"
+
+          root_parent="${LINUX_EXT4_CRASH_PREFIX_TEST_ROOT%/*}"
+          root_name="${LINUX_EXT4_CRASH_PREFIX_TEST_ROOT##*/}"
+          root_entries=""
+          root_probe_status=0
+          root_entries="$(sudo /usr/bin/find "$root_parent" \
+            -mindepth 1 -maxdepth 1 -name "$root_name" -print)" || root_probe_status="$?"
+          if ((root_probe_status != 0)); then
+            echo "working-root probe failed with status $root_probe_status" >&2
+            exit 1
+          fi
+          if [[ -n "$root_entries" ]]; then
             echo "scoped working root remains" >&2
             exit 1
           fi

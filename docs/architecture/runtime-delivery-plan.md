@@ -602,9 +602,11 @@ production crash-prefix composition, sudden-power-loss/controller-cache-loss
 evidence, automatic stale-writer fencing, differential export/compression,
 content-addressed distribution, encryption, registry trust, remote transport,
 and broader operational hardening. A separate completed conformance slice
-covers only a stopped, non-forking fixture, LVM's filesystem-freeze/flush
-snapshot boundary, raw-artifact byte stability, and tail repair on an
-independent writable copy; it changes no production API or capability.
+covers only a stopped, non-forking fixture, explicit rollout-file and directory
+fsync, a block-level LVM snapshot boundary, raw-artifact byte stability, and
+tail repair on an independent writable copy; it changes no production API or
+capability and makes no independently verified whole-filesystem freeze/flush
+claim.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental

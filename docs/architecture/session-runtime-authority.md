@@ -85,10 +85,11 @@ those ext4 mounts propagate to its parent namespace. The initialized ext4
 backend now binds committed persistent identity and a driver same-sample
 runtime identity into Podman's held FD and live mount authority in that same
 non-root producer process. A separate root-only LVM harness covers one stopped,
-non-forking fixture's fsynced crash prefix, filesystem freeze/flush, atomic
-snapshot, and detached-writable-copy tail repair. It is not runtime-authority
-or checkpoint-API evidence and does not claim sudden power loss or automatic
-stale-writer fencing.
+non-forking fixture's explicitly fsynced crash prefix and rollout directory,
+atomic block snapshot, and detached-writable-copy tail repair. It makes no
+independently verified whole-filesystem freeze/flush claim, is not runtime-
+authority or checkpoint-API evidence, and does not claim sudden power loss or
+automatic stale-writer fencing.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
