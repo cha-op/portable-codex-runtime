@@ -72,7 +72,9 @@ superseded_by:
   history, and protocol-marker history independently; aggregate output or
   protocol overflow terminates the exact QEMU child and fails closed. A guest
   error observed after an apparent success marker remains fatal after stdio is
-  fully drained and the process exits.
+  fully drained and the process exits. Every guest marker first terminates any
+  open initramfs status line, so the host can retain strict whole-line marker
+  recognition instead of accepting ambiguous serial suffixes.
 
 ## Safety Boundary
 

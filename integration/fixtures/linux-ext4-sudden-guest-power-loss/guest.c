@@ -231,7 +231,7 @@ static int run_setup(void) {
 }
 
 static int emit_ready_marker(const char *nonce) {
-  static const char marker_prefix[] = "PCR_SUDDEN_GUEST_POWER_READY_V1 ";
+  static const char marker_prefix[] = "\nPCR_SUDDEN_GUEST_POWER_READY_V1 ";
   uint8_t marker[sizeof(marker_prefix) - 1U + 32U + 1U];
   size_t offset = 0U;
 
