@@ -447,10 +447,11 @@ conformance tests rather than a metadata-only validator.
 The evidence-only LVM harness covers just the physical middle of that rule for
 one source-audited, non-forking fixture: exact process exit, explicit rollout-
 file and directory fsync, atomic mounted-origin block snapshot, read-only raw-
-artifact byte stability and readback, and repair on an independent writable
-copy. It does not independently verify a whole-filesystem freeze/flush,
-construct a checkpoint descriptor, obtain a newer canonical epoch, retain a
-production fence through admission, or implement an adapter.
+artifact byte stability, artifact-derived readback after journal replay on an
+independent writable copy, and repair on that copy. It does not independently
+verify a whole-filesystem freeze/flush, construct a checkpoint descriptor,
+obtain a newer canonical epoch, retain a production fence through admission,
+or implement an adapter.
 
 The backend-neutral snapshot and restore core implements only stopped-writer
 `clean` orchestration over these records. It validates the operation boundary

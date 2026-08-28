@@ -29,10 +29,10 @@ superseded_by:
   writer, fsyncs the rollout directory, then creates an atomic mounted-origin
   LVM/device-mapper block snapshot.
 - The read-only snapshot is exported and fsynced as a raw artifact. That
-  artifact is mode `0400`, attached to a read-only loop, and mounted with
-  journal replay disabled. Its size and SHA-256 remain fixed while
-  `repairStoppedRolloutTails()` runs only against an independent full
-  byte-stream copy mounted read-write.
+  artifact is mode `0400` and is never mounted directly. Its size and SHA-256
+  remain fixed while an independent full byte-stream copy is mounted read-
+  write, allowed to replay the ext4 journal, checked for the original prefix
+  and partial suffix, and then passed to `repairStoppedRolloutTails()`.
 - The repaired copy retains every complete record, removes only the invalid
   suffix, contains no invented `turn_aborted` event or abort marker, accepts
   one new synced valid event, and passes a full reread.
@@ -45,9 +45,11 @@ superseded_by:
 
 - The harness does not independently verify a whole-filesystem freeze/flush.
   Its durable evidence is limited to the rollout file and directory entry
-  explicitly fsynced before the block snapshot. This does not simulate sudden
-  host power loss, storage-controller cache loss, or a device that violates
-  acknowledged-write durability.
+  explicitly fsynced before the block snapshot. Filesystem readback happens
+  only after journal replay on the writable copy; the raw artifact itself is
+  proved byte-stable rather than directly mounted. This does not simulate
+  sudden host power loss, storage-controller cache loss, or a device that
+  violates acknowledged-write durability.
 - Stopping and joining the exact writer is required. The harness neither
   fences a partitioned stale writer nor proves automatic failover.
 - This is conformance evidence, not a production adapter. It does not emit or

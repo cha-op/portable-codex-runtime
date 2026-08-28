@@ -286,9 +286,10 @@
 - [done] Added evidence-only LVM crash-prefix conformance for a stopped writer,
   an explicitly fsynced plain-JSONL prefix plus synthetic partial suffix and
   rollout directory entry, an atomic block snapshot, read-only raw-artifact
-  byte stability and readback, and tail repair only on a detached writable
-  copy. It does not claim an independently verified whole-filesystem
-  freeze/flush or widen the production checkpoint API.
+  byte stability, pre-repair readback after journal replay on a detached
+  writable copy, and tail repair only on that copy. It does not claim an
+  independently verified whole-filesystem freeze/flush or widen the production
+  checkpoint API.
 - [pending] Extend beyond that evidence and the clean/manual-fencing production
   boundary only in separately scoped work: sudden-power-loss/controller-cache-
   loss evidence, a production crash-prefix adapter, automatic stale-writer

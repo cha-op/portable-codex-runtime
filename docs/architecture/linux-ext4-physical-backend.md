@@ -937,18 +937,19 @@ fsyncs the rollout file and its containing directory before signalling ready;
 the harness does not call `fsfreeze`, independently observe LVM's internal
 freeze coordination, or claim whole-filesystem flush evidence. The snapshot LV
 is required to remain read-only and below COW exhaustion. A full raw artifact
-is then exported and fsynced, attached to a read-only loop, and observed only
-through an ext4 `ro,noload` mount.
+is then exported and fsynced, set to mode `0400`, and never mounted directly.
 
 The raw artifact's size and SHA-256 are recorded before recovery. Tail repair
 runs only on an independent full byte-stream copy with a distinct file inode,
-mounted normally as a writable generation after the artifact's read-only loop
-is detached. The repaired generation must retain every complete record, remove
-only the invalid suffix, contain no invented `turn_aborted` event or abort
-marker, accept one new synced valid event, and pass a cold reread. The original
-artifact's size and SHA-256 must still match afterwards. This proves CI-scoped
-byte stability, not protection against a privileged same-host tamperer or
-durable publication authority.
+mounted normally as a writable generation so ext4 may replay its journal. The
+copy must expose the complete prefix plus synthetic partial suffix before any
+repair runs. The repaired generation must then retain every complete record,
+remove only the invalid suffix, contain no invented `turn_aborted` event or
+abort marker, accept one new synced valid event, and pass a cold reread. The
+original artifact's size and SHA-256 must still match afterwards. This proves
+CI-scoped byte stability and artifact-derived recovery after replay, not direct
+filesystem readback from the raw artifact, protection against a privileged
+same-host tamperer, or durable publication authority.
 
 The fixture's exact PID exit proves only this known single-process writer is
 stopped; it is not the production stopped-writer capability and makes no

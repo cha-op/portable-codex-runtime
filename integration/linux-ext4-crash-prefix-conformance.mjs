@@ -526,7 +526,6 @@ async function cleanupResources(resources) {
   }
   for (const mount of [
     ["repair mount", "repairMounted", resources.repairMount],
-    ["artifact mount", "artifactMounted", resources.artifactMount],
     ["origin mount", "originMounted", resources.originMount],
   ]) {
     const [label, state, path] = mount;
@@ -536,10 +535,7 @@ async function cleanupResources(resources) {
       resources[state] = false;
     });
   }
-  for (const loop of [
-    ["repair loop", "repairLoop"],
-    ["artifact loop", "artifactLoop"],
-  ]) {
+  for (const loop of [["repair loop", "repairLoop"]]) {
     const [label, state] = loop;
     if (resources[state] === null) continue;
     await attempt(label, async () => {
@@ -614,10 +610,8 @@ async function cleanupResources(resources) {
   }
   const allResourcesRetired =
     !resources.repairMounted &&
-    !resources.artifactMounted &&
     !resources.originMounted &&
     resources.repairLoop === null &&
-    resources.artifactLoop === null &&
     resources.originLoop === null &&
     !resources.snapshotCreated &&
     !resources.originCreated &&
@@ -649,9 +643,6 @@ async function runConformance(t) {
   const originDevice = `/dev/${volumeGroup}/origin`;
   const snapshotDevice = `/dev/${volumeGroup}/crash_snapshot`;
   const resources = {
-    artifactLoop: null,
-    artifactMount: join(root, "artifact-mount"),
-    artifactMounted: false,
     originLoop: null,
     originMount: join(root, "origin-mount"),
     originMounted: false,
@@ -674,7 +665,6 @@ async function runConformance(t) {
     await mkdir(root, { mode: 0o700 });
     resources.rootCreated = true;
     await mkdir(resources.originMount, { mode: 0o700 });
-    await mkdir(resources.artifactMount, { mode: 0o700 });
     await mkdir(resources.repairMount, { mode: 0o700 });
 
     const backingPath = join(root, "lvm-backing.raw");
@@ -828,33 +818,6 @@ async function runConformance(t) {
     assert.deepEqual(snapshotBefore, artifactBefore);
     assert.equal(artifactBefore.size, snapshotEvidenceAtCapture.size);
 
-    resources.artifactLoop = await attachLoop(artifactPath, true);
-    await mountExt4(resources.artifactLoop, resources.artifactMount, true);
-    resources.artifactMounted = true;
-    await assertSingleMount(
-      resources.artifactLoop,
-      resources.artifactMount,
-      "ro",
-    );
-    const artifactRolloutPath = join(
-      resources.artifactMount,
-      rolloutRelativePath,
-    );
-    const artifactRollout = await readFile(artifactRolloutPath);
-    assert.deepEqual(
-      artifactRollout,
-      Buffer.concat([FULL_PREFIX, PARTIAL_SUFFIX]),
-    );
-    assertNoAbortMarker(artifactRollout);
-    await assert.rejects(open(artifactRolloutPath, "a"), (error) => {
-      assert.equal(error?.code, "EROFS");
-      return true;
-    });
-    await runCommand(COMMANDS.umount, ["--", resources.artifactMount]);
-    resources.artifactMounted = false;
-    await detachLoop(resources.artifactLoop);
-    resources.artifactLoop = null;
-
     const repairImagePath = join(root, "writable-repair-copy.raw");
     await fullCopy(artifactPath, repairImagePath);
     const repairMetadata = await lstat(repairImagePath, { bigint: true });
@@ -876,6 +839,12 @@ async function runConformance(t) {
     );
     const repairCodexHome = join(resources.repairMount, "codex-home");
     const repairRolloutPath = join(resources.repairMount, rolloutRelativePath);
+    const preRepairRollout = await readFile(repairRolloutPath);
+    assert.deepEqual(
+      preRepairRollout,
+      Buffer.concat([FULL_PREFIX, PARTIAL_SUFFIX]),
+    );
+    assertNoAbortMarker(preRepairRollout);
     const repairRequest = {
       codexHome: repairCodexHome,
       rootSessionId: ROOT_SESSION_ID,
@@ -967,6 +936,8 @@ async function runConformance(t) {
 
     t.diagnostic(JSON.stringify({
       artifact: artifactAfter,
+      artifactReadbackBoundary:
+        "independent-writable-copy-after-ext4-journal-replay",
       artifactMode: "0400",
       checkpointBoundary: "lvm-mounted-origin-snapshot",
       controllerCachePowerLossClaimed: false,
