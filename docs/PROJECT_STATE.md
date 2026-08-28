@@ -646,10 +646,18 @@
   one same-process dispatch attempt. The committed artifact records object
   identity, byte length and SHA-256 content stability, and read-only access
   policy independently; verification returns only exact `committed` evidence
-  or non-authorizing `unknown`. This extension is not wired into the clean
-  checkpoint path or public deployment. It adds no concrete snapshot provider,
-  durable catalogue, physical fence, tail-repair admission, restore path, or
-  higher-epoch writer authority, and the ext4 backend remains
+  or non-authorizing `unknown`.
+- An independent PostgreSQL catalogue now binds four separately unique opaque
+  capture identities, immutable request/provider/result digests, and
+  database-owned `starting`, `uncertain`, and `committed` transition audit.
+  Only one clearly committed fresh claim can issue a process-local dispatch
+  grant; existing or acknowledgement-ambiguous attempts never regrant it.
+  A dormant stopped-only classic LVM wrapper consumes that decision before
+  authority and `lvcreate`, retains the read-only snapshot LV, and revalidates
+  its LV UUID, visible length, SHA-256, and access policy without reopening the
+  source. Neither component is wired into clean capture or public deployment;
+  no physical stale-writer fence, tail-repair admission, restore path, or
+  higher-epoch writer authority is added, and the ext4 backend remains
   `atomicPointInTimeCheckpoint: false` with manual fencing.
 - Terminal local Podman supervisor state now has a bounded two-phase collector.
   It validates the exact stopped revision 4 terminal record and revisions 0
@@ -702,6 +710,8 @@
   `docs/project_journal/2026/08/2026-08-28-qemu-guest-power-loss-conformance-e8b4c1.md`
 - Atomic crash-capture extension:
   `docs/project_journal/2026/08/2026-08-28-atomic-crash-capture-contract-a91d7e.md`
+- Atomic crash-capture provider catalogue:
+  `docs/project_journal/2026/08/2026-08-29-atomic-crash-capture-provider-catalogue-c4e7a2.md`
 - ext4-to-Podman attachment composition:
   `docs/project_journal/2026/08/2026-08-19-ext4-podman-composition-a4c821.md`
 - Terminal writer-supervisor state GC:

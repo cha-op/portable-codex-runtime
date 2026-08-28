@@ -474,10 +474,15 @@ source attachment, and storage reference. A same-process object-identity token
 is consumed before one physical dispatch attempt. A committed result binds the
 artifact's provider identity, byte length and SHA-256 content, and read-only
 policy as separate protected properties; source-free verification yields only
-the exact committed result or non-authorizing `unknown`. This remains a
-contract and process-local dispatch guard, not a physical stopped/fenced proof,
-durable provider catalogue, concrete snapshot adapter, repair/restore
-admission, or new writer lease. See `atomic-crash-capture-extension.md`.
+the exact committed result or non-authorizing `unknown`.
+
+An independent PostgreSQL catalogue and dormant classic LVM wrapper now
+implement durable one-attempt dispatch and exact-result replay for this private
+extension. The retained read-only snapshot LV is physically revalidated without
+reopening the source. This still is not a production stopped/fenced authority,
+clean-checkpoint integration, repair/restore admission, or new writer lease,
+and the assembled ext4 backend retains its existing false/manual capability
+tuple. See `atomic-crash-capture-extension.md`.
 
 The backend-neutral snapshot and restore core implements only stopped-writer
 `clean` orchestration over these records. It validates the operation boundary

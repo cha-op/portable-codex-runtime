@@ -18,6 +18,10 @@ import test from "node:test";
 import { Pool } from "pg";
 
 import {
+  assertPostgresAtomicCrashCaptureCatalogueIntegration,
+} from "./postgres-atomic-crash-capture-catalogue.mjs";
+
+import {
   FilesystemOperationJournal,
   operationJournalBindingSha256,
 } from "../src/filesystem-operation-journal.mjs";
@@ -236,6 +240,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
       import.meta.url,
     ),
     version: 11,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/012-atomic-crash-capture-catalogue.sql",
+      import.meta.url,
+    ),
+    version: 12,
   }),
 ]);
 
@@ -1250,7 +1261,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 11,
+    version: 12,
   });
   const forgedLifecycleAnchorIds = [];
   for (const retiredExpression of ["NULL", "pg_current_xact_id()"]) {
@@ -5359,7 +5370,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 11,
+    version: 12,
   });
   const registry = await pool.query(
     [
@@ -5713,7 +5724,7 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 11,
+    version: 12,
   });
   const legacyTerminal = await pool.query(
     [
@@ -9244,10 +9255,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 11);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 12);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
     );
 
     await pool.query(
@@ -9257,7 +9268,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 11,
+      version: 12,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -9270,7 +9281,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 11,
+      version: 12,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -9285,7 +9296,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 11,
+      version: 12,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -9297,7 +9308,7 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 11,
+      version: 12,
     });
     await assertFilesystemImageProviderHeadAnchorSchemaAndStore(pool, store);
     await assertFilesystemImageProviderStateAuthoritySchemaAndStore(
@@ -9319,6 +9330,7 @@ test(
     await assertWriterStopCaptureHandoffSchema(pool);
     await assertRestoreGenerationConstraints(pool);
     await assertRestoreRecoveryCursorSchemaAndStore(pool, store);
+    await assertPostgresAtomicCrashCaptureCatalogueIntegration(pool, store);
 
     const baselineWorkMem = await resetStore.runSerializable(
       async (transaction) => {
@@ -16120,7 +16132,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11],
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         );
 
         const input = writerLaunchAttemptInput(

@@ -110,6 +110,20 @@ jobs:
   linux-ext4-crash-prefix-conformance:
     name: Linux ext4 LVM crash-prefix conformance
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:18.4-alpine3.23
+        env:
+          POSTGRES_DB: portable_codex_runtime_test
+          POSTGRES_HOST_AUTH_METHOD: trust
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d portable_codex_runtime_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -135,11 +149,27 @@ jobs:
             LINUX_EXT4_CRASH_PREFIX_TEST_ROOT="$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT" \
             /usr/bin/unshare --mount --propagation private -- \
             "$node_path" --test integration/linux-ext4-crash-prefix-conformance.mjs
+      - name: Exercise durable-catalogued stopped-writer LVM snapshot
+        timeout-minutes: 10
+        env:
+          ATOMIC_CRASH_CAPTURE_DATABASE_URL: postgresql://postgres@127.0.0.1:5432/portable_codex_runtime_test
+          LVM_ATOMIC_CRASH_CAPTURE_INTEGRATION: "1"
+          LVM_ATOMIC_CRASH_CAPTURE_ROOT: /var/tmp/portable-codex-runtime-lvm-atomic-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          node_path="$(command -v node)"
+          test -x "$node_path"
+          sudo /usr/bin/env \
+            ATOMIC_CRASH_CAPTURE_DATABASE_URL="$ATOMIC_CRASH_CAPTURE_DATABASE_URL" \
+            LVM_ATOMIC_CRASH_CAPTURE_INTEGRATION="$LVM_ATOMIC_CRASH_CAPTURE_INTEGRATION" \
+            LVM_ATOMIC_CRASH_CAPTURE_ROOT="$LVM_ATOMIC_CRASH_CAPTURE_ROOT" \
+            /usr/bin/unshare --mount --propagation private -- \
+            "$node_path" --test integration/lvm-atomic-crash-capture-provider.mjs
       - name: Verify the harness retired every scoped resource
         if: always()
         timeout-minutes: 2
         env:
           LINUX_EXT4_CRASH_PREFIX_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-crash-prefix-${{ github.run_id }}-${{ github.run_attempt }}
+          LVM_ATOMIC_CRASH_CAPTURE_ROOT: /var/tmp/portable-codex-runtime-lvm-atomic-${{ github.run_id }}-${{ github.run_attempt }}
         run: |
           mount_targets=""
           mount_probe_status=0
@@ -150,7 +180,7 @@ jobs:
           fi
           while IFS= read -r target; do
             case "$target" in
-              "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT"/*)
+              "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT"/*|"$LVM_ATOMIC_CRASH_CAPTURE_ROOT"/*)
                 echo "scoped mount remains: $target" >&2
                 exit 1
                 ;;
@@ -166,7 +196,8 @@ jobs:
           fi
           while IFS= read -r vg; do
             vg="${vg//[[:space:]]/}"
-            if [[ "$vg" =~ ^pcrcp_[0-9]+_[0-9a-f]{8}$ ]]; then
+            if [[ "$vg" =~ ^pcrcp_[0-9]+_[0-9a-f]{8}$ ]] || \
+              [[ "$vg" =~ ^pcrvg[0-9a-f]{16}$ ]]; then
               echo "scoped volume group remains: $vg" >&2
               exit 1
             fi
@@ -182,27 +213,32 @@ jobs:
           fi
           while read -r loop backing; do
             case "$backing" in
-              "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT"/*)
+              "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT"/*|"$LVM_ATOMIC_CRASH_CAPTURE_ROOT"/*)
                 echo "scoped loop device remains: $loop" >&2
                 exit 1
                 ;;
             esac
           done <<< "$loop_devices"
 
-          root_parent="${LINUX_EXT4_CRASH_PREFIX_TEST_ROOT%/*}"
-          root_name="${LINUX_EXT4_CRASH_PREFIX_TEST_ROOT##*/}"
-          root_entries=""
-          root_probe_status=0
-          root_entries="$(sudo /usr/bin/find "$root_parent" \
-            -mindepth 1 -maxdepth 1 -name "$root_name" -print)" || root_probe_status="$?"
-          if ((root_probe_status != 0)); then
-            echo "working-root probe failed with status $root_probe_status" >&2
-            exit 1
-          fi
-          if [[ -n "$root_entries" ]]; then
-            echo "scoped working root remains" >&2
-            exit 1
-          fi
+          for scoped_root in \
+            "$LINUX_EXT4_CRASH_PREFIX_TEST_ROOT" \
+            "$LVM_ATOMIC_CRASH_CAPTURE_ROOT"; do
+            root_parent="${scoped_root%/*}"
+            root_name="${scoped_root##*/}"
+            root_entries=""
+            root_probe_status=0
+            root_entries="$(sudo /usr/bin/find "$root_parent" \
+              -mindepth 1 -maxdepth 1 -name "$root_name" -print)" || \
+              root_probe_status="$?"
+            if ((root_probe_status != 0)); then
+              echo "working-root probe failed with status $root_probe_status" >&2
+              exit 1
+            fi
+            if [[ -n "$root_entries" ]]; then
+              echo "scoped working root remains: $scoped_root" >&2
+              exit 1
+            fi
+          done
 
   linux-ext4-sudden-guest-power-loss-conformance:
     name: Linux ext4 external-QEMU-SIGKILL sudden guest power-loss conformance

@@ -928,6 +928,23 @@ The composed producer proves the ext4 attachment and Podman writer share one
 same-process authority boundary. It does not assemble the generic deployment's
 independent PostgreSQL gates into one whole-saga run.
 
+A separate dormant wrapper can now pair a trusted lifecycle backend with the
+private atomic crash-capture extension. It preserves all seven lifecycle
+methods and the base backend identity, and advertises the atomic capability only
+on that wrapper. For a stopped writer, its PostgreSQL catalogue grants at most
+one classic LVM snapshot dispatch for the exact attempt. The retained read-only
+snapshot LV is identified by its stable LV UUID and revalidated by visible
+block length, streaming SHA-256, LVM and block-device read-only signals,
+origin/name/tag binding, valid non-exhausted snapshot state, and same-window
+device-mapper attachment observations. Catalogue restart and verification do
+not reopen the source attachment or grant another `lvcreate`.
+
+That wrapper is not used by the assembled Linux ext4 backend, clean checkpoint
+path, lifecycle facade, or public deployment. In particular it supplies no
+physical stale-writer fence, repair-gated restore generation, or higher-epoch
+writer admission. The production capability tuple at the top of this document
+therefore remains unchanged.
+
 A separate root-only Ubuntu conformance job covers a narrower evidence-only
 path. One source-audited, non-forking fixture fsyncs complete plain-JSONL
 records and one synthetic partial suffix on a mounted ext4 origin LV. The

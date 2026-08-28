@@ -5,8 +5,9 @@
 This document defines the dormant, provider-neutral version 1 extension for
 capturing one `crash-prefix` checkpoint at an atomic storage boundary. The
 extension gives a future authority a closed request, result, and committed
-verification vocabulary. It does not make any currently assembled runtime or
-public deployment capable of taking that checkpoint.
+verification vocabulary. A separate durable PostgreSQL catalogue and classic
+LVM snapshot provider now implement that private boundary, but no currently
+assembled runtime or public deployment can take the checkpoint.
 
 The extension is separate from the base storage backend contract. A backend
 opts in through `captureAtomicCrashCheckpoint()` and
@@ -171,11 +172,61 @@ the same token is rejected.
 These rules prevent a mutable backend object, prototype replacement, accessor,
 or method swap from changing the implementation held by one facade, and bind
 one token to one dispatch attempt. They do not survive a process restart and
-create no provider catalogue entry. The process-local brands are not a global
-registration of the underlying implementation, and independently creating a
-new facade or token is not a durable deduplication mechanism. A future
-composition must reconstruct its authority from durable provider records, not
-from either process-local brand.
+create no provider catalogue entry by themselves. The process-local brands are
+not a global registration of the underlying implementation, and independently
+creating a new facade or token is not a durable deduplication mechanism. The
+private LVM provider therefore obtains its dispatch decision from the durable
+catalogue before it presents stopped-writer authority or calls LVM.
+
+## Durable Catalogue and Classic LVM Provider
+
+Migration 12 adds an independent `atomic_crash_captures` catalogue. Attempt,
+operation, checkpoint, and artifact IDs are stored in four separately unique
+opaque columns, with no lifecycle foreign key or UUID alias. Each row binds the
+canonical request and provider binding by exact JSON plus SHA-256 and moves
+only through these irreversible states:
+
+```text
+starting -> uncertain
+starting -> committed
+uncertain -> committed
+```
+
+The database owns `claimed_at`, `uncertain_at`, and `committed_at` transaction
+timestamps and rejects identity, request, binding, result, or timestamp
+replacement as well as delete and truncate. Only a newly and unambiguously
+committed `starting` insert returns one process-local dispatch claim. An
+existing `starting` or `uncertain` row, or an insert whose commit acknowledgement
+was lost, returns no claim. A committed row can replay only its exact validated
+provider binding and result. The dispatch claim is consumed before either
+`uncertain` or `committed` is written, so a malformed result, database error, or
+acknowledgement loss cannot reopen physical dispatch.
+
+The dormant LVM wrapper delegates all seven base lifecycle methods and changes
+only its private capability snapshot to
+`atomicPointInTimeCheckpoint: true`. Before claiming, its injected origin
+resolver derives a deterministic classic-snapshot binding from a stable origin
+LV UUID and a COW allocation. After the claim, an injected authority consumer
+must authenticate the exact opaque stopped-writer authority and request in the
+same callback that performs the one permitted `lvcreate`.
+
+The retained artifact is the read-only snapshot LV itself. Its persistent
+object identity is the snapshot LV UUID. Content stability is the independently
+observed block-device byte length plus a full streaming SHA-256, and access
+policy requires both read-only LVM attributes and a read-only block device.
+The snapshot name, tag, origin UUID, active-valid classic-snapshot state, COW
+usage below 100 percent, device-mapper UUID, and a same-observation-window
+major/minor pair provide provider and attachment checks. COW allocation is not
+the snapshot's visible byte length: the former sizes the COW store, while the
+latter is measured from both LVM and the block device and becomes the artifact
+length.
+
+Committed replay physically revalidates the retained LV before returning its
+result. Source-free verification reads only the catalogue and retained
+snapshot evidence; it never resolves or opens `sourceAttachment.rootPath`,
+reconstructs authority, or calls `lvcreate`. Missing, unreadable, writable,
+exhausted, replaced, or content-mismatched evidence returns `unknown` and never
+authorizes a second dispatch.
 
 ## Protected Properties
 
@@ -218,21 +269,21 @@ other metadata appears stable.
 
 ## Deliberate Non-Capabilities
 
-This extension does not provide or select:
+This private provider slice still does not provide or select:
 
-- an LVM, device-mapper, filesystem, cloud, or other atomic snapshot adapter;
-- provider operation journaling or a committed-result catalogue;
-- physical writer fencing or fence verification;
+- physical writer fencing or fence verification; its only authority hook is
+  an injected stopped-writer consumer;
 - integration with the current clean checkpoint path, lifecycle facade, or
   public deployment;
 - crash-prefix tail repair;
 - restore or publication of a writable restore destination; or
 - admission of a new writer lease or fencing epoch.
 
-The structural validators and same-process facade therefore cannot certify
-physical authority. That certification remains the responsibility of a future
-composition together with a concrete provider implementation and its durable
-catalogue.
+The provider and catalogue do not turn the structural request into physical
+authority. A future production composition must create the stopped or fenced
+authority, retain it through capture, and preserve the remaining recovery
+ordering below. Cloud, filesystem-native, thin-LVM, and other snapshot adapters
+also remain separate work.
 
 ## Required Future Ordering
 

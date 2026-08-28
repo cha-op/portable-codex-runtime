@@ -81,6 +81,10 @@ const AUTHORITY_MIGRATION_URLS = Object.freeze([
     "../migrations/authority/011-filesystem-image-provider-state-v3-adoption.sql",
     import.meta.url,
   ),
+  new URL(
+    "../migrations/authority/012-atomic-crash-capture-catalogue.sql",
+    import.meta.url,
+  ),
 ]);
 
 class FakeClient {
@@ -3981,13 +3985,16 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   const imageProviderMigration = migrations[7];
   const stateGcMigration = migrations[8];
   const operationIndexMigration = migrations[9];
-  const latestMigration = migrations.at(-1);
+  const latestMigration = migrations[10];
+  const atomicCatalogueMigration = migrations.at(-1);
   const client = new FakeClient([
     {},
     {},
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
@@ -4020,7 +4027,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
 
   assert.deepEqual(result, {
     applied: true,
-    checksum: latestMigration.checksum,
+    checksum: atomicCatalogueMigration.checksum,
     version: SESSION_AUTHORITY_MIGRATION_VERSION,
   });
   assert.equal(Object.isFrozen(result), true);
@@ -4095,7 +4102,12 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
     [11, latestMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[28], ["COMMIT"]);
+  assert.deepEqual(migrationQueries[28], [atomicCatalogueMigration.sql]);
+  assert.deepEqual(migrationQueries[29], [
+    "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+    [12, atomicCatalogueMigration.checksum],
+  ]);
+  assert.deepEqual(migrationQueries[30], ["COMMIT"]);
   assert.deepEqual(client.queries.at(0), ["DISCARD ALL"]);
   assert.deepEqual(client.queries.at(-1), ["DISCARD ALL"]);
   assert.deepEqual(client.releaseCalls, [[]]);
@@ -4130,6 +4142,18 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   assert.match(
     migrations[2].sql,
     /operation_claims_operation_id_registry_fk/u,
+  );
+  assert.match(
+    atomicCatalogueMigration.sql,
+    /CREATE TABLE session_authority\.atomic_crash_captures/u,
+  );
+  assert.match(
+    atomicCatalogueMigration.sql,
+    /state IN \('starting', 'uncertain', 'committed'\)/u,
+  );
+  assert.match(
+    atomicCatalogueMigration.sql,
+    /NEW\.claimed_at := pg_catalog\.transaction_timestamp\(\)/u,
   );
   assert.match(
     migrations[1].sql,
@@ -4969,6 +4993,8 @@ test("migrate destroys a client when its post-COMMIT reset fails", async () => {
       {},
       {},
       {},
+      {},
+      {},
       COMMIT_RESULT,
     ],
     { resetSteps: [DISCARD_RESULT, resetFailure] },
@@ -5025,7 +5051,7 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v1 ledger through v11", async () => {
+test("migrate upgrades an exact v1 ledger through v12", async () => {
   const migrations = await readAuthorityMigrations();
   const firstMigration = migrations[0];
   const latestMigration = migrations.at(-1);
@@ -5042,6 +5068,8 @@ test("migrate upgrades an exact v1 ledger through v11", async () => {
         },
       ],
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -5119,6 +5147,11 @@ test("migrate upgrades an exact v1 ledger through v11", async () => {
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[9].version, migrations[9].checksum],
     ],
+    [migrations[10].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[10].version, migrations[10].checksum],
+    ],
     [latestMigration.sql],
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
@@ -5130,7 +5163,7 @@ test("migrate upgrades an exact v1 ledger through v11", async () => {
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v2 ledger through v11", async () => {
+test("migrate upgrades an exact v2 ledger through v12", async () => {
   const migrations = await readAuthorityMigrations();
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
@@ -5144,6 +5177,8 @@ test("migrate upgrades an exact v2 ledger through v11", async () => {
         version,
       })),
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -5213,6 +5248,11 @@ test("migrate upgrades an exact v2 ledger through v11", async () => {
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[9].version, migrations[9].checksum],
+    ],
+    [migrations[10].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[10].version, migrations[10].checksum],
     ],
     [latestMigration.sql],
     [
@@ -5554,6 +5594,8 @@ test("migrate rejects a COMMIT acknowledgement that reports ROLLBACK", async () 
     {},
     {},
     {},
+    {},
+    {},
     { command: "ROLLBACK" },
   ]);
   const store = new PostgresSerializableStore({
@@ -5577,6 +5619,8 @@ test("migrate treats a failed COMMIT as uncertain and never reapplies", async ()
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
