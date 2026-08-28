@@ -547,6 +547,13 @@ cross-host failover are not supported. Its
 directory; trusted host-side collaborators own lifecycle, fencing, and
 publication authority.
 
+The separate LVM conformance harness snapshots a mounted ext4 LV only after
+killing and joining its known single-process fixture and after that fixture
+fsyncs its rollout file and containing directory, then repairs an independent
+writable raw copy. It does not independently verify a whole-filesystem
+freeze/flush, call this backend, mint a checkpoint descriptor, or change either
+advertised capability above.
+
 NFS, SMB, distributed filesystems, object-store mounts, and unknown filesystem
 semantics are outside this adapter's guarantee. Moving the same interface onto
 shared storage requires a separate backend with server-side exclusive-writer
@@ -571,8 +578,7 @@ This backend deliberately does not provide:
 
 The separate Linux ext4 physical components now inject this backend's
 publication surface into clean/manual-fencing raw-image lifecycle and
-rootless Podman seams. Their trusted persistent-identity bridge and
-same-process evidence remain pending. That does not make
+rootless Podman seams. The separate evidence-only LVM harness does not make
 `StoppedDirectoryBackend` itself an ext4 provider or add automatic host
 fencing to it. See
 `linux-ext4-physical-backend.md`.

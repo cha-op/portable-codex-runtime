@@ -444,6 +444,15 @@ writable epoch strictly greater than the source epoch and retain physical
 fence evidence through worker admission. These rules belong to adapter
 conformance tests rather than a metadata-only validator.
 
+The evidence-only LVM harness covers just the physical middle of that rule for
+one source-audited, non-forking fixture: exact process exit, explicit rollout-
+file and directory fsync, atomic mounted-origin block snapshot, read-only raw-
+artifact byte stability, artifact-derived readback after journal replay on an
+independent writable copy, and repair on that copy. It does not independently
+verify a whole-filesystem freeze/flush, construct a checkpoint descriptor,
+obtain a newer canonical epoch, retain a production fence through admission,
+or implement an adapter.
+
 The backend-neutral snapshot and restore core implements only stopped-writer
 `clean` orchestration over these records. It validates the operation boundary
 and fails closed after uncertain backend dispatch, while the backend retains
@@ -514,11 +523,12 @@ Remaining adapter and evidence work includes:
 
 - Docker, UID-remapping, and SELinux-specific launch profiles beyond the
   current rootless Podman path;
-- NFS, LVM, ZFS, cloud-volume, and other shared or remote storage adapters;
+- production NFS, LVM, ZFS, cloud-volume, and other shared or remote storage
+  adapters;
 - automatic exact-owner host fencing beyond the ext4 backend's clean detach and
   `fencing: "manual"` boundary;
-- production graceful-abort barriers and power-loss/crash-prefix atomic
-  capture;
+- production graceful-abort barriers, sudden-power-loss/controller-cache-loss
+  evidence, and production crash-prefix atomic capture;
 - composition of the separate pinned-runtime rollout-tail repair primitive
   with trusted OCI resolution and launcher admission;
 - differential export/compression, content-addressed distribution, encryption,

@@ -928,13 +928,46 @@ The composed producer proves the ext4 attachment and Podman writer share one
 same-process authority boundary. It does not assemble the generic deployment's
 independent PostgreSQL gates into one whole-saga run.
 
+A separate root-only Ubuntu conformance job covers a narrower evidence-only
+path. One source-audited, non-forking fixture fsyncs complete plain-JSONL
+records and one synthetic partial suffix on a mounted ext4 origin LV. The
+harness sends `SIGKILL`, waits for that exact process to exit, and only then
+asks LVM to create an atomic device-mapper snapshot. The fixture explicitly
+fsyncs the rollout file and its containing directory before signalling ready;
+the harness does not call `fsfreeze`, independently observe LVM's internal
+freeze coordination, or claim whole-filesystem flush evidence. The snapshot LV
+is required to remain read-only and below COW exhaustion. A full raw artifact
+is then exported and fsynced, set to mode `0400`, and never mounted directly.
+
+The raw artifact's size and SHA-256 are recorded before recovery. Tail repair
+runs only on an independent full byte-stream copy with a distinct file inode,
+mounted normally as a writable generation so ext4 may replay its journal. The
+copy must expose the complete prefix plus synthetic partial suffix before any
+repair runs. The repaired generation must then retain every complete record,
+remove only the invalid suffix, contain no invented `turn_aborted` event or
+abort marker, accept one new synced valid event, and pass a cold reread. The
+original artifact's size and SHA-256 must still match afterwards. This proves
+CI-scoped byte stability and artifact-derived recovery after replay, not direct
+filesystem readback from the raw artifact, protection against a privileged
+same-host tamperer, or durable publication authority.
+
+The fixture's exact PID exit proves only this known single-process writer is
+stopped; it is not the production stopped-writer capability and makes no
+process-group, container, cgroup, or detached-child containment claim. The
+harness emits no checkpoint descriptor, performs no catalogue mutation, and
+does not add a capture or restore method to the backend.
+
 These jobs prove clean detach, remount, publication, and cross-host identity.
 The namespace retirement only releases the hosted runner's exclusive Podman
 engine. Final physical quiescence still comes from the native loop receipt:
 unused device identity, advanced disk sequence, and absent sysfs backing.
 Container stop/removal alone is not loop-detach evidence.
 They do not simulate sudden power loss, storage-controller cache loss,
-partitioned stale-writer revocation, or an automatic force fence. Crash-prefix
-checkpointing, epoch-enforced fencing, differential export, compression,
-encryption, retention, registry signature policy, and remote image transport
-remain outside this backend's declared capabilities.
+partitioned stale-writer revocation, or an automatic force fence. The separate
+LVM harness proves a stopped-fixture crash-prefix recovery sequence only under
+its explicit fixture-file and rollout-directory fsync plus block-level
+point-in-time snapshot boundary; it does not widen the production capability
+tuple. Production crash-prefix checkpointing,
+epoch-enforced fencing, differential export, compression, encryption,
+retention, registry signature policy, and remote image transport remain
+outside this backend's declared capabilities.

@@ -590,9 +590,10 @@
   authorizes verification for the exact publication root. Two hosted Ubuntu
   runners cover clean detach, transfer, remount, provider-head continuity, and
   source-free committed verification; the producer additionally gates private-
-  namespace non-propagation. This remains a clean/manual-fencing
-  boundary: it does not prove power-loss or crash-prefix recovery,
-  automatically fence a stale writer, or implement differential export/
+  namespace non-propagation. This production path remains a clean/manual-
+  fencing boundary: it exposes no crash-prefix checkpoint API, does not prove
+  sudden power loss or automatically fence a stale writer, and does not
+  implement differential export/
   compression, encryption, production history offload, or registry trust. The
   initialized ext4
   backend now binds committed attachment identity into Podman filesystem
@@ -612,6 +613,18 @@
   wrapper close plus group absence; a dispatched exact start only advances on
   a zero exit and otherwise remains pending because conmon may leave the CLI
   group.
+- A separate root-only Ubuntu conformance job now kills and joins one writer
+  after it has fsynced complete plain-JSONL records and one synthetic partial
+  suffix plus its rollout directory on ext4, then atomically snapshots the
+  mounted origin through LVM/device-mapper. The harness does not independently
+  verify a whole-filesystem freeze/flush; its durable fixture evidence is
+  limited to the explicitly fsynced rollout bytes and directory entry.
+  It exports the snapshot as a fixed raw artifact, repairs only an independent
+  writable raw copy, proves no abort marker was invented, and appends and
+  rereads one synced valid event. This
+  evidence does not simulate sudden power loss or storage-controller cache
+  loss, fence a stale writer, emit a checkpoint descriptor, or widen the
+  production backend's `atomicPointInTimeCheckpoint: false` capability.
 - Terminal local Podman supervisor state now has a bounded two-phase collector.
   It validates the exact stopped revision 4 terminal record and revisions 0
   through 3 or their admitted oldest-first missing retry prefix, removes the
@@ -657,6 +670,8 @@
   `docs/project_journal/2026/08/2026-08-28-provider-state-adoption-capacity-7b6d41.md`
 - Linux ext4 physical backend:
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
+- LVM crash-prefix conformance:
+  `docs/project_journal/2026/08/2026-08-28-lvm-crash-prefix-conformance-d6a3f2.md`
 - ext4-to-Podman attachment composition:
   `docs/project_journal/2026/08/2026-08-19-ext4-podman-composition-a4c821.md`
 - Terminal writer-supervisor state GC:
@@ -791,14 +806,20 @@
   retires the user-wide Podman pause namespace, and relies on the native loop
   receipt—not container stop alone—for physical quiescence. This release step
   is forbidden on a shared UID or Podman engine. The independent Podman job
-  remains as narrower supervisor coverage. These jobs do not make crash-prefix
-  state durable, revoke a stale remote writer automatically, or supply
+  remains as narrower supervisor coverage. Those production jobs expose no
+  crash-prefix checkpoint API, revoke no stale remote writer automatically,
+  and supply no
   differential/compressed export, encryption, provider-state retention, or
-  registry trust. Terminal supervisor-state GC safety after PostgreSQL terminal
+  registry trust. A separate root-only LVM job now covers the narrower stopped-
+  writer, explicitly fsynced rollout, atomic block snapshot, and detached-
+  writable-copy tail-repair sequence. It makes no independently verified
+  whole-filesystem freeze/flush claim, is not sudden-power-loss or controller-
+  cache-loss evidence, and does not change production capabilities. Terminal
+  supervisor-state GC safety after PostgreSQL terminal
   commit is complete for both healthy-session callback quiescence and exact
   same-authorization session-loss overlap. The provider operation-index
   authority, atomic version 2-to-3 adoption, current attachment-origin binding,
   committed-history removal from local checkpoints, and restartable paged
   adoption beyond the full-array version 1 transport limits are complete.
   Remaining Linux/provider follow-up stays in the already-listed, separately
-  scoped clean/manual-fencing work; no additional feature is selected here.
+  scoped production crash-capture, automatic-fencing, and distribution work.

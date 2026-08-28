@@ -195,8 +195,8 @@ rejected before dispatch.
 This core does not itself provide or compose:
 
 - a production storage barrier for the graceful `turn/interrupt` boundary;
-- atomic `crash-prefix` capture or invocation of the separate pinned-runtime
-  rollout-tail repair primitive from a concrete physical backend;
+- production atomic `crash-prefix` capture or invocation of the separate
+  pinned-runtime rollout-tail repair primitive from this core;
 - repair or automatic continuation of `prepared` or `materialized` capture
   attempts;
 - an ext4 or filesystem-image physical backend;
@@ -210,8 +210,11 @@ These are separate evidence and backend workstreams. In particular, Git state
 is user context and is not part of checkpoint correctness. The separately
 injected Linux ext4 and rootless Podman components now supply the clean/manual-
 fencing physical boundary without moving those responsibilities into this
-core. Their trusted persistent-identity bridge and same-process conformance
-evidence remain pending; see `linux-ext4-physical-backend.md`.
+core. An independent LVM harness now proves one stopped, non-forking fixture's
+fsynced crash prefix can pass through an atomic block snapshot and tail repair
+on a detached writable copy. It does not independently verify a whole-
+filesystem freeze/flush, call this core, or emit a checkpoint descriptor; see
+`linux-ext4-physical-backend.md`.
 
 ## Dependency History and Remaining Order
 
@@ -235,8 +238,11 @@ pull-request order in the runtime delivery plan:
     externally anchored provider state, rootless Podman, and two-host clean
     transfer verification (completed separately from this core, with their
     persistent-identity bridge and same-process evidence remaining); and
-12. power-loss/crash-prefix evidence, automatic stale-writer fencing, and
-    differential export/compression (remaining).
+12. stopped-fixture LVM crash-prefix conformance (completed separately from
+    this core); and
+13. sudden-power-loss/controller-cache-loss evidence, production crash-prefix
+    composition, automatic stale-writer fencing, and differential export/
+    compression (remaining).
 
 This ordering kept orchestration semantics testable before selecting the ext4
 physical format and established pinned-executable Codex recovery evidence

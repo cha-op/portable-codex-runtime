@@ -551,6 +551,11 @@ compression, content-addressed storage, encryption, retention, periodic
 long-goal capture, cross-host migration, or Git Summary. See
 `rollout-tail-repair.md` for the offline repair contract.
 
+An independent LVM conformance harness uses that offline repair contract on a
+writable copy of a raw stopped-fixture snapshot. It does not call or widen this
+publication layer, and the read-only raw artifact is not a published
+checkpoint.
+
 The composed stopped-directory backend does not widen this physical boundary:
 it advertises manual fencing and no atomic point-in-time checkpoint. Its
 durable authority seam supplies canonical admission and catalogue ordering,

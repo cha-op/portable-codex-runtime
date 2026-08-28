@@ -316,8 +316,10 @@ This work does not implement or claim:
 - Git Summary. Git Summary remains deferred read-only user context and is not
   recovery authority.
 
-Separate production-injectable Linux ext4 and rootless Podman components now
-implement clean/manual-fencing physical seams. Their trusted persistent-
-identity bridge and same-process evidence remain pending. They do not compose
-this rollout repair primitive into capture, prove a crash-prefix, or change any
-non-goal above. See `linux-ext4-physical-backend.md`.
+Separate production-injectable Linux ext4 and rootless Podman components
+implement clean/manual-fencing physical seams. An evidence-only root LVM
+conformance harness now composes this repair primitive with one stopped,
+non-forking fixture's atomic block snapshot, but only against an independent
+writable raw copy. It emits no checkpoint descriptor and supplies no production
+capture, fencing, catalogue, or launcher authority, so it changes none of the
+non-goals above. See `linux-ext4-physical-backend.md`.

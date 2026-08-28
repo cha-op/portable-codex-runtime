@@ -119,8 +119,10 @@ mutation envelope required by the snapshot and restore core. See
 The production-injectable Linux ext4 components are a separate completed
 workstream and do not widen these primitives when they are called
 independently. They provide only the clean/manual-fencing component boundaries
-described in `linux-ext4-physical-backend.md`; their trusted persistent-identity
-bridge and same-process evidence remain pending. Power-loss/crash-prefix
-evidence, automatic stale-writer fencing, differential export/compression,
+described in `linux-ext4-physical-backend.md`. A separate LVM conformance
+harness proves one stopped-fixture atomic snapshot and detached-writable-copy
+tail-repair sequence without widening these primitives or production APIs.
+Sudden-power-loss/controller-cache-loss evidence, production crash-prefix
+capture, automatic stale-writer fencing, differential export/compression,
 retention, encryption, periodic long-goal snapshots, registry trust, remote
 transport, and Git Summary remain separate workstreams.

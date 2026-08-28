@@ -598,9 +598,15 @@ version 2 removes only those full-array version 1 transport limits. The 4 MiB
 record/frame-payload, active-tail 65,535-frame/64 MiB, uint32 checkpoint-count,
 and legal version 3 runtime-projection bounds remain distinct and unchanged. See
 `linux-ext4-physical-backend.md`. Later slices own
-power-loss/crash-prefix evidence, automatic stale-writer fencing, differential
-export/compression, content-addressed distribution, encryption, registry trust,
-remote transport, and broader operational hardening.
+production crash-prefix composition, sudden-power-loss/controller-cache-loss
+evidence, automatic stale-writer fencing, differential export/compression,
+content-addressed distribution, encryption, registry trust, remote transport,
+and broader operational hardening. A separate completed conformance slice
+covers only a stopped, non-forking fixture, explicit rollout-file and directory
+fsync, a block-level LVM snapshot boundary, raw-artifact byte stability, and
+tail repair on an independent writable copy; it changes no production API or
+capability and makes no independently verified whole-filesystem freeze/flush
+claim.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental
