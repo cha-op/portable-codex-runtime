@@ -7,10 +7,12 @@ import {
   chmod,
   lstat,
   mkdir,
+  mkdtemp,
   open,
   readFile,
   rm,
 } from "node:fs/promises";
+import { tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import test from "node:test";
@@ -46,6 +48,7 @@ const PARTIAL_SUFFIX = Buffer.from(
 const CONTINUATION = Buffer.from(`${JSON.stringify(event(3))}\n`, "utf8");
 const COMMAND_TIMEOUT_MILLISECONDS = 60_000;
 const WRITER_READY_TIMEOUT_MILLISECONDS = 30_000;
+const WRITER_LIVENESS_PROBE_MILLISECONDS = 100;
 const COMMANDS = Object.freeze({
   blockdev: "/usr/sbin/blockdev",
   dd: "/usr/bin/dd",
@@ -187,12 +190,19 @@ async function runCrashPrefixWriter(rolloutPath) {
   if (typeof process.send !== "function") {
     throw new Error("crash-prefix writer requires an IPC owner");
   }
+  const ownerDisconnected = new Promise((_, rejectPromise) => {
+    process.once("disconnect", () => {
+      rejectPromise(new Error(
+        "crash-prefix writer lost its IPC owner before SIGKILL",
+      ));
+    });
+  });
   process.send({
     prefixBytes: FULL_PREFIX.length,
     partialBytes: PARTIAL_SUFFIX.length,
     type: "ready",
   });
-  await new Promise(() => {});
+  await ownerDisconnected;
 }
 
 function waitForWriterReady(child) {
@@ -982,6 +992,40 @@ if (WRITER_MODE) {
       () => checkedTestRoot("/tmp/unscoped", "unused"),
       /unsafe Linux ext4 crash-prefix test root/u,
     );
+  });
+
+  test("crash-prefix writer remains alive until its parent sends SIGKILL", async () => {
+    const root = await mkdtemp(join(
+      tmpdir(),
+      `${TEST_ROOT_PREFIX}${process.pid}-writer-`,
+    ));
+    const rolloutPath = join(root, "crash-prefix.jsonl");
+    let child;
+    try {
+      child = spawn(
+        process.execPath,
+        [CURRENT_FILE, "--writer", rolloutPath],
+        { stdio: ["ignore", "ignore", "pipe", "ipc"] },
+      );
+      await waitForWriterReady(child);
+      await delay(WRITER_LIVENESS_PROBE_MILLISECONDS);
+      assert.equal(child.exitCode, null);
+      assert.equal(child.signalCode, null);
+      await killWriter(child);
+    } finally {
+      if (
+        child &&
+        child.exitCode === null &&
+        child.signalCode === null
+      ) {
+        const exited = new Promise((resolvePromise) => {
+          child.once("exit", resolvePromise);
+        });
+        child.kill("SIGKILL");
+        await exited;
+      }
+      await rm(root, { force: true, recursive: true });
+    }
   });
 
   test(
