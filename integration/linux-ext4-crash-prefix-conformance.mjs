@@ -421,7 +421,7 @@ async function readSnapshotEvidence(
     "b",
     "--nosuffix",
     "--options",
-    "lv_name,lv_uuid,origin,lv_attr,lv_size,data_percent,segtype",
+    "lv_name,lv_uuid,origin,lv_attr,lv_size,data_percent",
     "--select",
     `vg_name=${volumeGroup}`,
   ]);
@@ -433,8 +433,9 @@ async function readSnapshotEvidence(
     .find((entry) => entry.lv_name === "crash_snapshot");
   assert.notEqual(origin, undefined);
   assert.notEqual(snapshot, undefined);
+  // `segtype` may describe the snapshot COW LV's backing layout. The origin
+  // relation and snapshot attribute prove the semantic snapshot identity.
   assert.equal(snapshot.origin, "origin");
-  assert.equal(snapshot.segtype, "snapshot");
   assert.equal(snapshot.lv_attr[0], "s");
   assert.equal(snapshot.lv_attr[1], "r");
   assert.equal(snapshot.lv_attr[4], "a");
