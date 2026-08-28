@@ -1598,6 +1598,47 @@ function atomicCrashCaptureBackendExtension(value) {
     "invalid_storage_backend",
     "atomic crash-capture backend must be a non-proxy object",
   );
+  let prototypeCursor = value;
+  for (
+    let depth = 0;
+    prototypeCursor !== null && depth < MAX_BACKEND_PROTOTYPE_DEPTH;
+    depth += 1
+  ) {
+    ensure(
+      !isProxyValue(prototypeCursor),
+      "invalid_storage_backend",
+      "atomic crash-capture backend prototype chain must not contain a proxy",
+    );
+    let nextPrototype;
+    try {
+      nextPrototype = objectGetPrototypeOf(prototypeCursor);
+    } catch {
+      fail(
+        "invalid_storage_backend",
+        "atomic crash-capture backend prototype chain is invalid",
+      );
+    }
+    if (prototypeCursor === objectPrototype) {
+      ensure(
+        nextPrototype === null,
+        "invalid_storage_backend",
+        "atomic crash-capture backend shared prototype is invalid",
+      );
+      prototypeCursor = null;
+      break;
+    }
+    ensure(
+      !(depth > 0 && nextPrototype === null),
+      "invalid_storage_backend",
+      "atomic crash-capture backend fields must not come from a terminal prototype",
+    );
+    prototypeCursor = nextPrototype;
+  }
+  ensure(
+    prototypeCursor === null,
+    "invalid_storage_backend",
+    "atomic crash-capture backend prototype chain is too deep",
+  );
   const dataValue = (key) => {
     let cursor = value;
     for (

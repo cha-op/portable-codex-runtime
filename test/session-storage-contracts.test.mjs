@@ -1769,6 +1769,15 @@ test("atomic crash capture backend rejects incomplete, non-atomic, and executabl
     hostilePrototype,
     Object.getOwnPropertyDescriptors(backend),
   );
+  assert.throws(
+    () => assertAtomicCrashCaptureBackend(hostilePrototype),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.throws(
+    () => createAtomicCrashCaptureBackendFacade(hostilePrototype),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(prototypeTraps, 0);
   delete hostilePrototype.contractVersion;
   assert.throws(
     () => assertAtomicCrashCaptureBackend(hostilePrototype),
