@@ -79,7 +79,10 @@ const DATA_IMAGE_SIZE = 128 * 1024 * 1024;
 const COMMAND_TIMEOUT_MILLISECONDS = 180_000;
 const QEMU_BOOT_TIMEOUT_MILLISECONDS = 120_000;
 const QEMU_OUTPUT_LIMIT = 256 * 1024;
+const QEMU_DIAGNOSTIC_TAIL_LIMIT = 8 * 1024;
 const QEMU_LIVENESS_PROBE_MILLISECONDS = 100;
+const QEMU_GUEST_ERROR_PATTERN =
+  /^PCR_SUDDEN_GUEST_POWER_ERROR_V1 (?:unknown|[0-9A-Fa-f]{32}) [a-z0-9_]+ status=[0-9]+$/u;
 const COMMANDS = Object.freeze({
   cc: "/usr/bin/cc",
   findmnt: "/usr/bin/findmnt",
@@ -453,6 +456,35 @@ function boundedAppend(current, chunk, state) {
   return `${current}${chunk}`.slice(-QEMU_OUTPUT_LIMIT);
 }
 
+function boundedUtf8Tail(value, maximumBytes) {
+  const bytes = Buffer.from(value, "utf8");
+  if (bytes.length <= maximumBytes) return value;
+  const tail = bytes.subarray(bytes.length - maximumBytes);
+  let offset = 0;
+  while (offset < tail.length && (tail[offset] & 0xc0) === 0x80) {
+    offset += 1;
+  }
+  return tail.subarray(offset).toString("utf8");
+}
+
+function qemuDiagnosticSummary(controller) {
+  const guestErrors = controller.lines
+    .filter((line) => QEMU_GUEST_ERROR_PATTERN.test(line))
+    .slice(-4);
+  return [
+    `guestErrors=${JSON.stringify(guestErrors)}`,
+    `stdoutTail=${JSON.stringify(boundedUtf8Tail(
+      controller.stdout,
+      QEMU_DIAGNOSTIC_TAIL_LIMIT,
+    ))}`,
+    `stderrTail=${JSON.stringify(boundedUtf8Tail(
+      controller.stderr,
+      QEMU_DIAGNOSTIC_TAIL_LIMIT,
+    ))}`,
+    `outputOverflow=${controller.outputState.overflow}`,
+  ].join(" ");
+}
+
 function startQemu(arguments_) {
   const child = spawn(COMMANDS.qemu, arguments_, {
     stdio: ["ignore", "pipe", "pipe"],
@@ -515,6 +547,11 @@ async function waitForQemuLine(controller, predicate, label) {
   while (Date.now() < deadline) {
     const line = controller.lines.find(predicate);
     if (line !== undefined) return line;
+    if (controller.lines.some((entry) => QEMU_GUEST_ERROR_PATTERN.test(entry))) {
+      throw new Error(
+        `${label} reported guest failure: ${qemuDiagnosticSummary(controller)}`,
+      );
+    }
     if (controller.spawnError !== null) throw controller.spawnError;
     if (
       controller.child.exitCode !== null ||
@@ -523,18 +560,23 @@ async function waitForQemuLine(controller, predicate, label) {
       await withDeadline(controller.closed, 10_000, `${label} stdio close`);
       const finalLine = controller.lines.find(predicate);
       if (finalLine !== undefined) return finalLine;
+      if (controller.lines.some((entry) => QEMU_GUEST_ERROR_PATTERN.test(entry))) {
+        throw new Error(
+          `${label} reported guest failure: ${qemuDiagnosticSummary(controller)}`,
+        );
+      }
       throw new Error(
-        `${label} exited before marker: code=${controller.child.exitCode} signal=${controller.child.signalCode} stderr=${controller.stderr}`,
+        `${label} exited before marker: code=${controller.child.exitCode} signal=${controller.child.signalCode} ${qemuDiagnosticSummary(controller)}`,
       );
     }
-    assert.equal(
-      controller.outputState.overflow,
-      false,
-      `${label} exceeded the bounded QEMU output limit`,
-    );
+    if (controller.outputState.overflow) {
+      throw new Error(
+        `${label} exceeded the bounded QEMU output limit: ${qemuDiagnosticSummary(controller)}`,
+      );
+    }
     await delay(20, undefined, { ref: false });
   }
-  throw new Error(`${label} timed out`);
+  throw new Error(`${label} timed out: ${qemuDiagnosticSummary(controller)}`);
 }
 
 async function assertPidfile(controller, pidfilePath) {
@@ -1290,6 +1332,58 @@ test("initramfs boot capabilities accept loadable and built-in modules", () => {
       "ext4",
     ),
     /initramfs is missing modules\.builtin for ext4/u,
+  );
+});
+
+test("QEMU marker wait consumes close-drained output and bounds guest errors", async () => {
+  const expected = `PCR_SUDDEN_GUEST_POWER_SETUP_OK_V1 ${"ab".repeat(16)}`;
+  const closeController = {
+    child: { exitCode: 0, signalCode: null },
+    lines: [],
+    outputState: { bytes: 0, overflow: false },
+    spawnError: null,
+    stderr: "",
+    stdout: "",
+  };
+  closeController.closed = Promise.resolve().then(() => {
+    closeController.lines.push(expected);
+    closeController.stdout = `${expected}\n`;
+    return { code: 0, signal: null };
+  });
+  assert.equal(
+    await waitForQemuLine(
+      closeController,
+      (line) => line === expected,
+      "setup boot",
+    ),
+    expected,
+  );
+
+  const guestError =
+    `PCR_SUDDEN_GUEST_POWER_ERROR_V1 ${"cd".repeat(16)} mount_ext4 status=1`;
+  const discardedPrefix = "discarded-prefix";
+  const stdout =
+    `${discardedPrefix}${"x".repeat(QEMU_DIAGNOSTIC_TAIL_LIMIT)}\n` +
+    `${guestError}\n`;
+  const errorController = {
+    child: { exitCode: null, signalCode: null },
+    closed: Promise.resolve({ code: 0, signal: null }),
+    lines: [guestError],
+    outputState: { bytes: Buffer.byteLength(stdout), overflow: false },
+    spawnError: null,
+    stderr: "guest stderr\n",
+    stdout,
+  };
+  await assert.rejects(
+    waitForQemuLine(errorController, () => false, "recovery boot"),
+    (error) => {
+      assert.match(error.message, /reported guest failure/u);
+      assert.match(error.message, /mount_ext4 status=1/u);
+      assert.match(error.message, /stdoutTail=/u);
+      assert.match(error.message, /stderrTail="guest stderr\\n"/u);
+      assert.doesNotMatch(error.message, /discarded-prefix/u);
+      return true;
+    },
   );
 });
 

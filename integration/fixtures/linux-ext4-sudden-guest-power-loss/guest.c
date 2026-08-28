@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <termios.h>
 #include <unistd.h>
 
 #ifdef __linux__
@@ -379,14 +380,32 @@ static int run_poweroff(void) {
 #endif
 }
 
+static int run_drain(void) {
+  for (;;) {
+    if (tcdrain(STDOUT_FILENO) == 0) {
+      return EXIT_SUCCESS;
+    }
+    if (errno != EINTR) {
+      report_errno("drain guest serial output");
+      return EXIT_FAILURE;
+    }
+  }
+}
+
 int main(int argc, char **argv) {
   umask(0077);
-  if (argc == 2 && strcmp(argv[1], "poweroff") == 0) {
-    return run_poweroff();
+  if (argc == 2) {
+    if (strcmp(argv[1], "poweroff") == 0) {
+      return run_poweroff();
+    }
+    if (strcmp(argv[1], "drain") == 0) {
+      return run_drain();
+    }
   }
   if (argc != 3) {
     report_message(
-        "usage: guest <setup|armed|recover> <32-hex-nonce> | guest poweroff");
+        "usage: guest <setup|armed|recover> <32-hex-nonce> | "
+        "guest <drain|poweroff>");
     return EXIT_FAILURE;
   }
   if (!valid_nonce(argv[2])) {

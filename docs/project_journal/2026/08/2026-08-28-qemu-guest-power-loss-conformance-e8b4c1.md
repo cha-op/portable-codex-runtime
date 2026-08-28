@@ -64,7 +64,11 @@ superseded_by:
   PID. Its initramfs content gate accepts each required ext4/virtio capability
   only as either a loadable module in the archive or a kernel built-in recorded
   by the exact release's `modules.builtin`, and requires that built-in metadata
-  to be present in the archive.
+  to be present in the archive. The guest skips `modprobe` for capabilities
+  already active in `/sys/module`. Setup, recovery, and error markers are
+  drained through the guest serial terminal before clean power-off; host-side
+  failures retain strictly parsed guest error markers and bounded 8 KiB tails
+  from both serial streams.
 
 ## Safety Boundary
 
@@ -94,12 +98,16 @@ superseded_by:
 
 - `node --check integration/linux-ext4-sudden-guest-power-loss-conformance.mjs`
   passed.
-- The local non-privileged harness tests passed with five passes; the explicit
+- The local non-privileged harness tests passed with six passes; the explicit
   Linux/QEMU case skipped without its opt-in environment.
-- The guest C source passed the local fallback warning-clean object compile;
-  both initramfs scripts passed `bash -n` and `sh -n`. Static Linux linking and
-  the generated-initramfs content gate remain owned by Ubuntu CI.
+- The guest C source passed a warning-clean local compile and its serial-drain
+  command completed on a native PTY. Both initramfs scripts passed `bash -n`
+  and `sh -n`; `shellcheck` was unavailable. Static Linux linking and the
+  generated-initramfs content gate remain owned by Ubuntu CI.
 - Project-journal validation and `git diff --check` passed.
+- The unfiltered local suite exposed only the unchanged external-auth monitor
+  test failing when `fs.watch` reached the host's `EMFILE` limit. The complete
+  rerun with that exact test name skipped passed.
 - The privileged three-boot QEMU path is owned by the dedicated Ubuntu 24.04 CI
   job because the local macOS host does not provide the Linux guest kernel,
   initramfs, ext4, and QEMU runtime used by that gate.

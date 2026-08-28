@@ -50,12 +50,22 @@ on_exit() {
     mounted=0
   fi
   emit "PCR_SUDDEN_GUEST_POWER_ERROR_V1 $nonce $failure_reason status=$status"
+  if [ -x "$AGENT" ]; then
+    "$AGENT" drain || :
+  fi
   power_off_forever
 }
 
 fail() {
   failure_reason=$1
   exit 1
+}
+
+load_module() {
+  if [ -d "/sys/module/$1" ]; then
+    return 0
+  fi
+  modprobe "$1" || fail "$2"
 }
 
 trap 'on_exit' 0
@@ -106,9 +116,9 @@ esac
 
 [ -x "$AGENT" ] || fail missing_agent
 
-modprobe virtio_pci || fail modprobe_virtio_pci
-modprobe virtio_blk || fail modprobe_virtio_blk
-modprobe ext4 || fail modprobe_ext4
+load_module virtio_pci modprobe_virtio_pci
+load_module virtio_blk modprobe_virtio_blk
+load_module ext4 modprobe_ext4
 
 wait_count=0
 while [ ! -b "$DEVICE" ]; do
@@ -134,6 +144,7 @@ setup)
   umount "$MOUNT_POINT" || fail setup_umount
   mounted=0
   emit "PCR_SUDDEN_GUEST_POWER_SETUP_OK_V1 $nonce"
+  "$AGENT" drain || fail setup_marker_drain
   "$AGENT" poweroff || fail setup_poweroff
   fail setup_poweroff_returned
   ;;
@@ -145,6 +156,7 @@ recover)
   umount "$MOUNT_POINT" || fail recover_umount
   mounted=0
   emit "PCR_SUDDEN_GUEST_POWER_RECOVER_OK_V1 $nonce $tail_length"
+  "$AGENT" drain || fail recover_marker_drain
   "$AGENT" poweroff || fail recover_poweroff
   fail recover_poweroff_returned
   ;;
