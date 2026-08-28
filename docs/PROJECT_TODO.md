@@ -283,8 +283,14 @@
   the 4 MiB record/frame-payload, active-tail 65,535-frame/64 MiB, uint32
   checkpoint-count, and runtime-projection boundaries remain distinct and
   unchanged.
-- [pending] Extend beyond that clean/manual-fencing boundary only in separately
-  scoped work: power-loss/crash-prefix evidence, automatic stale-writer
+- [done] Added evidence-only LVM crash-prefix conformance for a stopped writer,
+  an fsynced plain-JSONL prefix plus synthetic partial suffix, the snapshot
+  operation's automatic filesystem freeze/flush, read-only raw-artifact byte
+  stability and readback, and tail repair only on a detached writable copy.
+  This does not widen the production checkpoint API.
+- [pending] Extend beyond that evidence and the clean/manual-fencing production
+  boundary only in separately scoped work: sudden-power-loss/controller-cache-
+  loss evidence, a production crash-prefix adapter, automatic stale-writer
   fencing, differential export/compression, content-addressed distribution,
   encryption, retention and periodic snapshots, registry publisher/signature
   trust, and remote image transport.

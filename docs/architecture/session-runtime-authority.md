@@ -84,8 +84,11 @@ long-lived private mount namespace; a live producer barrier gates whether
 those ext4 mounts propagate to its parent namespace. The initialized ext4
 backend now binds committed persistent identity and a driver same-sample
 runtime identity into Podman's held FD and live mount authority in that same
-non-root producer process; the current evidence does not claim power-loss/
-crash-prefix recovery or automatic stale-writer fencing.
+non-root producer process. A separate root-only LVM harness covers one stopped,
+non-forking fixture's fsynced crash prefix, filesystem freeze/flush, atomic
+snapshot, and detached-writable-copy tail repair. It is not runtime-authority
+or checkpoint-API evidence and does not claim sudden power loss or automatic
+stale-writer fencing.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -2715,8 +2718,10 @@ The resulting scope is deliberately clean and manually fenced. Two hosted
 Ubuntu runners independently anchor the archive mount-root and artifact-child
 control tuples, then verify clean detach, transfer, a verification-only first
 remount, publication identity, and provider-head continuity. They do not prove
-sudden power-loss or crash-prefix recovery, and the backend does not revoke a
-partitioned stale writer automatically. Differential export/compression,
+sudden power loss or expose crash-prefix recovery, and the backend does not
+revoke a partitioned stale writer automatically. The separate LVM conformance
+harness demonstrates stopped-fixture snapshot and writable-copy repair only;
+it does not enter this authority graph. Differential export/compression,
 encryption, retention, registry publisher/signature trust, and remote image
 transport remain separate work.
 
@@ -2859,6 +2864,8 @@ lane collection, independent settlement, two-phase local deletion, protected-
 property revalidation, held-root-anchored Linux deletion, same-session
 composite pagination without oldest-item starvation, and `collected` to
 `absent` acknowledgement loss.
-Power-loss/crash-prefix recovery, automatic stale-writer fencing, differential
-export/compression, encryption, provider-state retention, and registry trust
-remain unproved or unimplemented by design.
+Production crash-prefix recovery, sudden-power-loss/controller-cache-loss
+evidence, automatic stale-writer fencing, differential export/compression,
+encryption, provider-state retention, and registry trust remain unproved or
+unimplemented by design. The separate stopped-fixture LVM harness is not
+evidence for this assembled authority.
