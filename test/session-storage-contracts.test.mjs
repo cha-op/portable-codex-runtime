@@ -1529,6 +1529,8 @@ test("atomic crash capture backend exposes a receiver-bound dormant facade", asy
       return "verified";
     },
   };
+  const originalBackendId = backend.backendId;
+  const originalContractVersion = backend.contractVersion;
 
   assert.strictEqual(assertAtomicCrashCaptureBackend(backend), backend);
   const facade = createAtomicCrashCaptureBackendFacade(backend);
@@ -1553,6 +1555,8 @@ test("atomic crash capture backend exposes a receiver-bound dormant facade", asy
   assert.strictEqual(createAtomicCrashCaptureBackendFacade(facade), facade);
 
   backend.capabilities.atomicPointInTimeCheckpoint = false;
+  backend.backendId = "replacement-backend";
+  backend.contractVersion = 2;
   backend.captureAtomicCrashCheckpoint = async () => {
     replacementCalls += 1;
   };
@@ -1580,7 +1584,9 @@ test("atomic crash capture backend exposes a receiver-bound dormant facade", asy
     },
   ]);
   assert.equal(replacementCalls, 0);
+  assert.equal(facade.backendId, originalBackendId);
   assert.equal(facade.capabilities.atomicPointInTimeCheckpoint, true);
+  assert.equal(facade.contractVersion, originalContractVersion);
   assert.throws(
     () =>
       Reflect.apply(
@@ -1627,6 +1633,10 @@ test("atomic crash capture backend rejects incomplete, non-atomic, and executabl
       ...backend,
       verifyCommittedAtomicCrashCheckpoint: new Proxy(method, {}),
     },
+    {
+      ...backend,
+      captureCheckpoint: new Proxy(method, {}),
+    },
     storageBackend({ atomicPointInTimeCheckpoint: false }),
     {
       ...backend,
@@ -1672,6 +1682,103 @@ test("atomic crash capture backend rejects incomplete, non-atomic, and executabl
     );
   }
   assert.equal(reads, 0);
+
+  let baseReads = 0;
+  for (const field of [
+    "backendId",
+    "capabilities",
+    "captureCheckpoint",
+    "contractVersion",
+    "destroySession",
+    "detachAttachment",
+    "forceFence",
+    "prepareWritableAttachment",
+    "provisionSession",
+    "restoreCheckpoint",
+  ]) {
+    const accessor = { ...backend };
+    Object.defineProperty(accessor, field, {
+      enumerable: true,
+      get() {
+        baseReads += 1;
+        return backend[field];
+      },
+    });
+    assert.throws(
+      () => assertAtomicCrashCaptureBackend(accessor),
+      assertCode("invalid_storage_backend"),
+    );
+    assert.throws(
+      () => createAtomicCrashCaptureBackendFacade(accessor),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+
+  const accessorPrototype = {};
+  Object.defineProperty(accessorPrototype, "contractVersion", {
+    enumerable: true,
+    get() {
+      baseReads += 1;
+      return backend.contractVersion;
+    },
+  });
+  const inheritedAccessor = Object.create(accessorPrototype);
+  Object.defineProperties(
+    inheritedAccessor,
+    Object.getOwnPropertyDescriptors(backend),
+  );
+  delete inheritedAccessor.contractVersion;
+  assert.throws(
+    () => assertAtomicCrashCaptureBackend(inheritedAccessor),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.throws(
+    () => createAtomicCrashCaptureBackendFacade(inheritedAccessor),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(baseReads, 0);
+
+  const stablePrototype = { contractVersion: backend.contractVersion };
+  const inheritedBaseField = Object.create(stablePrototype);
+  Object.defineProperties(
+    inheritedBaseField,
+    Object.getOwnPropertyDescriptors(backend),
+  );
+  delete inheritedBaseField.contractVersion;
+  assert.equal(
+    createAtomicCrashCaptureBackendFacade(inheritedBaseField).contractVersion,
+    backend.contractVersion,
+  );
+
+  let prototypeTraps = 0;
+  const proxyPrototype = new Proxy(
+    { contractVersion: backend.contractVersion },
+    {
+      getOwnPropertyDescriptor() {
+        prototypeTraps += 1;
+        throw new Error("atomic crash prototype descriptor must not run");
+      },
+      getPrototypeOf() {
+        prototypeTraps += 1;
+        throw new Error("atomic crash prototype lookup must not run");
+      },
+    },
+  );
+  const hostilePrototype = Object.create(proxyPrototype);
+  Object.defineProperties(
+    hostilePrototype,
+    Object.getOwnPropertyDescriptors(backend),
+  );
+  delete hostilePrototype.contractVersion;
+  assert.throws(
+    () => assertAtomicCrashCaptureBackend(hostilePrototype),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.throws(
+    () => createAtomicCrashCaptureBackendFacade(hostilePrototype),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(prototypeTraps, 0);
 
   const inherited = Object.create({
     atomicCrashCaptureContractVersion:

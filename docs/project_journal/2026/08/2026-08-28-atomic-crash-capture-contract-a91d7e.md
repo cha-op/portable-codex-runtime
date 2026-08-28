@@ -33,8 +33,11 @@ superseded_by:
 - A backend opts into the dormant extension through exact data properties for
   `atomicCrashCaptureContractVersion`, `captureAtomicCrashCheckpoint()`, and
   `verifyCommittedAtomicCrashCheckpoint()`. The narrow null-prototype facade
-  captures those methods once, fixes their receiver, and requires the backend
-  to declare `atomicPointInTimeCheckpoint: true`.
+  captures those methods and the validated base identity/capabilities once,
+  fixes the methods' receiver, and requires the backend to declare
+  `atomicPointInTimeCheckpoint: true`. Base fields are read only through a
+  non-proxy data-property chain; accessors and proxy prototypes are rejected
+  without invocation.
 - One prepared token authorizes at most one same-process invocation attempt.
   It is consumed synchronously before calling the provider, so rejection,
   malformed output, or acknowledgement loss cannot reopen that token.

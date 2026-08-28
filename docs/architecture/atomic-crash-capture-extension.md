@@ -153,11 +153,14 @@ outcome. Version 1 intentionally has no `absent` outcome.
 ## Same-Process Preparation
 
 The extension facade is process-local. It validates one concrete backend
-object, reads its version, backend ID, capability, and both extension methods
-as data properties, and closes over those method values in a branded frozen
-facade. Reapplying `createAtomicCrashCaptureBackendFacade()` to that facade in
-the same process returns the same object and does not look the methods up
-again.
+object, captures the base contract version, backend ID, capabilities, and
+required operations only through a non-proxy data-property chain, and requires
+the three extension fields to be own data properties. Accessors and a proxy at
+any inspected prototype depth are rejected without being invoked. The facade
+uses the captured identity, capability snapshot, and extension methods rather
+than rereading the backend after validation. Reapplying
+`createAtomicCrashCaptureBackendFacade()` to that facade in the same process
+returns the same object and does not look the methods up again.
 
 `prepareAtomicCrashCapture()` separately binds one normalized request to one
 frozen, object-identity token. `capturePreparedAtomicCrashCheckpoint()`
