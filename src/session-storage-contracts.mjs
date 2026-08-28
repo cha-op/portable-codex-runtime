@@ -34,6 +34,7 @@ const weakSetHasIntrinsic = WeakSet.prototype.has;
 export const SESSION_MANIFEST_SCHEMA_VERSION = 1;
 export const SESSION_LAYOUT_VERSION = 1;
 export const STORAGE_CONTRACT_VERSION = 1;
+export const ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION = 1;
 export const CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION = 1;
 export const PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION = 1;
 export const RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION = 1;
@@ -117,6 +118,7 @@ const STORAGE_BACKEND_CAPABILITY_KEYS = Object.freeze([
 ]);
 const MAX_BACKEND_PROTOTYPE_DEPTH = 64;
 const MAX_ATTACHMENT_ROOT_PATH_BYTES = 4095;
+const atomicCrashCaptureBackendFacades = new WeakSetConstructor();
 const checkpointBackendProjections = new WeakSetConstructor();
 
 export class SessionStorageContractError extends Error {
@@ -784,6 +786,29 @@ function parseFencingEpochForRecord(value, code) {
   return epoch;
 }
 
+function assertPositiveUint64Decimal(value, code, label) {
+  ensure(
+    typeof value === "string" &&
+      value.length >= 1 &&
+      value.length <= 20 &&
+      stringCharCodeAt(value, 0) >= 49 &&
+      stringCharCodeAt(value, 0) <= 57,
+    code,
+    `${label} must be a canonical positive decimal string`,
+  );
+  for (let index = 1; index < value.length; index += 1) {
+    const codePoint = stringCharCodeAt(value, index);
+    ensure(
+      codePoint >= 48 && codePoint <= 57,
+      code,
+      `${label} must be a canonical positive decimal string`,
+    );
+  }
+  const parsed = bigIntIntrinsic(value);
+  ensure(parsed <= UINT64_MAX, code, `${label} exceeds uint64`);
+  return parsed;
+}
+
 export function parseFencingEpoch(value) {
   return parseFencingEpochForRecord(value, "invalid_fence");
 }
@@ -1263,6 +1288,525 @@ export function assertStorageBackendCapabilities(value) {
       "storage backend capabilities",
     ),
   );
+}
+
+function assertAtomicCrashCaptureArtifact(value) {
+  const code = "invalid_atomic_crash_capture";
+  assertExactObject(
+    value,
+    [
+      "byteLength",
+      "contentSha256",
+      "objectId",
+      "objectIdentityScheme",
+      "readOnly",
+    ],
+    code,
+    "atomic crash-capture artifact",
+  );
+  assertPositiveUint64Decimal(
+    value.byteLength,
+    code,
+    "atomic crash-capture artifact byte length",
+  );
+  ensure(
+    isSha256Hex(value.contentSha256),
+    code,
+    "atomic crash-capture artifact content digest must be lowercase sha256",
+  );
+  assertPersistentObjectId(
+    value.objectId,
+    code,
+    "atomic crash-capture artifact object ID",
+  );
+  assertOpaqueId(
+    value.objectIdentityScheme,
+    code,
+    "atomic crash-capture artifact object identity scheme",
+  );
+  ensure(
+    value.readOnly === true,
+    code,
+    "atomic crash-capture artifact must be read-only",
+  );
+  return deepFreeze(
+    defensiveClone(value, code, "atomic crash-capture artifact"),
+  );
+}
+
+/**
+ * Canonicalizes one provider-neutral physical capture request. This record
+ * binds identities only: a future composition must separately authenticate
+ * the opaque stopped-or-fenced writer authority presented at dispatch.
+ */
+export function assertAtomicCrashCaptureRequest(value) {
+  const code = "invalid_atomic_crash_capture";
+  assertExactObject(
+    value,
+    [
+      "captureAttemptId",
+      "checkpoint",
+      "contractVersion",
+      "mutationRequest",
+      "sourceAttachment",
+      "storageRef",
+    ],
+    code,
+    "atomic crash-capture request",
+  );
+  ensure(
+    value.contractVersion === ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    code,
+    "atomic crash-capture contract version is unsupported",
+  );
+  assertOpaqueId(
+    value.captureAttemptId,
+    code,
+    "atomic crash-capture attempt ID",
+  );
+  let checkpoint;
+  let mutationRequest;
+  let sourceAttachment;
+  let storageRef;
+  try {
+    checkpoint = assertCheckpointDescriptor(value.checkpoint);
+    mutationRequest = assertStorageMutationRequest(value.mutationRequest);
+    sourceAttachment = assertSessionAttachment(value.sourceAttachment);
+    storageRef = assertSessionStorageRef(value.storageRef);
+  } catch {
+    fail(code, "atomic crash-capture request contains invalid storage records");
+  }
+  ensure(
+    checkpoint.checkpointClass === "crash-prefix" &&
+      mutationRequest.operation === "checkpoint" &&
+      checkpoint.backendId === storageRef.backendId &&
+      checkpoint.sessionId === storageRef.sessionId &&
+      checkpoint.storageId === storageRef.storageId &&
+      sourceAttachment.backendId === storageRef.backendId &&
+      sourceAttachment.sessionId === storageRef.sessionId &&
+      sourceAttachment.storageId === storageRef.storageId &&
+      mutationRequest.backendId === storageRef.backendId &&
+      mutationRequest.sessionId === storageRef.sessionId &&
+      mutationRequest.storageId === storageRef.storageId &&
+      mutationRequest.fencingEpoch === sourceAttachment.fencingEpoch &&
+      mutationRequest.holderId === sourceAttachment.holderId &&
+      mutationRequest.leaseId === sourceAttachment.leaseId &&
+      checkpoint.sourceFencingEpoch === sourceAttachment.fencingEpoch &&
+      mutationRequest.target.kind === "checkpoint" &&
+      mutationRequest.target.artifactId === checkpoint.artifactId &&
+      mutationRequest.target.checkpointId === checkpoint.checkpointId,
+    code,
+    "atomic crash-capture request identity does not match",
+  );
+  return deepFreeze({
+    captureAttemptId: value.captureAttemptId,
+    checkpoint,
+    contractVersion: value.contractVersion,
+    mutationRequest,
+    sourceAttachment,
+    storageRef,
+  });
+}
+
+function atomicCrashCaptureResultsMatch(expected, actual) {
+  return (
+    expected.artifactId === actual.artifactId &&
+    expected.backendId === actual.backendId &&
+    expected.captureAttemptId === actual.captureAttemptId &&
+    expected.checkpointId === actual.checkpointId &&
+    expected.contractVersion === actual.contractVersion &&
+    expected.operationId === actual.operationId &&
+    expected.proofId === actual.proofId &&
+    expected.sessionId === actual.sessionId &&
+    expected.sourceFencingEpoch === actual.sourceFencingEpoch &&
+    expected.status === actual.status &&
+    expected.storageId === actual.storageId &&
+    expected.artifact.byteLength === actual.artifact.byteLength &&
+    expected.artifact.contentSha256 === actual.artifact.contentSha256 &&
+    expected.artifact.objectId === actual.artifact.objectId &&
+    expected.artifact.objectIdentityScheme ===
+      actual.artifact.objectIdentityScheme &&
+    expected.artifact.readOnly === actual.artifact.readOnly
+  );
+}
+
+export function assertAtomicCrashCaptureResult(value, options) {
+  const code = "invalid_atomic_crash_capture";
+  const { previousResult, request } = assertOptionsObject(
+    options,
+    ["previousResult", "request"],
+    ["request"],
+    code,
+    "atomic crash-capture result options",
+  );
+  assertExactObject(
+    value,
+    [
+      "artifact",
+      "artifactId",
+      "backendId",
+      "captureAttemptId",
+      "checkpointId",
+      "contractVersion",
+      "operationId",
+      "proofId",
+      "sessionId",
+      "sourceFencingEpoch",
+      "status",
+      "storageId",
+    ],
+    code,
+    "atomic crash-capture result",
+  );
+  const expected = assertAtomicCrashCaptureRequest(request);
+  const artifact = assertAtomicCrashCaptureArtifact(value.artifact);
+  ensure(
+    value.contractVersion === ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    code,
+    "atomic crash-capture result contract version is unsupported",
+  );
+  const requiredIds = [
+    [value.artifactId, "artifact ID"],
+    [value.backendId, "backend ID"],
+    [value.captureAttemptId, "attempt ID"],
+    [value.checkpointId, "checkpoint ID"],
+    [value.operationId, "operation ID"],
+    [value.proofId, "proof ID"],
+    [value.storageId, "storage ID"],
+  ];
+  for (let index = 0; index < requiredIds.length; index += 1) {
+    const requiredId = requiredIds[index];
+    assertOpaqueId(
+      requiredId[0],
+      code,
+      `atomic crash-capture ${requiredId[1]}`,
+    );
+  }
+  assertUuid(
+    value.sessionId,
+    code,
+    "atomic crash-capture result session ID",
+  );
+  parseFencingEpochForRecord(value.sourceFencingEpoch, code);
+  ensure(
+    value.status === "committed" &&
+      value.artifactId === expected.checkpoint.artifactId &&
+      value.backendId === expected.storageRef.backendId &&
+      value.captureAttemptId === expected.captureAttemptId &&
+      value.checkpointId === expected.checkpoint.checkpointId &&
+      value.operationId === expected.mutationRequest.operationId &&
+      value.sessionId === expected.storageRef.sessionId &&
+      value.sourceFencingEpoch === expected.checkpoint.sourceFencingEpoch &&
+      value.storageId === expected.storageRef.storageId,
+    code,
+    "atomic crash-capture result does not match its request",
+  );
+  const normalized = deepFreeze({
+    artifact,
+    artifactId: value.artifactId,
+    backendId: value.backendId,
+    captureAttemptId: value.captureAttemptId,
+    checkpointId: value.checkpointId,
+    contractVersion: value.contractVersion,
+    operationId: value.operationId,
+    proofId: value.proofId,
+    sessionId: value.sessionId,
+    sourceFencingEpoch: value.sourceFencingEpoch,
+    status: value.status,
+    storageId: value.storageId,
+  });
+  if (previousResult !== undefined) {
+    const previous = assertAtomicCrashCaptureResult(previousResult, {
+      request: expected,
+    });
+    ensure(
+      atomicCrashCaptureResultsMatch(previous, normalized),
+      code,
+      "atomic crash-capture retry does not replay its original result",
+    );
+  }
+  return normalized;
+}
+
+/**
+ * Source-free verification can prove the exact committed result or remain
+ * unknown. Unknown is not evidence that dispatch did not occur and never
+ * authorizes another capture attempt.
+ */
+export function assertAtomicCrashCaptureVerificationResult(value, options) {
+  const code = "invalid_atomic_crash_capture";
+  const { request } = assertOptionsObject(
+    options,
+    ["request"],
+    ["request"],
+    code,
+    "atomic crash-capture verification result options",
+  );
+  const expected = assertAtomicCrashCaptureRequest(request);
+  assertExactObject(
+    value,
+    ["contractVersion", "outcome", "result"],
+    code,
+    "atomic crash-capture verification result",
+  );
+  ensure(
+    value.contractVersion === ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    code,
+    "atomic crash-capture verification contract version is unsupported",
+  );
+  if (value.outcome === "committed") {
+    return deepFreeze({
+      contractVersion: value.contractVersion,
+      outcome: value.outcome,
+      result: assertAtomicCrashCaptureResult(value.result, {
+        request: expected,
+      }),
+    });
+  }
+  ensure(
+    value.outcome === "unknown" && value.result === null,
+    code,
+    "atomic crash-capture verification outcome is unsupported",
+  );
+  return deepFreeze({
+    contractVersion: value.contractVersion,
+    outcome: value.outcome,
+    result: null,
+  });
+}
+
+function atomicCrashCaptureBackendExtension(value) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    reflectApply(weakSetHasIntrinsic, atomicCrashCaptureBackendFacades, [value])
+  ) {
+    return {
+      backend: value,
+      backendId: value.backendId,
+      capabilities: value.capabilities,
+      capture: value.captureAtomicCrashCheckpoint,
+      contractVersion: value.contractVersion,
+      verify: value.verifyCommittedAtomicCrashCheckpoint,
+    };
+  }
+  ensure(
+    value !== null &&
+      typeof value === "object" &&
+      !arrayIsArray(value) &&
+      !isProxyValue(value),
+    "invalid_storage_backend",
+    "atomic crash-capture backend must be a non-proxy object",
+  );
+  let prototypeCursor = value;
+  for (
+    let depth = 0;
+    prototypeCursor !== null && depth < MAX_BACKEND_PROTOTYPE_DEPTH;
+    depth += 1
+  ) {
+    ensure(
+      !isProxyValue(prototypeCursor),
+      "invalid_storage_backend",
+      "atomic crash-capture backend prototype chain must not contain a proxy",
+    );
+    let nextPrototype;
+    try {
+      nextPrototype = objectGetPrototypeOf(prototypeCursor);
+    } catch {
+      fail(
+        "invalid_storage_backend",
+        "atomic crash-capture backend prototype chain is invalid",
+      );
+    }
+    if (prototypeCursor === objectPrototype) {
+      ensure(
+        nextPrototype === null,
+        "invalid_storage_backend",
+        "atomic crash-capture backend shared prototype is invalid",
+      );
+      prototypeCursor = null;
+      break;
+    }
+    ensure(
+      !(depth > 0 && nextPrototype === null),
+      "invalid_storage_backend",
+      "atomic crash-capture backend fields must not come from a terminal prototype",
+    );
+    prototypeCursor = nextPrototype;
+  }
+  ensure(
+    prototypeCursor === null,
+    "invalid_storage_backend",
+    "atomic crash-capture backend prototype chain is too deep",
+  );
+  const dataValue = (key) => {
+    let cursor = value;
+    for (
+      let depth = 0;
+      cursor !== null && depth < MAX_BACKEND_PROTOTYPE_DEPTH;
+      depth += 1
+    ) {
+      ensure(
+        !isProxyValue(cursor),
+        "invalid_storage_backend",
+        "atomic crash-capture backend prototype chain must not contain a proxy",
+      );
+      let nextPrototype;
+      try {
+        nextPrototype = objectGetPrototypeOf(cursor);
+      } catch {
+        fail(
+          "invalid_storage_backend",
+          "atomic crash-capture backend prototype chain is invalid",
+        );
+      }
+      ensure(
+        cursor !== objectPrototype && !(depth > 0 && nextPrototype === null),
+        "invalid_storage_backend",
+        "atomic crash-capture backend fields must not come from a shared or terminal prototype",
+      );
+      let descriptor;
+      try {
+        descriptor = objectGetOwnPropertyDescriptor(cursor, key);
+      } catch {
+        fail(
+          "invalid_storage_backend",
+          "atomic crash-capture backend fields must be data properties",
+        );
+      }
+      if (descriptor !== undefined) {
+        ensure(
+          objectHasOwn(descriptor, "value"),
+          "invalid_storage_backend",
+          "atomic crash-capture backend fields must be data properties",
+        );
+        return descriptor.value;
+      }
+      cursor = nextPrototype;
+    }
+    ensure(
+      cursor === null,
+      "invalid_storage_backend",
+      "atomic crash-capture backend prototype chain is too deep",
+    );
+    fail(
+      "invalid_storage_backend",
+      "atomic crash-capture backend is missing a required field",
+    );
+  };
+  const contractVersion = dataValue("contractVersion");
+  ensure(
+    contractVersion === STORAGE_CONTRACT_VERSION,
+    "invalid_storage_backend",
+    "atomic crash-capture backend contract version is unsupported",
+  );
+  const backendId = dataValue("backendId");
+  assertOpaqueId(
+    backendId,
+    "invalid_storage_backend",
+    "atomic crash-capture backend ID",
+  );
+  const capabilities = assertStorageBackendCapabilities(
+    dataValue("capabilities"),
+  );
+  for (let index = 0; index < STORAGE_BACKEND_METHODS.length; index += 1) {
+    const operation = dataValue(STORAGE_BACKEND_METHODS[index]);
+    ensure(
+      typeof operation === "function" && !isProxyValue(operation),
+      "invalid_storage_backend",
+      "atomic crash-capture backend is missing a required operation",
+    );
+  }
+  const version = plainDataDescriptor(
+    value,
+    "atomicCrashCaptureContractVersion",
+    "invalid_storage_backend",
+    "atomic crash-capture backend",
+  ).value;
+  const capture = plainDataDescriptor(
+    value,
+    "captureAtomicCrashCheckpoint",
+    "invalid_storage_backend",
+    "atomic crash-capture backend",
+  ).value;
+  const verify = plainDataDescriptor(
+    value,
+    "verifyCommittedAtomicCrashCheckpoint",
+    "invalid_storage_backend",
+    "atomic crash-capture backend",
+  ).value;
+  ensure(
+    version === ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION &&
+      capabilities.atomicPointInTimeCheckpoint === true &&
+      typeof capture === "function" &&
+      !isProxyValue(capture) &&
+      typeof verify === "function" &&
+      !isProxyValue(verify),
+    "invalid_storage_backend",
+    "storage backend does not support atomic crash capture",
+  );
+  return {
+    backend: value,
+    backendId,
+    capabilities,
+    capture,
+    contractVersion,
+    verify,
+  };
+}
+
+/**
+ * Optional physical-provider extension for atomic crash capture. It is not a
+ * base storage-backend method and does not enable any public checkpoint path.
+ */
+export function assertAtomicCrashCaptureBackend(value) {
+  return atomicCrashCaptureBackendExtension(value).backend;
+}
+
+export function createAtomicCrashCaptureBackendFacade(value) {
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    reflectApply(weakSetHasIntrinsic, atomicCrashCaptureBackendFacades, [value])
+  ) {
+    return value;
+  }
+  const implementation = atomicCrashCaptureBackendExtension(value);
+  const facadeCapabilities = objectCreate(null);
+  for (
+    let index = 0;
+    index < STORAGE_BACKEND_CAPABILITY_KEYS.length;
+    index += 1
+  ) {
+    const key = STORAGE_BACKEND_CAPABILITY_KEYS[index];
+    facadeCapabilities[key] = implementation.capabilities[key];
+  }
+  objectFreeze(facadeCapabilities);
+  let facade;
+  const operation = (method) => {
+    const callback = function atomicCrashCaptureBackendMethod(...args) {
+      if (!objectIs(this, facade)) {
+        throw new TypeErrorConstructor(
+          "Invalid atomic crash-capture backend receiver",
+        );
+      }
+      return reflectApply(method, implementation.backend, args);
+    };
+    return objectFreeze(callback);
+  };
+  facade = objectCreate(null);
+  facade.atomicCrashCaptureContractVersion =
+    ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION;
+  facade.backendId = implementation.backendId;
+  facade.capabilities = facadeCapabilities;
+  facade.captureAtomicCrashCheckpoint = operation(implementation.capture);
+  facade.contractVersion = implementation.contractVersion;
+  facade.verifyCommittedAtomicCrashCheckpoint = operation(
+    implementation.verify,
+  );
+  objectFreeze(facade);
+  reflectApply(weakSetAddIntrinsic, atomicCrashCaptureBackendFacades, [facade]);
+  return facade;
 }
 
 /**

@@ -227,6 +227,17 @@ harness
 also does not call this core, emit a checkpoint descriptor, or supply canonical
 fence, catalogue, publication, or launcher authority.
 
+A separate dormant atomic crash-capture extension now validates one closed
+version 1 physical request and result outside this clean snapshot core. Its
+one-use process-local token prevents a second dispatch through the same
+preparation after rejection or acknowledgement loss, while source-free
+verification can prove only the exact committed result or return
+non-authorizing `unknown`. The result separates provider object identity,
+byte-length/SHA-256 content stability, and read-only policy. It does not make
+the clean core accept `crash-prefix`, enable a backend capability, or provide a
+physical fence, provider catalogue, tail repair, restore generation, or newer
+writer epoch. See `atomic-crash-capture-extension.md`.
+
 ## Dependency History and Remaining Order
 
 The completed foundations and remaining storage work follow the serial
@@ -253,7 +264,9 @@ pull-request order in the runtime delivery plan:
     this core); and
 13. external-QEMU-SIGKILL sudden guest power-loss conformance (completed
     separately from this core); and
-14. host, controller, and drive cache-loss evidence, production crash-prefix
+14. dormant provider-neutral atomic crash-capture extension and same-process
+    one-use dispatch core (completed separately from this core); and
+15. host, controller, and drive cache-loss evidence, production crash-prefix
     composition, automatic stale-writer fencing, and differential export/
     compression (remaining).
 

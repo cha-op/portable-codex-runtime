@@ -615,6 +615,18 @@ does not prove host, controller, or drive cache loss, FUA, whole-filesystem
 durability, production checkpoint composition, automatic fencing, or
 distribution.
 
+A later contract-only slice defines a dormant provider-neutral version 1
+atomic crash-capture extension without changing that boundary. It freezes one
+exact `crash-prefix` source tuple behind a same-process one-use dispatch token,
+requires a committed raw-artifact observation to bind object identity, content
+length and SHA-256, and read-only access policy independently, and permits
+source-free verification to return only exact `committed` evidence or
+non-authorizing `unknown`. The extension is not visible through the existing
+clean checkpoint facade or public deployment, and no current backend advertises
+it. Concrete atomic capture, durable catalogue state, physical fencing,
+repair-gated restore, and higher-epoch writer admission remain later slices;
+see `atomic-crash-capture-extension.md`.
+
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental
 result inside production implementation.
