@@ -625,6 +625,20 @@
   evidence does not simulate sudden power loss or storage-controller cache
   loss, fence a stale writer, emit a checkpoint descriptor, or widen the
   production backend's `atomicPointInTimeCheckpoint: false` capability.
+- A second root-only Ubuntu job now provides external-QEMU-SIGKILL sudden guest
+  power-loss evidence. Setup, armed, and recovery boots use the same
+  `data.raw` object. The armed guest fsyncs one exact 4,096-byte valid JSONL
+  prefix and its rollout directory entry, writes an unsynced synthetic tail,
+  and remains live until the external host controller sends `SIGKILL` to and
+  joins the exact non-daemonised QEMU child. Host-side recovery admission
+  accepts zero through the attempted tail length of arbitrary bytes only when
+  they contain no LF, complete JSON value, or abort marker; it preserves the
+  prefix and uses the production repair primitive to converge the rollout
+  exactly back to that prefix before a durable continuation. The host runner
+  and storage stay
+  online; QMP verifies only the configured `writeback=true`, `direct=true`,
+  `no-flush=false` tuple. This is not host, controller, or drive cache-loss
+  evidence and supplies no production checkpoint or fencing authority.
 - Terminal local Podman supervisor state now has a bounded two-phase collector.
   It validates the exact stopped revision 4 terminal record and revisions 0
   through 3 or their admitted oldest-first missing retry prefix, removes the
@@ -672,6 +686,8 @@
   `docs/project_journal/2026/08/2026-08-14-linux-ext4-physical-backend-7c4e91.md`
 - LVM crash-prefix conformance:
   `docs/project_journal/2026/08/2026-08-28-lvm-crash-prefix-conformance-d6a3f2.md`
+- QEMU sudden guest power-loss conformance:
+  `docs/project_journal/2026/08/2026-08-28-qemu-guest-power-loss-conformance-e8b4c1.md`
 - ext4-to-Podman attachment composition:
   `docs/project_journal/2026/08/2026-08-19-ext4-podman-composition-a4c821.md`
 - Terminal writer-supervisor state GC:
@@ -814,7 +830,12 @@
   writer, explicitly fsynced rollout, atomic block snapshot, and detached-
   writable-copy tail-repair sequence. It makes no independently verified
   whole-filesystem freeze/flush claim, is not sudden-power-loss or controller-
-  cache-loss evidence, and does not change production capabilities. Terminal
+  cache-loss evidence, and does not change production capabilities. A second
+  evidence-only job cold-boots the same raw ext4 object after an external host
+  controller sends `SIGKILL` to its exact non-daemonised QEMU child. This
+  proves the configured sudden guest power-loss boundary while the host and
+  storage remain online; it does not prove host, controller, or drive cache
+  loss and changes no production API or capability. Terminal
   supervisor-state GC safety after PostgreSQL terminal
   commit is complete for both healthy-session callback quiescence and exact
   same-authorization session-loss overlap. The provider operation-index
@@ -822,4 +843,5 @@
   committed-history removal from local checkpoints, and restartable paged
   adoption beyond the full-array version 1 transport limits are complete.
   Remaining Linux/provider follow-up stays in the already-listed, separately
-  scoped production crash-capture, automatic-fencing, and distribution work.
+  scoped host/controller/drive cache-loss evidence, production crash-capture,
+  automatic-fencing, and distribution work.

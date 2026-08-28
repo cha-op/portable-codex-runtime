@@ -204,6 +204,131 @@ jobs:
             exit 1
           fi
 
+  linux-ext4-sudden-guest-power-loss-conformance:
+    name: Linux ext4 external-QEMU-SIGKILL sudden guest power-loss conformance
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+      - run: npm ci
+      - name: Install the QEMU guest power-loss test dependencies
+        timeout-minutes: 15
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes \
+            acl \
+            build-essential \
+            busybox-static \
+            cpio \
+            e2fsprogs \
+            initramfs-tools \
+            linux-image-virtual \
+            qemu-system-x86 \
+            udev \
+            util-linux
+
+          mapfile -t kernel_packages < <(
+            dpkg-query --showformat='${Depends}\n' --show linux-image-virtual | \
+              tr ',|' '\n' | \
+              sed -n 's/^[[:space:]]*\(linux-image-[0-9][^ :(|]*\)\(:[^ (|]*\)\{0,1\}.*/\1/p' | \
+              sort -u
+          )
+          test "${#kernel_packages[@]}" -eq 1
+          kernel_package="${kernel_packages[0]}"
+          test "$(dpkg-query --showformat='${db:Status-Status}' \
+            --show "$kernel_package")" = installed
+
+          mapfile -t kernel_paths < <(
+            dpkg-query --listfiles "$kernel_package" | \
+              sed -n '\|^/boot/vmlinuz-[^/]\+$|p'
+          )
+          test "${#kernel_paths[@]}" -eq 1
+          kernel_path="${kernel_paths[0]}"
+          kernel_release="${kernel_path#/boot/vmlinuz-}"
+          test "$kernel_release" != "$kernel_path"
+          sudo test -r "$kernel_path"
+          test -d "/lib/modules/$kernel_release"
+          printf 'LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_KERNEL=%s\n' \
+            "$kernel_path" >> "$GITHUB_ENV"
+          printf 'LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_KERNEL_RELEASE=%s\n' \
+            "$kernel_release" >> "$GITHUB_ENV"
+      - name: Exercise external QEMU SIGKILL and same-medium ext4 recovery
+        timeout-minutes: 20
+        env:
+          LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONFORMANCE: "1"
+          LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONTROL_ROOT: /var/tmp/pcrpl-qmp-${{ github.run_id }}-${{ github.run_attempt }}
+          LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-sudden-guest-power-loss-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          node_path="$(command -v node)"
+          test -x "$node_path"
+          sudo /usr/bin/env \
+            LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONFORMANCE="$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONFORMANCE" \
+            LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONTROL_ROOT="$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONTROL_ROOT" \
+            LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT="$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT" \
+            LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_KERNEL="$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_KERNEL" \
+            LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_KERNEL_RELEASE="$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_KERNEL_RELEASE" \
+            /usr/bin/unshare --mount --propagation private -- \
+            "$node_path" --test integration/linux-ext4-sudden-guest-power-loss-conformance.mjs
+      - name: Report any QEMU harness scoped residue
+        if: always()
+        timeout-minutes: 3
+        env:
+          LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONTROL_ROOT: /var/tmp/pcrpl-qmp-${{ github.run_id }}-${{ github.run_attempt }}
+          LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT: /var/tmp/portable-codex-runtime-linux-ext4-sudden-guest-power-loss-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          residue_found=0
+          probe_failed=0
+          for process_root in /proc/[0-9]*; do
+            pid="${process_root##*/}"
+            if [[ ! -r "$process_root/cmdline" ]]; then
+              continue
+            fi
+            if sudo /usr/bin/grep -zFqx '/usr/bin/qemu-system-x86_64' "$process_root/cmdline" && \
+              sudo /usr/bin/grep -zFq -- "$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT/data.raw" "$process_root/cmdline" && \
+              sudo /usr/bin/grep -zEq 'guest=pcrpl_[0-9]+_[0-9a-f]{8}' "$process_root/cmdline"; then
+              echo "scoped QEMU process remains: pid=$pid" >&2
+              residue_found=1
+            fi
+          done
+
+          mount_targets="$(/usr/bin/findmnt -rn -o TARGET)" || probe_failed=1
+          while IFS= read -r target; do
+            case "$target" in
+              "$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT"/*)
+                echo "scoped mount remains: $target" >&2
+                residue_found=1
+                ;;
+            esac
+          done <<< "$mount_targets"
+
+          loop_devices="$(sudo /usr/sbin/losetup --list --noheadings --output NAME,BACK-FILE)" || \
+            probe_failed=1
+          while read -r loop backing; do
+            case "$backing" in
+              "$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT"/*)
+                echo "scoped loop device remains: $loop" >&2
+                residue_found=1
+                ;;
+            esac
+          done <<< "$loop_devices"
+
+          if [[ -e "$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT" || \
+            -L "$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_TEST_ROOT" ]]; then
+            echo "scoped working root remains" >&2
+            residue_found=1
+          fi
+          if [[ -e "$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONTROL_ROOT" || \
+            -L "$LINUX_EXT4_SUDDEN_GUEST_POWER_LOSS_CONTROL_ROOT" ]]; then
+            echo "scoped QMP control root remains" >&2
+            residue_found=1
+          fi
+          if ((probe_failed != 0 || residue_found != 0)); then
+            exit 1
+          fi
+
   linux-ext4-producer:
     name: Linux ext4 physical producer
     runs-on: ubuntu-24.04

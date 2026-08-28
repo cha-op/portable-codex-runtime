@@ -90,6 +90,12 @@ atomic block snapshot, and detached-writable-copy tail repair. It makes no
 independently verified whole-filesystem freeze/flush claim, is not runtime-
 authority or checkpoint-API evidence, and does not claim sudden power loss or
 automatic stale-writer fencing.
+An independent external-QEMU-SIGKILL harness cold-boots the same raw ext4
+object after the external host controller kills and joins one exact non-
+daemonised QEMU child. It proves only sudden loss of that guest's CPU, RAM, and
+device-model state while the host and storage remain online, followed by ext4
+journal replay and production tail repair. It is not runtime-authority,
+checkpoint-API, host/controller-cache-loss, or automatic-fencing evidence.
 
 Registration and generic operation reservation are not writer admission: they
 do not allocate a lease or epoch, create an attachment, invoke a provider, or
@@ -2722,9 +2728,12 @@ remount, publication identity, and provider-head continuity. They do not prove
 sudden power loss or expose crash-prefix recovery, and the backend does not
 revoke a partitioned stale writer automatically. The separate LVM conformance
 harness demonstrates stopped-fixture snapshot and writable-copy repair only;
-it does not enter this authority graph. Differential export/compression,
-encryption, retention, registry publisher/signature trust, and remote image
-transport remain separate work.
+it does not enter this authority graph. The external-QEMU-SIGKILL harness also
+remains outside the graph: its same-raw-object cold boot and tail repair prove
+only sudden guest power loss with the host and storage still online, not a
+checkpoint descriptor, canonical epoch, physical fence, or launcher admission.
+Differential export/compression, encryption, retention, registry publisher/
+signature trust, and remote image transport remain separate work.
 
 ## Operational Boundary
 
@@ -2865,8 +2874,9 @@ lane collection, independent settlement, two-phase local deletion, protected-
 property revalidation, held-root-anchored Linux deletion, same-session
 composite pagination without oldest-item starvation, and `collected` to
 `absent` acknowledgement loss.
-Production crash-prefix recovery, sudden-power-loss/controller-cache-loss
-evidence, automatic stale-writer fencing, differential export/compression,
-encryption, provider-state retention, and registry trust remain unproved or
-unimplemented by design. The separate stopped-fixture LVM harness is not
-evidence for this assembled authority.
+Production crash-prefix recovery, host/controller/drive cache-loss evidence,
+automatic stale-writer fencing, differential export/compression, encryption,
+provider-state retention, and registry trust remain unproved or unimplemented
+by design. Neither the separate stopped-fixture LVM harness nor the external-
+QEMU-SIGKILL sudden guest power-loss harness is evidence for this assembled
+authority.

@@ -453,6 +453,20 @@ verify a whole-filesystem freeze/flush, construct a checkpoint descriptor,
 obtain a newer canonical epoch, retain a production fence through admission,
 or implement an adapter.
 
+The independent external-QEMU-SIGKILL harness covers another evidence-only
+substrate. Setup, armed, and recovery boots preserve the same `data.raw`
+object. The armed guest fsyncs an exact 4,096-byte valid JSONL prefix and its
+rollout directory entry before an external host controller kills and joins the
+exact non-daemonised QEMU child. Host-side recovery admission accepts zero
+through the attempted tail length of arbitrary bytes only when they contain no
+LF, complete JSON value, or abort marker. The recovery boot performs ext4
+journal replay on that same object, then composes the production tail-repair
+primitive before a durable continuation. The host and storage remain online.
+This does not
+construct a checkpoint descriptor, prove host/controller/drive cache loss,
+obtain a canonical epoch or fence, retain admission authority, or implement an
+adapter.
+
 The backend-neutral snapshot and restore core implements only stopped-writer
 `clean` orchestration over these records. It validates the operation boundary
 and fails closed after uncertain backend dispatch, while the backend retains
@@ -527,7 +541,7 @@ Remaining adapter and evidence work includes:
   adapters;
 - automatic exact-owner host fencing beyond the ext4 backend's clean detach and
   `fencing: "manual"` boundary;
-- production graceful-abort barriers, sudden-power-loss/controller-cache-loss
+- production graceful-abort barriers, host/controller/drive cache-loss
   evidence, and production crash-prefix atomic capture;
 - composition of the separate pinned-runtime rollout-tail repair primitive
   with trusted OCI resolution and launcher admission;
