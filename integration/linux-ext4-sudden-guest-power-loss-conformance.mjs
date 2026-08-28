@@ -739,6 +739,41 @@ async function compileGuestAgent(destination) {
   await access(destination, fsConstants.X_OK);
 }
 
+function assertInitramfsBootCapability(
+  entries,
+  modulesBuiltin,
+  kernelRelease,
+  moduleName,
+) {
+  const moduleFilenames = new Set([
+    `${moduleName}.ko`,
+    `${moduleName}.ko.gz`,
+    `${moduleName}.ko.xz`,
+    `${moduleName}.ko.zst`,
+  ]);
+  if (entries.some((entry) => moduleFilenames.has(basename(entry)))) {
+    return "module";
+  }
+  const isBuiltin = modulesBuiltin
+    .split("\n")
+    .map((entry) => entry.trim())
+    .some((entry) => basename(entry) === `${moduleName}.ko`);
+  assert.equal(
+    isBuiltin,
+    true,
+    `kernel/initramfs is missing ${moduleName}`,
+  );
+  assert.equal(
+    [
+      `lib/modules/${kernelRelease}/modules.builtin`,
+      `usr/lib/modules/${kernelRelease}/modules.builtin`,
+    ].some((entry) => entries.includes(entry)),
+    true,
+    `initramfs is missing modules.builtin for ${moduleName}`,
+  );
+  return "builtin";
+}
+
 async function buildInitramfs(destination, guestAgent, kernelRelease) {
   await runCommand(COMMANDS.mkinitramfs, [
     "-d",
@@ -750,7 +785,10 @@ async function buildInitramfs(destination, guestAgent, kernelRelease) {
     env: { PCR_SUDDEN_GUEST_POWER_AGENT: guestAgent },
   });
   await access(destination, fsConstants.R_OK);
-  const { stdout } = await runCommand(COMMANDS.lsinitramfs, [destination]);
+  const [{ stdout }, modulesBuiltin] = await Promise.all([
+    runCommand(COMMANDS.lsinitramfs, [destination]),
+    readFile(`/lib/modules/${kernelRelease}/modules.builtin`, "utf8"),
+  ]);
   const entries = stdout
     .split("\n")
     .map((entry) => entry.trim().replace(/^\.\//u, ""))
@@ -766,14 +804,11 @@ async function buildInitramfs(destination, guestAgent, kernelRelease) {
     );
   }
   for (const moduleName of ["ext4", "virtio_blk", "virtio_pci"]) {
-    const modulePattern = new RegExp(
-      `/${moduleName}\\.ko(?:\\.(?:gz|xz|zst))?$`,
-      "u",
-    );
-    assert.equal(
-      entries.some((entry) => modulePattern.test(entry)),
-      true,
-      `initramfs is missing ${moduleName}`,
+    assertInitramfsBootCapability(
+      entries,
+      modulesBuiltin,
+      kernelRelease,
+      moduleName,
     );
   }
 }
@@ -1221,6 +1256,40 @@ test("ext4 journal recovery evidence uses the needs_recovery feature", () => {
         "Filesystem features:      has_journal needs_recovery\n",
     ),
     /match/u,
+  );
+});
+
+test("initramfs boot capabilities accept loadable and built-in modules", () => {
+  assert.equal(
+    assertInitramfsBootCapability(
+      ["usr/lib/modules/test/kernel/fs/ext4/ext4.ko.zst"],
+      "",
+      "test",
+      "ext4",
+    ),
+    "module",
+  );
+  assert.equal(
+    assertInitramfsBootCapability(
+      ["usr/lib/modules/test/modules.builtin"],
+      "kernel/fs/ext4/ext4.ko\n",
+      "test",
+      "ext4",
+    ),
+    "builtin",
+  );
+  assert.throws(
+    () => assertInitramfsBootCapability([], "", "test", "ext4"),
+    /kernel\/initramfs is missing ext4/u,
+  );
+  assert.throws(
+    () => assertInitramfsBootCapability(
+      [],
+      "kernel/fs/ext4/ext4.ko\n",
+      "test",
+      "ext4",
+    ),
+    /initramfs is missing modules\.builtin for ext4/u,
   );
 });
 

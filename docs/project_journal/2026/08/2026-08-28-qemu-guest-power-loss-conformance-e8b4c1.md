@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-28
 updated: 2026-08-28
 branch: wip/linux-ext4-sudden-guest-power-loss
-pr:
+pr: 59
 supersedes: []
 superseded_by:
 ---
@@ -61,7 +61,10 @@ superseded_by:
   harness timeouts, and an `always()` report-only residue gate for scoped QEMU
   processes, mounts, loops, the exact test root, and a separate length-bounded
   QMP control root. The gate reports and fails without signalling a discovered
-  PID.
+  PID. Its initramfs content gate accepts each required ext4/virtio capability
+  only as either a loadable module in the archive or a kernel built-in recorded
+  by the exact release's `modules.builtin`, and requires that built-in metadata
+  to be present in the archive.
 
 ## Safety Boundary
 
@@ -91,7 +94,7 @@ superseded_by:
 
 - `node --check integration/linux-ext4-sudden-guest-power-loss-conformance.mjs`
   passed.
-- The local non-privileged harness tests passed with four passes; the explicit
+- The local non-privileged harness tests passed with five passes; the explicit
   Linux/QEMU case skipped without its opt-in environment.
 - The guest C source passed the local fallback warning-clean object compile;
   both initramfs scripts passed `bash -n` and `sh -n`. Static Linux linking and
