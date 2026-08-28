@@ -290,8 +290,16 @@
   writable copy, and tail repair only on that copy. It does not claim an
   independently verified whole-filesystem freeze/flush or widen the production
   checkpoint API.
+- [done] Added external-QEMU-SIGKILL sudden guest power-loss conformance. Three
+  boots use the same `data.raw` object: an external host controller kills and
+  joins the exact non-daemonised QEMU child after the guest fsyncs one exact
+  4,096-byte valid JSONL prefix and its rollout directory entry. Host-side
+  recovery admission accepts zero through the attempted tail length of arbitrary
+  bytes only when they contain no LF, complete JSON value, or abort marker, and
+  production tail repair converges the rollout back to that prefix. The host
+  runner and storage remain online throughout.
 - [pending] Extend beyond that evidence and the clean/manual-fencing production
-  boundary only in separately scoped work: sudden-power-loss/controller-cache-
+  boundary only in separately scoped work: host, controller, and drive cache-
   loss evidence, a production crash-prefix adapter, automatic stale-writer
   fencing, differential export/compression, content-addressed distribution,
   encryption, retention and periodic snapshots, registry publisher/signature

@@ -216,6 +216,17 @@ on a detached writable copy. It does not independently verify a whole-
 filesystem freeze/flush, call this core, or emit a checkpoint descriptor; see
 `linux-ext4-physical-backend.md`.
 
+A separate external-QEMU-SIGKILL harness now proves a sudden guest power-loss
+fixture can preserve one exact fsynced 4,096-byte JSONL prefix across a cold
+boot of the same raw ext4 object. Host-side admission accepts an arbitrary
+unsynced tail of zero through the attempted length only when it contains no LF,
+complete JSON value, or abort marker, then converges that tail with the
+production repair primitive. The external host controller kills and joins the
+exact non-daemonised QEMU child; the host runner and storage remain online. This
+harness
+also does not call this core, emit a checkpoint descriptor, or supply canonical
+fence, catalogue, publication, or launcher authority.
+
 ## Dependency History and Remaining Order
 
 The completed foundations and remaining storage work follow the serial
@@ -240,7 +251,9 @@ pull-request order in the runtime delivery plan:
     persistent-identity bridge and same-process evidence remaining); and
 12. stopped-fixture LVM crash-prefix conformance (completed separately from
     this core); and
-13. sudden-power-loss/controller-cache-loss evidence, production crash-prefix
+13. external-QEMU-SIGKILL sudden guest power-loss conformance (completed
+    separately from this core); and
+14. host, controller, and drive cache-loss evidence, production crash-prefix
     composition, automatic stale-writer fencing, and differential export/
     compression (remaining).
 

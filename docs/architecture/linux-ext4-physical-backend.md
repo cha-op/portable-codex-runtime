@@ -957,17 +957,48 @@ process-group, container, cgroup, or detached-child containment claim. The
 harness emits no checkpoint descriptor, performs no catalogue mutation, and
 does not add a capture or restore method to the backend.
 
-These jobs prove clean detach, remount, publication, and cross-host identity.
+A second independent root-only Ubuntu job supplies external-QEMU-SIGKILL
+sudden guest power-loss evidence. Setup, armed, and recovery boots all use the
+same `data.raw` regular-file object. During the armed boot the guest writes and
+fsyncs an exact 4,096-byte valid JSONL prefix `P`, fsyncs the containing rollout
+directory entry `D`, writes but does not fsync a synthetic tail, emits one
+nonce-bound ready marker, and remains alive. The external host controller then
+sends `SIGKILL` to the exact non-daemonised QEMU child and joins its
+`{ code: null, signal: "SIGKILL" }` exit before a cold recovery boot on that
+same path and inode. No signal is delivered to a guest process.
+
+The recovery boot preserves `P` exactly while accepting any recovered tail
+length from zero through the attempted length. Those bytes need not match a
+prefix of the attempted write; they may be arbitrary, including zero-filled,
+but must contain no LF, complete JSON value, or abort marker. After guest ext4
+journal replay, the host mounts the same `data.raw` object writable and the
+production `repairStoppedRolloutTails()` primitive converges the rollout
+exactly to `P`. A subsequent valid record is synced and survives a read-only
+cold remount. A separate post-kill raw artefact is mode `0400`, has a distinct
+inode, is never mounted, and retains its exact identity, access policy, size,
+and SHA-256 while recovery and repair mutate only `data.raw`.
+
+The host runner and its storage remain online throughout. QMP is used only to
+verify the configured QEMU block-cache tuple `writeback=true`, `direct=true`,
+and `no-flush=false`; it is not the crash injector. This does not simulate host,
+controller, or drive volatile-cache loss, verify FUA or a device that lies
+about acknowledged durability, establish whole-filesystem durability or
+freeze evidence, or prove a production checkpoint, automatic fence, catalogue,
+launcher admission, distribution, or publication path.
+
+The clean production and Podman jobs prove clean detach, remount, publication,
+and cross-host identity.
 The namespace retirement only releases the hosted runner's exclusive Podman
 engine. Final physical quiescence still comes from the native loop receipt:
 unused device identity, advanced disk sequence, and absent sysfs backing.
 Container stop/removal alone is not loop-detach evidence.
-They do not simulate sudden power loss, storage-controller cache loss,
-partitioned stale-writer revocation, or an automatic force fence. The separate
-LVM harness proves a stopped-fixture crash-prefix recovery sequence only under
-its explicit fixture-file and rollout-directory fsync plus block-level
-point-in-time snapshot boundary; it does not widen the production capability
-tuple. Production crash-prefix checkpointing,
-epoch-enforced fencing, differential export, compression, encryption,
-retention, registry signature policy, and remote image transport remain
-outside this backend's declared capabilities.
+They do not simulate sudden guest or host power loss, storage-controller cache
+loss, partitioned stale-writer revocation, or an automatic force fence. The
+separate LVM harness proves a stopped-fixture crash-prefix recovery sequence
+only under its explicit fixture-file and rollout-directory fsync plus block-
+level point-in-time snapshot boundary. The QEMU harness proves only the
+sudden-guest-power-loss boundary described above. Neither widens the production
+capability tuple. Host/controller/drive cache-loss evidence remains separate.
+Production crash-prefix checkpointing, epoch-enforced fencing, differential
+export, compression, encryption, retention, registry signature policy, and
+remote image transport remain outside this backend's declared capabilities.

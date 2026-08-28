@@ -1,0 +1,154 @@
+#!/bin/sh
+
+set -eu
+set -f
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+AGENT=/usr/libexec/pcr-power-loss-agent
+MOUNT_POINT=/mnt
+DEVICE=/dev/vda
+PREREQ=""
+
+prereqs() {
+  echo "$PREREQ"
+}
+
+case "${1:-}" in
+prereqs)
+  prereqs
+  exit 0
+  ;;
+esac
+
+mode=
+nonce=unknown
+mode_seen=0
+nonce_seen=0
+mounted=0
+failure_reason=unexpected_exit
+
+emit() {
+  printf '%s\n' "$1"
+}
+
+power_off_forever() {
+  if [ -x "$AGENT" ]; then
+    "$AGENT" poweroff || :
+  fi
+  while :; do
+    sleep 3600
+  done
+}
+
+on_exit() {
+  status=$?
+  trap - 0
+  if [ "$mounted" -eq 1 ]; then
+    umount "$MOUNT_POINT" || :
+    mounted=0
+  fi
+  emit "PCR_SUDDEN_GUEST_POWER_ERROR_V1 $nonce $failure_reason status=$status"
+  power_off_forever
+}
+
+fail() {
+  failure_reason=$1
+  exit 1
+}
+
+trap 'on_exit' 0
+
+if [ -c /dev/ttyS0 ]; then
+  exec >/dev/ttyS0 2>&1
+fi
+
+cmdline=$(cat /proc/cmdline) || fail read_cmdline
+saved_ifs=$IFS
+IFS=' '
+set -- $cmdline
+IFS=$saved_ifs
+
+for token do
+  case "$token" in
+  pcr_mode=*)
+    [ "$mode_seen" -eq 0 ] || fail duplicate_mode
+    mode=${token#pcr_mode=}
+    mode_seen=1
+    ;;
+  pcr_nonce=*)
+    [ "$nonce_seen" -eq 0 ] || fail duplicate_nonce
+    nonce=${token#pcr_nonce=}
+    nonce_seen=1
+    ;;
+  pcr_mode | pcr_nonce)
+    fail malformed_parameter
+    ;;
+  pcr_*)
+    fail unknown_pcr_parameter
+    ;;
+  esac
+done
+
+[ "$mode_seen" -eq 1 ] || fail missing_mode
+[ "$nonce_seen" -eq 1 ] || fail missing_nonce
+
+case "$mode" in
+setup | armed | recover) ;;
+*) fail invalid_mode ;;
+esac
+
+[ "${#nonce}" -eq 32 ] || fail invalid_nonce_length
+case "$nonce" in
+*[!0123456789abcdefABCDEF]*) fail invalid_nonce_characters ;;
+esac
+
+[ -x "$AGENT" ] || fail missing_agent
+
+modprobe virtio_pci || fail modprobe_virtio_pci
+modprobe virtio_blk || fail modprobe_virtio_blk
+modprobe ext4 || fail modprobe_ext4
+
+wait_count=0
+while [ ! -b "$DEVICE" ]; do
+  wait_count=$((wait_count + 1))
+  [ "$wait_count" -le 30 ] || fail device_timeout
+  sleep 1
+done
+
+[ -r /sys/block/vda/queue/write_cache ] || fail missing_write_cache_signal
+write_cache=$(cat /sys/block/vda/queue/write_cache) || fail read_write_cache_signal
+[ "$write_cache" = "write back" ] || fail unexpected_write_cache_signal
+
+if [ ! -d "$MOUNT_POINT" ]; then
+  mkdir "$MOUNT_POINT" || fail create_mount_point
+fi
+mount -t ext4 -o rw,nosuid,nodev,noexec,barrier=1 \
+  "$DEVICE" "$MOUNT_POINT" || fail mount_ext4
+mounted=1
+
+case "$mode" in
+setup)
+  "$AGENT" setup "$nonce" || fail setup_agent
+  umount "$MOUNT_POINT" || fail setup_umount
+  mounted=0
+  emit "PCR_SUDDEN_GUEST_POWER_SETUP_OK_V1 $nonce"
+  "$AGENT" poweroff || fail setup_poweroff
+  fail setup_poweroff_returned
+  ;;
+recover)
+  tail_length=$("$AGENT" recover "$nonce") || fail recover_agent
+  case "$tail_length" in
+  '' | *[!0123456789]*) fail invalid_tail_length ;;
+  esac
+  umount "$MOUNT_POINT" || fail recover_umount
+  mounted=0
+  emit "PCR_SUDDEN_GUEST_POWER_RECOVER_OK_V1 $nonce $tail_length"
+  "$AGENT" poweroff || fail recover_poweroff
+  fail recover_poweroff_returned
+  ;;
+armed)
+  exec "$AGENT" armed "$nonce" || fail armed_agent_exec
+  ;;
+esac

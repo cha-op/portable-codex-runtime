@@ -1,0 +1,29 @@
+#!/bin/sh
+
+set -eu
+
+PREREQ=""
+
+prereqs() {
+  echo "$PREREQ"
+}
+
+case "${1:-}" in
+prereqs)
+  prereqs
+  exit 0
+  ;;
+esac
+
+. /usr/share/initramfs-tools/hook-functions
+
+: "${PCR_SUDDEN_GUEST_POWER_AGENT:?PCR_SUDDEN_GUEST_POWER_AGENT is required}"
+
+if [ ! -f "$PCR_SUDDEN_GUEST_POWER_AGENT" ] ||
+  [ ! -x "$PCR_SUDDEN_GUEST_POWER_AGENT" ]; then
+  echo "PCR_SUDDEN_GUEST_POWER_AGENT must name an executable regular file" >&2
+  exit 1
+fi
+
+copy_exec "$PCR_SUDDEN_GUEST_POWER_AGENT" \
+  /usr/libexec/pcr-power-loss-agent

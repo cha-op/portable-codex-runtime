@@ -323,3 +323,15 @@ non-forking fixture's atomic block snapshot, but only against an independent
 writable raw copy. It emits no checkpoint descriptor and supplies no production
 capture, fencing, catalogue, or launcher authority, so it changes none of the
 non-goals above. See `linux-ext4-physical-backend.md`.
+
+A separate external-QEMU-SIGKILL conformance harness invokes the same
+production repair primitive after cold-boot ext4 journal replay on the same raw
+data object. It first proves an exact fsynced 4,096-byte valid JSONL prefix and
+host-side admission accepts zero through the attempted unsynced-tail length of
+arbitrary bytes only when they contain no LF, complete JSON value, or abort
+marker; repair must converge the rollout exactly to that prefix before a synced
+continuation. The external host controller kills and joins the exact non-
+daemonised QEMU child while the host and storage remain online. This is sudden
+guest power-loss evidence only. It supplies no checkpoint, whole-filesystem
+durability, host/controller-cache-loss, fencing, catalogue, or launcher
+authority and therefore changes none of the non-goals above.
