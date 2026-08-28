@@ -367,11 +367,11 @@ const READ_ALL_OPERATIONS_QUERY = [
 ].join(" ");
 const READ_LATEST_COMMITTED_STORAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
-  "FROM session_authority.filesystem_image_provider_operations",
-  "WHERE provider_id = $1 AND anchor_id = $2 AND storage_id = $3",
-  "AND state = 'committed'",
-  "ORDER BY committed_state_revision DESC,",
-  'operation_id COLLATE pg_catalog."C" DESC',
+  "FROM session_authority.filesystem_image_provider_operations AS operation",
+  "WHERE operation.provider_id = $1 AND operation.anchor_id = $2",
+  "AND operation.storage_id = $3 AND operation.state = 'committed'",
+  "ORDER BY operation.committed_state_revision DESC,",
+  'operation.operation_id COLLATE pg_catalog."C" DESC',
   "LIMIT 1",
 ].join(" ");
 const INSERT_PREPARED_QUERY = [

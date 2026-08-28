@@ -52,6 +52,10 @@ superseded_by:
   readback, uncertain preservation of both generations, projection validation,
   the durable `verified` marker, and cold source-cleanup recovery retain their
   existing semantics across both transport versions.
+- Latest committed storage lineage is ordered by the underlying PostgreSQL
+  numeric revision rather than its projected text alias. Real-database coverage
+  crosses committed state revisions 8 and 10 before preparing revision 11, so
+  a lexicographic regression selects stale lineage and fails the test.
 
 ## Safety Boundary
 

@@ -634,6 +634,8 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     `operation-index-concurrent-adoption-${randomUUID()}`;
   const lifecycleRaceAnchorId =
     `operation-index-lifecycle-race-${randomUUID()}`;
+  const lineageOrderingAnchorId =
+    `operation-index-lineage-ordering-${randomUUID()}`;
   const revisionRaceAnchorId =
     `operation-index-revision-race-${randomUUID()}`;
   const progressValidationAnchorId =
@@ -772,6 +774,20 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     expectedStorage: null,
     result: { status: "created" },
     storageState: provisionedStorage(prepared.storageId),
+  });
+  const committedCheckpointRecord = (prepared, revision) => ({
+    ...prepared,
+    state: "committed",
+    committedStateRevision: revision,
+    expectedStorage: {
+      lifecycle: prepared.storageStateBefore.lifecycle,
+      revision: prepared.storageStateBefore.revision,
+    },
+    result: { status: "checkpointed" },
+    storageState: {
+      ...prepared.storageStateBefore,
+      revision: (BigInt(prepared.storageStateBefore.revision) + 1n).toString(),
+    },
   });
   const canonicalRecordJson = (value) => {
     if (value === null || typeof value !== "object") {
@@ -2616,6 +2632,105 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       state,
     })),
     [{ operation_id: operationZ, state: "committed" }],
+  );
+
+  // The query projects numeric revisions as text. Revision 11 must still read
+  // committed revision 10 rather than the lexicographically greater 8.
+  const lineageOrderingAuthority = createAuthority(
+    store,
+    lineageOrderingAnchorId,
+  );
+  const lineageOrderingStorageId =
+    `provider-storage-lineage-ordering-${randomUUID()}`;
+  let lineageOrderingHead = genesis;
+  let lineageOrderingStorage = null;
+  const appendLineageOperation = async (kind, index) => {
+    const preparedHead = appendHead(
+      lineageOrderingHead,
+      (BigInt(lineageOrderingHead.stateRevision) + 1n)
+        .toString(16)
+        .padStart(64, "0"),
+      Number(lineageOrderingHead.ledgerBytes) + 512,
+    );
+    const prepared = preparedRecord({
+      checksum: preparedHead.lastChecksum,
+      kind,
+      operationId: `provider-operation-lineage-${index}-${randomUUID()}`,
+      revision: preparedHead.stateRevision,
+      storageId: lineageOrderingStorageId,
+      storageStateBefore: lineageOrderingStorage,
+    });
+    assert.equal(
+      await lineageOrderingAuthority.compareAndAdvance({
+        expectedHead: lineageOrderingHead,
+        nextHead: preparedHead,
+        transition: {
+          contractVersion: 1,
+          type: "append-prepared-v1",
+          frameChecksum: preparedHead.lastChecksum,
+          record: prepared,
+        },
+      }),
+      true,
+    );
+    const committedHead = appendHead(
+      preparedHead,
+      (BigInt(preparedHead.stateRevision) + 1n)
+        .toString(16)
+        .padStart(64, "0"),
+      Number(preparedHead.ledgerBytes) + 512,
+    );
+    const committed =
+      kind === "provision"
+        ? committedRecord(prepared, committedHead.stateRevision)
+        : committedCheckpointRecord(prepared, committedHead.stateRevision);
+    assert.equal(
+      await lineageOrderingAuthority.compareAndAdvance({
+        expectedHead: preparedHead,
+        nextHead: committedHead,
+        transition: {
+          contractVersion: 1,
+          type: "append-committed-v1",
+          frameChecksum: committedHead.lastChecksum,
+          record: committed,
+        },
+      }),
+      true,
+    );
+    lineageOrderingHead = committedHead;
+    lineageOrderingStorage = committed.storageState;
+  };
+  await appendLineageOperation("provision", 0);
+  for (let index = 1; index <= 4; index += 1) {
+    await appendLineageOperation("checkpoint", index);
+  }
+  assert.equal(lineageOrderingHead.stateRevision, "10");
+  assert.equal(lineageOrderingStorage.revision, "5");
+  const crossDigitPreparedHead = appendHead(
+    lineageOrderingHead,
+    "b".repeat(64),
+    Number(lineageOrderingHead.ledgerBytes) + 512,
+  );
+  const crossDigitPrepared = preparedRecord({
+    checksum: crossDigitPreparedHead.lastChecksum,
+    kind: "checkpoint",
+    operationId: `provider-operation-lineage-cross-digit-${randomUUID()}`,
+    revision: crossDigitPreparedHead.stateRevision,
+    storageId: lineageOrderingStorageId,
+    storageStateBefore: lineageOrderingStorage,
+  });
+  assert.equal(
+    await lineageOrderingAuthority.compareAndAdvance({
+      expectedHead: lineageOrderingHead,
+      nextHead: crossDigitPreparedHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: crossDigitPreparedHead.lastChecksum,
+        record: crossDigitPrepared,
+      },
+    }),
+    true,
   );
 
   const duplicateProvisionHead = appendHead(
