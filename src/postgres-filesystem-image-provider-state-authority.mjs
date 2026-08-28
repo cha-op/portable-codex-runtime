@@ -466,12 +466,14 @@ const CREATE_PAGED_ADOPTION_REPLAY_QUERY = [
   "ON COMMIT DROP",
 ].join(" ");
 const READ_PAGED_ADOPTION_OPERATIONS_STAGE_QUERY = [
-  "SELECT ordinal::pg_catalog.text AS ordinal, operation_id, storage_id,",
-  "prepared_state_revision::pg_catalog.text AS prepared_state_revision,",
-  "committed_state_revision::pg_catalog.text AS committed_state_revision,",
-  "record_state, record_bytes, record_sha256",
-  "FROM pg_temp.filesystem_image_provider_adoption_v2_operations",
-  "WHERE ordinal > $1::pg_catalog.numeric ORDER BY ordinal",
+  "SELECT operation.ordinal::pg_catalog.text AS ordinal,",
+  "operation.operation_id, operation.storage_id,",
+  "operation.prepared_state_revision::pg_catalog.text AS prepared_state_revision,",
+  "operation.committed_state_revision::pg_catalog.text AS committed_state_revision,",
+  "operation.record_state, operation.record_bytes, operation.record_sha256",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_operations AS operation",
+  "WHERE operation.ordinal > $1::pg_catalog.numeric",
+  "ORDER BY operation.ordinal",
   "LIMIT $2::pg_catalog.int4",
 ].join(" ");
 const READ_PAGED_ADOPTION_EVENTS_QUERY = [

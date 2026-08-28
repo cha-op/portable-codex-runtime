@@ -3033,6 +3033,15 @@ test("paged adoption preserves the v1 manifest across multiple legacy pages", as
     true,
   );
   assert.equal(
+    paged.database.queries.some(
+      ([text]) =>
+        text.includes(
+          "FROM pg_temp.filesystem_image_provider_adoption_v2_operations AS operation",
+        ) && text.includes("ORDER BY operation.ordinal"),
+    ),
+    true,
+  );
+  assert.equal(
     await paged.pagedAdoptionAuthority.compareAndAdopt(
       pagedAdoptionRequest(paged.request),
     ),
