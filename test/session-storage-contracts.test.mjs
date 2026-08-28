@@ -6,6 +6,7 @@ import test from "node:test";
 import { runInNewContext } from "node:vm";
 
 import {
+  ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
   CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION,
   CHECKPOINT_CLASS_POLICIES,
   DEFAULT_AGENT_POLICY,
@@ -20,6 +21,10 @@ import {
   SESSION_WORKER_LAYOUT,
   SESSION_WORKER_ROOT,
   SessionStorageContractError,
+  assertAtomicCrashCaptureBackend,
+  assertAtomicCrashCaptureRequest,
+  assertAtomicCrashCaptureResult,
+  assertAtomicCrashCaptureVerificationResult,
   assertCanonicalFenceMatch,
   assertCheckpointBackend,
   assertCheckpointCaptureReconciliationBackend,
@@ -51,6 +56,7 @@ import {
   assertWriterAttachmentMutationResult,
   checkpointClassPolicy,
   compareFencingEpochs,
+  createAtomicCrashCaptureBackendFacade,
   createCheckpointBackendFacade,
   createRootlessWorkerTemplate,
   createSessionManifest,
@@ -64,6 +70,8 @@ const OTHER_RUNTIME_SESSION_ID = "019f2100-0000-7000-8000-000000000003";
 const CODEX_THREAD_ID = "019f2100-0000-7000-8000-000000000002";
 const CODEX_SESSION_ID = CODEX_THREAD_ID;
 const IMAGE_DIGEST = `sha256:${"a".repeat(64)}`;
+const ATOMIC_CAPTURE_ATTEMPT_ID =
+  "019f2100-0000-7000-8000-000000000004";
 
 function manifestInput() {
   return {
@@ -303,6 +311,49 @@ function restoreAttachmentActivationResult(request, overrides = {}) {
     publication: structuredClone(request.publication),
     ...resultOverrides,
     mutationResult,
+  };
+}
+
+function atomicCrashCaptureRequest(overrides = {}) {
+  return {
+    captureAttemptId: ATOMIC_CAPTURE_ATTEMPT_ID,
+    checkpoint: checkpoint(),
+    contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    mutationRequest: mutationRequest({ operation: "checkpoint" }),
+    sourceAttachment: attachment(),
+    storageRef: storageRef(),
+    ...overrides,
+  };
+}
+
+function atomicCrashCaptureResult(request, overrides = {}) {
+  const {
+    artifact: artifactOverrides = {},
+    ...resultOverrides
+  } = overrides;
+  const artifact = {
+    byteLength: "4096",
+    contentSha256: "f".repeat(64),
+    objectId: "atomic-crash-object-001",
+    objectIdentityScheme: "test-atomic-object-v1",
+    readOnly: true,
+    ...artifactOverrides,
+  };
+  return {
+    artifact,
+    artifactId: request.checkpoint.artifactId,
+    backendId: request.storageRef.backendId,
+    captureAttemptId: request.captureAttemptId,
+    checkpointId: request.checkpoint.checkpointId,
+    contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    operationId: request.mutationRequest.operationId,
+    proofId: "proof-atomic-crash-001",
+    sessionId: request.storageRef.sessionId,
+    sourceFencingEpoch: request.checkpoint.sourceFencingEpoch,
+    status: "committed",
+    storageId: request.storageRef.storageId,
+    ...resultOverrides,
+    artifact,
   };
 }
 
@@ -1451,6 +1502,673 @@ test("checkpoint backend projection rejects shared prototype pollution across re
     () => assertCheckpointBackend(Object.create(terminalCustomPrototype)),
     assertCode("invalid_storage_backend"),
   );
+});
+
+test("atomic crash capture backend exposes a receiver-bound dormant facade", async () => {
+  assert.equal(ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION, 1);
+  const calls = [];
+  let replacementCalls = 0;
+  const backend = {
+    ...storageBackend(),
+    atomicCrashCaptureContractVersion:
+      ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    async captureAtomicCrashCheckpoint(value) {
+      calls.push({
+        method: "captureAtomicCrashCheckpoint",
+        receiver: this,
+        value,
+      });
+      return "captured";
+    },
+    async verifyCommittedAtomicCrashCheckpoint(value) {
+      calls.push({
+        method: "verifyCommittedAtomicCrashCheckpoint",
+        receiver: this,
+        value,
+      });
+      return "verified";
+    },
+  };
+
+  assert.strictEqual(assertAtomicCrashCaptureBackend(backend), backend);
+  const facade = createAtomicCrashCaptureBackendFacade(backend);
+  assert.deepEqual(Reflect.ownKeys(facade).sort(), [
+    "atomicCrashCaptureContractVersion",
+    "backendId",
+    "capabilities",
+    "captureAtomicCrashCheckpoint",
+    "contractVersion",
+    "verifyCommittedAtomicCrashCheckpoint",
+  ]);
+  assert.equal(Object.getPrototypeOf(facade), null);
+  assert.equal(Object.isFrozen(facade), true);
+  assert.equal(Object.isFrozen(facade.capabilities), true);
+  assert.equal(Object.isFrozen(facade.captureAtomicCrashCheckpoint), true);
+  assert.equal(
+    Object.isFrozen(facade.verifyCommittedAtomicCrashCheckpoint),
+    true,
+  );
+  assert.equal(facade.capabilities.atomicPointInTimeCheckpoint, true);
+  assert.strictEqual(assertAtomicCrashCaptureBackend(facade), facade);
+  assert.strictEqual(createAtomicCrashCaptureBackendFacade(facade), facade);
+
+  backend.capabilities.atomicPointInTimeCheckpoint = false;
+  backend.captureAtomicCrashCheckpoint = async () => {
+    replacementCalls += 1;
+  };
+  backend.verifyCommittedAtomicCrashCheckpoint = async () => {
+    replacementCalls += 1;
+  };
+  assert.equal(
+    await facade.captureAtomicCrashCheckpoint("capture-input"),
+    "captured",
+  );
+  assert.equal(
+    await facade.verifyCommittedAtomicCrashCheckpoint("verify-input"),
+    "verified",
+  );
+  assert.deepEqual(calls, [
+    {
+      method: "captureAtomicCrashCheckpoint",
+      receiver: backend,
+      value: "capture-input",
+    },
+    {
+      method: "verifyCommittedAtomicCrashCheckpoint",
+      receiver: backend,
+      value: "verify-input",
+    },
+  ]);
+  assert.equal(replacementCalls, 0);
+  assert.equal(facade.capabilities.atomicPointInTimeCheckpoint, true);
+  assert.throws(
+    () =>
+      Reflect.apply(
+        facade.captureAtomicCrashCheckpoint,
+        Object.freeze({ wrong: "receiver" }),
+        ["capture-input"],
+      ),
+    TypeError,
+  );
+  assert.throws(
+    () =>
+      Reflect.apply(
+        facade.verifyCommittedAtomicCrashCheckpoint,
+        undefined,
+        ["verify-input"],
+      ),
+    TypeError,
+  );
+});
+
+test("atomic crash capture backend rejects incomplete, non-atomic, and executable surfaces", () => {
+  const method = async () => {};
+  const backend = {
+    ...storageBackend(),
+    atomicCrashCaptureContractVersion:
+      ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    captureAtomicCrashCheckpoint: method,
+    verifyCommittedAtomicCrashCheckpoint: method,
+  };
+  for (const invalid of [
+    storageBackend(),
+    {
+      ...backend,
+      atomicCrashCaptureContractVersion:
+        ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION + 1,
+    },
+    { ...backend, captureAtomicCrashCheckpoint: undefined },
+    { ...backend, verifyCommittedAtomicCrashCheckpoint: undefined },
+    {
+      ...backend,
+      captureAtomicCrashCheckpoint: new Proxy(method, {}),
+    },
+    {
+      ...backend,
+      verifyCommittedAtomicCrashCheckpoint: new Proxy(method, {}),
+    },
+    storageBackend({ atomicPointInTimeCheckpoint: false }),
+    {
+      ...backend,
+      capabilities: {
+        ...backend.capabilities,
+        atomicPointInTimeCheckpoint: false,
+      },
+    },
+  ]) {
+    assert.throws(
+      () => assertAtomicCrashCaptureBackend(invalid),
+      assertCode("invalid_storage_backend"),
+    );
+    assert.throws(
+      () => createAtomicCrashCaptureBackendFacade(invalid),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+
+  let reads = 0;
+  for (const field of [
+    "atomicCrashCaptureContractVersion",
+    "captureAtomicCrashCheckpoint",
+    "verifyCommittedAtomicCrashCheckpoint",
+  ]) {
+    const accessor = { ...backend };
+    Object.defineProperty(accessor, field, {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return field === "atomicCrashCaptureContractVersion"
+          ? ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION
+          : method;
+      },
+    });
+    assert.throws(
+      () => assertAtomicCrashCaptureBackend(accessor),
+      assertCode("invalid_storage_backend"),
+    );
+    assert.throws(
+      () => createAtomicCrashCaptureBackendFacade(accessor),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+  assert.equal(reads, 0);
+
+  const inherited = Object.create({
+    atomicCrashCaptureContractVersion:
+      ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    captureAtomicCrashCheckpoint: method,
+    verifyCommittedAtomicCrashCheckpoint: method,
+  });
+  Object.assign(inherited, storageBackend());
+  assert.throws(
+    () => assertAtomicCrashCaptureBackend(inherited),
+    assertCode("invalid_storage_backend"),
+  );
+
+  let traps = 0;
+  const hostile = new Proxy(backend, {
+    get() {
+      traps += 1;
+      throw new Error("atomic crash backend proxy get must not run");
+    },
+    getOwnPropertyDescriptor() {
+      traps += 1;
+      throw new Error("atomic crash backend proxy descriptor must not run");
+    },
+  });
+  assert.throws(
+    () => assertAtomicCrashCaptureBackend(hostile),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.throws(
+    () => createAtomicCrashCaptureBackendFacade(hostile),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(traps, 0);
+});
+
+test("atomic crash capture requests bind the crash prefix to one exact writer source", () => {
+  const request = atomicCrashCaptureRequest();
+  const checked = assertAtomicCrashCaptureRequest(request);
+  assert.deepEqual(checked, request);
+  assert.deepEqual(Reflect.ownKeys(checked).sort(), [
+    "captureAttemptId",
+    "checkpoint",
+    "contractVersion",
+    "mutationRequest",
+    "sourceAttachment",
+    "storageRef",
+  ]);
+  for (const value of [
+    checked,
+    checked.checkpoint,
+    checked.mutationRequest,
+    checked.mutationRequest.target,
+    checked.sourceAttachment,
+    checked.storageRef,
+  ]) {
+    assert.equal(Object.isFrozen(value), true);
+  }
+
+  request.checkpoint.artifactId = "mutated-artifact";
+  request.mutationRequest.operationId = "mutated-operation";
+  request.sourceAttachment.leaseId = "mutated-lease";
+  assert.equal(checked.checkpoint.artifactId, "artifact-001");
+  assert.equal(checked.mutationRequest.operationId, "operation-checkpoint-001");
+  assert.equal(checked.sourceAttachment.leaseId, "lease-001");
+  assert.deepEqual(assertAtomicCrashCaptureRequest(checked), checked);
+});
+
+test("atomic crash capture requests reject every crossed identity, fence, and target", () => {
+  const invalidRequests = [
+    { ...atomicCrashCaptureRequest(), extra: true },
+    { ...atomicCrashCaptureRequest(), contractVersion: 2 },
+    {
+      ...atomicCrashCaptureRequest(),
+      captureAttemptId: "not/a/capture/attempt",
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      checkpoint: checkpoint({ checkpointClass: "clean" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      checkpoint: checkpoint({ backendId: "other-backend" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      checkpoint: checkpoint({ sessionId: OTHER_RUNTIME_SESSION_ID }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      checkpoint: checkpoint({ storageId: "volume-002" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      checkpoint: checkpoint({ sourceFencingEpoch: "9007199254740994" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      checkpoint: checkpoint({ artifactId: "artifact-002" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      checkpoint: checkpoint({ checkpointId: "checkpoint-002" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        backendId: "other-backend",
+        operation: "checkpoint",
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        operation: "checkpoint",
+        sessionId: OTHER_RUNTIME_SESSION_ID,
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        operation: "checkpoint",
+        storageId: "volume-002",
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        fencingEpoch: "9007199254740994",
+        operation: "checkpoint",
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        leaseId: "lease-002",
+        operation: "checkpoint",
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        holderId: "host-002",
+        operation: "checkpoint",
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({ operation: "restore" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        operation: "checkpoint",
+        target: {
+          artifactId: "artifact-002",
+          checkpointId: "checkpoint-001",
+          kind: "checkpoint",
+        },
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      mutationRequest: mutationRequest({
+        operation: "checkpoint",
+        target: {
+          artifactId: "artifact-001",
+          checkpointId: "checkpoint-002",
+          kind: "checkpoint",
+        },
+      }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      sourceAttachment: attachment({ backendId: "other-backend" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      sourceAttachment: attachment({ sessionId: OTHER_RUNTIME_SESSION_ID }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      sourceAttachment: attachment({ storageId: "volume-002" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      sourceAttachment: attachment({ fencingEpoch: "9007199254740994" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      sourceAttachment: attachment({ leaseId: "lease-002" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      sourceAttachment: attachment({ holderId: "host-002" }),
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      storageRef: { ...storageRef(), backendId: "other-backend" },
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      storageRef: { ...storageRef(), sessionId: OTHER_RUNTIME_SESSION_ID },
+    },
+    {
+      ...atomicCrashCaptureRequest(),
+      storageRef: { ...storageRef(), storageId: "volume-002" },
+    },
+  ];
+
+  for (const invalid of invalidRequests) {
+    assert.throws(
+      () => assertAtomicCrashCaptureRequest(invalid),
+      assertCode("invalid_atomic_crash_capture"),
+    );
+  }
+});
+
+test("atomic crash capture results are exact committed proofs with exact replay", () => {
+  const request = atomicCrashCaptureRequest();
+  const result = atomicCrashCaptureResult(request);
+  const checked = assertAtomicCrashCaptureResult(result, { request });
+  assert.deepEqual(checked, result);
+  assert.deepEqual(Reflect.ownKeys(checked).sort(), [
+    "artifact",
+    "artifactId",
+    "backendId",
+    "captureAttemptId",
+    "checkpointId",
+    "contractVersion",
+    "operationId",
+    "proofId",
+    "sessionId",
+    "sourceFencingEpoch",
+    "status",
+    "storageId",
+  ]);
+  assert.deepEqual(Reflect.ownKeys(checked.artifact).sort(), [
+    "byteLength",
+    "contentSha256",
+    "objectId",
+    "objectIdentityScheme",
+    "readOnly",
+  ]);
+  assert.equal(Object.isFrozen(checked), true);
+  assert.equal(Object.isFrozen(checked.artifact), true);
+  result.artifact.objectId = "mutated-object";
+  result.proofId = "mutated-proof";
+  assert.equal(checked.artifact.objectId, "atomic-crash-object-001");
+  assert.equal(checked.proofId, "proof-atomic-crash-001");
+
+  assert.throws(
+    () => assertAtomicCrashCaptureResult(checked),
+    assertCode("invalid_atomic_crash_capture"),
+  );
+  assert.deepEqual(
+    assertAtomicCrashCaptureResult(checked, {
+      previousResult: checked,
+      request,
+    }),
+    checked,
+  );
+
+  const replayMismatches = [
+    atomicCrashCaptureResult(request, { proofId: "proof-atomic-crash-002" }),
+    atomicCrashCaptureResult(request, { artifact: { byteLength: "4097" } }),
+    atomicCrashCaptureResult(request, {
+      artifact: { contentSha256: "e".repeat(64) },
+    }),
+    atomicCrashCaptureResult(request, {
+      artifact: { objectId: "atomic-crash-object-002" },
+    }),
+    atomicCrashCaptureResult(request, {
+      artifact: { objectIdentityScheme: "test-atomic-object-v2" },
+    }),
+  ];
+  for (const previousResult of replayMismatches) {
+    assert.throws(
+      () =>
+        assertAtomicCrashCaptureResult(checked, {
+          previousResult,
+          request,
+        }),
+      assertCode("invalid_atomic_crash_capture"),
+    );
+  }
+});
+
+test("atomic crash artifacts expose strict identity, content, and access-policy signals", () => {
+  const request = atomicCrashCaptureRequest();
+  const invalidResults = [
+    { ...atomicCrashCaptureResult(request), extra: true },
+    { ...atomicCrashCaptureResult(request), artifact: null },
+    {
+      ...atomicCrashCaptureResult(request),
+      artifact: { ...atomicCrashCaptureResult(request).artifact, extra: true },
+    },
+    atomicCrashCaptureResult(request, { artifactId: "artifact-002" }),
+    atomicCrashCaptureResult(request, { backendId: "other-backend" }),
+    atomicCrashCaptureResult(request, {
+      captureAttemptId: "019f2100-0000-7000-8000-000000000005",
+    }),
+    atomicCrashCaptureResult(request, { checkpointId: "checkpoint-002" }),
+    atomicCrashCaptureResult(request, { contractVersion: 2 }),
+    atomicCrashCaptureResult(request, {
+      operationId: "operation-checkpoint-002",
+    }),
+    atomicCrashCaptureResult(request, { proofId: "" }),
+    atomicCrashCaptureResult(request, { sessionId: OTHER_RUNTIME_SESSION_ID }),
+    atomicCrashCaptureResult(request, {
+      sourceFencingEpoch: "9007199254740994",
+    }),
+    atomicCrashCaptureResult(request, { status: "prepared" }),
+    atomicCrashCaptureResult(request, { storageId: "volume-002" }),
+    atomicCrashCaptureResult(request, { artifact: { byteLength: 4096 } }),
+    atomicCrashCaptureResult(request, { artifact: { byteLength: "0" } }),
+    atomicCrashCaptureResult(request, { artifact: { byteLength: "04096" } }),
+    atomicCrashCaptureResult(request, {
+      artifact: { byteLength: "18446744073709551616" },
+    }),
+    atomicCrashCaptureResult(request, {
+      artifact: { contentSha256: "f".repeat(63) },
+    }),
+    atomicCrashCaptureResult(request, {
+      artifact: { contentSha256: "F".repeat(64) },
+    }),
+    atomicCrashCaptureResult(request, {
+      artifact: { contentSha256: `sha256:${"f".repeat(64)}` },
+    }),
+    atomicCrashCaptureResult(request, { artifact: { objectId: "" } }),
+    atomicCrashCaptureResult(request, {
+      artifact: { objectId: "atomic/crash/object" },
+    }),
+    atomicCrashCaptureResult(request, {
+      artifact: { objectIdentityScheme: "test/atomic/v1" },
+    }),
+    atomicCrashCaptureResult(request, { artifact: { readOnly: false } }),
+  ];
+
+  for (const invalid of invalidResults) {
+    assert.throws(
+      () => assertAtomicCrashCaptureResult(invalid, { request }),
+      assertCode("invalid_atomic_crash_capture"),
+    );
+  }
+});
+
+test("atomic crash verification keeps unknown distinct from physical absence", () => {
+  const request = atomicCrashCaptureRequest();
+  const result = atomicCrashCaptureResult(request);
+  const committedInput = {
+    contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    outcome: "committed",
+    result,
+  };
+  const unknownInput = {
+    contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    outcome: "unknown",
+    result: null,
+  };
+  const committed = assertAtomicCrashCaptureVerificationResult(
+    committedInput,
+    { request },
+  );
+  const unknown = assertAtomicCrashCaptureVerificationResult(unknownInput, {
+    request,
+  });
+  assert.deepEqual(committed, committedInput);
+  assert.deepEqual(unknown, unknownInput);
+  assert.equal(Object.isFrozen(committed), true);
+  assert.equal(Object.isFrozen(committed.result), true);
+  assert.equal(Object.isFrozen(committed.result.artifact), true);
+  assert.equal(Object.isFrozen(unknown), true);
+  assert.equal(Object.hasOwn(unknown, "result"), true);
+  assert.equal(unknown.result, null);
+
+  result.artifact.objectId = "mutated-object";
+  assert.equal(committed.result.artifact.objectId, "atomic-crash-object-001");
+
+  for (const invalid of [
+    { ...committedInput, extra: true },
+    { ...committedInput, contractVersion: 2 },
+    { ...committedInput, outcome: "unknown" },
+    { ...committedInput, result: null },
+    {
+      contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+      outcome: "committed",
+    },
+    { ...unknownInput, extra: true },
+    { ...unknownInput, result: atomicCrashCaptureResult(request) },
+    {
+      contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+      outcome: "unknown",
+    },
+    {
+      contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+      outcome: "absent",
+      result: null,
+    },
+    {
+      contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+      outcome: "absent-and-quiescent",
+      result: null,
+    },
+    {
+      ...committedInput,
+      result: atomicCrashCaptureResult(request, {
+        artifact: { readOnly: false },
+      }),
+    },
+  ]) {
+    assert.throws(
+      () =>
+        assertAtomicCrashCaptureVerificationResult(invalid, { request }),
+      assertCode("invalid_atomic_crash_capture"),
+    );
+  }
+});
+
+test("atomic crash validators reject accessors and proxies without observing them", () => {
+  let reads = 0;
+  const accessorRequest = atomicCrashCaptureRequest();
+  Object.defineProperty(accessorRequest, "checkpoint", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return checkpoint();
+    },
+  });
+  assert.throws(
+    () => assertAtomicCrashCaptureRequest(accessorRequest),
+    assertCode("invalid_atomic_crash_capture"),
+  );
+
+  const request = atomicCrashCaptureRequest();
+  const accessorArtifact = atomicCrashCaptureResult(request);
+  Object.defineProperty(accessorArtifact.artifact, "objectId", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "atomic-crash-object-001";
+    },
+  });
+  assert.throws(
+    () => assertAtomicCrashCaptureResult(accessorArtifact, { request }),
+    assertCode("invalid_atomic_crash_capture"),
+  );
+
+  const options = { request };
+  Object.defineProperty(options, "request", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return request;
+    },
+  });
+  assert.throws(
+    () => assertAtomicCrashCaptureResult(atomicCrashCaptureResult(request), options),
+    assertCode("invalid_atomic_crash_capture"),
+  );
+
+  const accessorVerification = {
+    contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    outcome: "unknown",
+    result: null,
+  };
+  Object.defineProperty(accessorVerification, "outcome", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "unknown";
+    },
+  });
+  assert.throws(
+    () =>
+      assertAtomicCrashCaptureVerificationResult(accessorVerification, {
+        request,
+      }),
+    assertCode("invalid_atomic_crash_capture"),
+  );
+  assert.equal(reads, 0);
+
+  let traps = 0;
+  const hostile = new Proxy(atomicCrashCaptureRequest(), {
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error("atomic crash proxy prototype must not run");
+    },
+    ownKeys() {
+      traps += 1;
+      throw new Error("atomic crash proxy keys must not run");
+    },
+  });
+  assert.throws(
+    () => assertAtomicCrashCaptureRequest(hostile),
+    assertCode("invalid_atomic_crash_capture"),
+  );
+  assert.equal(traps, 0);
 });
 
 test("checkpoint capture reconciliation is an optional versioned backend extension", () => {

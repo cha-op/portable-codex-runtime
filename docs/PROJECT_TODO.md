@@ -298,11 +298,22 @@
   bytes only when they contain no LF, complete JSON value, or abort marker, and
   production tail repair converges the rollout back to that prefix. The host
   runner and storage remain online throughout.
+- [done] Added a dormant provider-neutral atomic crash-capture contract and
+  same-process core. Version 1 binds one exact `crash-prefix` descriptor,
+  mutation, source attachment, and storage identity to a one-use dispatch
+  token; a committed result independently records artifact object identity,
+  content length and SHA-256, and read-only access policy. Source-free
+  verification returns only exact `committed` evidence or non-authorizing
+  `unknown`. Existing clean capture, ext4 capabilities, public deployment,
+  provider catalogues, physical fencing, tail-repair admission, restore, and
+  writer launch remain unchanged.
 - [pending] Extend beyond that evidence and the clean/manual-fencing production
   boundary only in separately scoped work: host, controller, and drive cache-
-  loss evidence, a production crash-prefix adapter, automatic stale-writer
-  fencing, differential export/compression, content-addressed distribution,
-  encryption, retention and periodic snapshots, registry publisher/signature
-  trust, and remote image transport.
+  loss evidence, a concrete atomic-capture provider and durable catalogue,
+  fence-bound production crash-prefix composition, automatic stale-writer
+  fencing, repair-gated restore and higher-epoch launch, differential export/
+  compression, content-addressed distribution, encryption, retention and
+  periodic snapshots, registry publisher/signature trust, and remote image
+  transport.
 - [deferred] Add a read-only Git Summary for user context; it is not part of
   snapshot correctness or recovery.

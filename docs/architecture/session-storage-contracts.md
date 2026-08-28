@@ -467,6 +467,18 @@ construct a checkpoint descriptor, prove host/controller/drive cache loss,
 obtain a canonical epoch or fence, retain admission authority, or implement an
 adapter.
 
+The dormant provider-neutral atomic crash-capture extension supplies the next
+structural boundary without widening any base backend or runtime capability.
+Its version 1 request binds one `crash-prefix` descriptor, checkpoint mutation,
+source attachment, and storage reference. A same-process object-identity token
+is consumed before one physical dispatch attempt. A committed result binds the
+artifact's provider identity, byte length and SHA-256 content, and read-only
+policy as separate protected properties; source-free verification yields only
+the exact committed result or non-authorizing `unknown`. This remains a
+contract and process-local dispatch guard, not a physical stopped/fenced proof,
+durable provider catalogue, concrete snapshot adapter, repair/restore
+admission, or new writer lease. See `atomic-crash-capture-extension.md`.
+
 The backend-neutral snapshot and restore core implements only stopped-writer
 `clean` orchestration over these records. It validates the operation boundary
 and fails closed after uncertain backend dispatch, while the backend retains

@@ -639,6 +639,18 @@
   online; QMP verifies only the configured `writeback=true`, `direct=true`,
   `no-flush=false` tuple. This is not host, controller, or drive cache-loss
   evidence and supplies no production checkpoint or fencing authority.
+- A dormant provider-neutral atomic crash-capture extension now defines one
+  exact version 1 `crash-prefix` request, committed result, and source-free
+  verification envelope. A narrow frozen backend facade captures the declared
+  physical methods, while a separate object-identity token is consumed before
+  one same-process dispatch attempt. The committed artifact records object
+  identity, byte length and SHA-256 content stability, and read-only access
+  policy independently; verification returns only exact `committed` evidence
+  or non-authorizing `unknown`. This extension is not wired into the clean
+  checkpoint path or public deployment. It adds no concrete snapshot provider,
+  durable catalogue, physical fence, tail-repair admission, restore path, or
+  higher-epoch writer authority, and the ext4 backend remains
+  `atomicPointInTimeCheckpoint: false` with manual fencing.
 - Terminal local Podman supervisor state now has a bounded two-phase collector.
   It validates the exact stopped revision 4 terminal record and revisions 0
   through 3 or their admitted oldest-first missing retry prefix, removes the
@@ -688,6 +700,8 @@
   `docs/project_journal/2026/08/2026-08-28-lvm-crash-prefix-conformance-d6a3f2.md`
 - QEMU sudden guest power-loss conformance:
   `docs/project_journal/2026/08/2026-08-28-qemu-guest-power-loss-conformance-e8b4c1.md`
+- Atomic crash-capture extension:
+  `docs/project_journal/2026/08/2026-08-28-atomic-crash-capture-contract-a91d7e.md`
 - ext4-to-Podman attachment composition:
   `docs/project_journal/2026/08/2026-08-19-ext4-podman-composition-a4c821.md`
 - Terminal writer-supervisor state GC:
