@@ -80,9 +80,14 @@ const COMMAND_TIMEOUT_MILLISECONDS = 180_000;
 const QEMU_BOOT_TIMEOUT_MILLISECONDS = 120_000;
 const QEMU_OUTPUT_LIMIT = 256 * 1024;
 const QEMU_DIAGNOSTIC_TAIL_LIMIT = 8 * 1024;
+const QEMU_LINE_BYTE_LIMIT = 8 * 1024;
+const QEMU_LINE_HISTORY_LIMIT = 256;
+const QEMU_PROTOCOL_HISTORY_LIMIT = 32;
 const QEMU_LIVENESS_PROBE_MILLISECONDS = 100;
 const QEMU_GUEST_ERROR_PATTERN =
   /^PCR_SUDDEN_GUEST_POWER_ERROR_V1 (?:unknown|[0-9A-Fa-f]{32}) [a-z0-9_]+ status=[0-9]+$/u;
+const QEMU_PROTOCOL_LINE_PATTERN =
+  /^PCR_SUDDEN_GUEST_POWER_(?:ERROR_V1|READY_V1|RECOVER_OK_V1|SETUP_OK_V1)(?: |$)/u;
 const COMMANDS = Object.freeze({
   cc: "/usr/bin/cc",
   findmnt: "/usr/bin/findmnt",
@@ -453,7 +458,7 @@ function qemuArguments({
 function boundedAppend(current, chunk, state) {
   state.bytes += Buffer.byteLength(chunk);
   if (state.bytes > QEMU_OUTPUT_LIMIT) state.overflow = true;
-  return `${current}${chunk}`.slice(-QEMU_OUTPUT_LIMIT);
+  return boundedUtf8Tail(`${current}${chunk}`, QEMU_OUTPUT_LIMIT);
 }
 
 function boundedUtf8Tail(value, maximumBytes) {
@@ -468,11 +473,9 @@ function boundedUtf8Tail(value, maximumBytes) {
 }
 
 function qemuDiagnosticSummary(controller) {
-  const guestErrors = controller.lines
-    .filter((line) => QEMU_GUEST_ERROR_PATTERN.test(line))
-    .slice(-4);
   return [
-    `guestErrors=${JSON.stringify(guestErrors)}`,
+    `guestErrorCount=${controller.guestErrorCount}`,
+    `guestErrors=${JSON.stringify(controller.guestErrors)}`,
     `stdoutTail=${JSON.stringify(boundedUtf8Tail(
       controller.stdout,
       QEMU_DIAGNOSTIC_TAIL_LIMIT,
@@ -482,7 +485,104 @@ function qemuDiagnosticSummary(controller) {
       QEMU_DIAGNOSTIC_TAIL_LIMIT,
     ))}`,
     `outputOverflow=${controller.outputState.overflow}`,
+    `protocolOverflow=${controller.outputState.protocolOverflow}`,
   ].join(" ");
+}
+
+function pushBounded(collection, value, limit) {
+  if (collection.length === limit) collection.shift();
+  collection.push(value);
+}
+
+function requestQemuOutputAbort(controller) {
+  if (controller.outputState.abortRequested) return;
+  controller.outputState.abortRequested = true;
+  controller.child.kill("SIGKILL");
+}
+
+function recordQemuLine(controller, line) {
+  const normalized = line.endsWith("\r") ? line.slice(0, -1) : line;
+  pushBounded(controller.lines, normalized, QEMU_LINE_HISTORY_LIMIT);
+  if (QEMU_PROTOCOL_LINE_PATTERN.test(normalized)) {
+    controller.protocolLineCount += 1;
+    if (controller.protocolLineCount > QEMU_PROTOCOL_HISTORY_LIMIT) {
+      controller.outputState.protocolOverflow = true;
+      requestQemuOutputAbort(controller);
+      return;
+    }
+    controller.protocolLines.push(normalized);
+  }
+  if (QEMU_GUEST_ERROR_PATTERN.test(normalized)) {
+    controller.guestErrorCount += 1;
+    pushBounded(controller.guestErrors, normalized, 4);
+  }
+}
+
+function consumeQemuStdout(controller, chunk) {
+  let cursor = 0;
+  while (cursor < chunk.length) {
+    const newline = chunk.indexOf("\n", cursor);
+    const end = newline === -1 ? chunk.length : newline;
+    if (!controller.discardingLongLine) {
+      const candidate = controller.partialLine + chunk.slice(cursor, end);
+      if (Buffer.byteLength(candidate) > QEMU_LINE_BYTE_LIMIT) {
+        controller.partialLine = "";
+        controller.discardingLongLine = true;
+      } else {
+        controller.partialLine = candidate;
+      }
+    }
+    if (newline === -1) return;
+    if (!controller.discardingLongLine) {
+      recordQemuLine(controller, controller.partialLine);
+    }
+    controller.discardingLongLine = false;
+    controller.partialLine = "";
+    cursor = newline + 1;
+  }
+}
+
+function finishQemuStdout(controller) {
+  if (!controller.discardingLongLine && controller.partialLine !== "") {
+    recordQemuLine(controller, controller.partialLine);
+  }
+  controller.discardingLongLine = false;
+  controller.partialLine = "";
+}
+
+function recordQemuChunk(controller, stream, chunk) {
+  controller[stream] = boundedAppend(
+    controller[stream],
+    chunk,
+    controller.outputState,
+  );
+  if (controller.outputState.overflow) {
+    requestQemuOutputAbort(controller);
+    return;
+  }
+  if (stream === "stdout") consumeQemuStdout(controller, chunk);
+}
+
+function findQemuLine(controller, predicate) {
+  return controller.protocolLines.find(predicate) ?? controller.lines.find(predicate);
+}
+
+function assertQemuOutputHealthy(controller, label) {
+  if (controller.guestErrorCount > 0) {
+    throw new Error(
+      `${label} reported guest failure: ${qemuDiagnosticSummary(controller)}`,
+    );
+  }
+  if (controller.outputState.overflow) {
+    throw new Error(
+      `${label} exceeded the bounded QEMU output limit: ${qemuDiagnosticSummary(controller)}`,
+    );
+  }
+  if (controller.outputState.protocolOverflow) {
+    throw new Error(
+      `${label} exceeded the bounded QEMU protocol history: ${qemuDiagnosticSummary(controller)}`,
+    );
+  }
 }
 
 function startQemu(arguments_) {
@@ -492,29 +592,31 @@ function startQemu(arguments_) {
   const controller = {
     arguments_,
     child,
+    discardingLongLine: false,
+    guestErrorCount: 0,
+    guestErrors: [],
     lines: [],
-    outputState: { bytes: 0, overflow: false },
+    outputState: {
+      abortRequested: false,
+      bytes: 0,
+      overflow: false,
+      protocolOverflow: false,
+    },
+    partialLine: "",
+    protocolLineCount: 0,
+    protocolLines: [],
     spawnError: null,
     stderr: "",
     stdout: "",
   };
   child.stdout.setEncoding("utf8");
   child.stderr.setEncoding("utf8");
-  const lineReader = createInterface({ input: child.stdout, crlfDelay: Infinity });
-  lineReader.on("line", (line) => controller.lines.push(line));
   child.stdout.on("data", (chunk) => {
-    controller.stdout = boundedAppend(
-      controller.stdout,
-      chunk,
-      controller.outputState,
-    );
+    recordQemuChunk(controller, "stdout", chunk);
   });
+  child.stdout.on("end", () => finishQemuStdout(controller));
   child.stderr.on("data", (chunk) => {
-    controller.stderr = boundedAppend(
-      controller.stderr,
-      chunk,
-      controller.outputState,
-    );
+    recordQemuChunk(controller, "stderr", chunk);
   });
   controller.exit = new Promise((resolvePromise) => {
     child.once("error", (error) => {
@@ -545,33 +647,20 @@ async function withDeadline(promise, milliseconds, label) {
 async function waitForQemuLine(controller, predicate, label) {
   const deadline = Date.now() + QEMU_BOOT_TIMEOUT_MILLISECONDS;
   while (Date.now() < deadline) {
-    const line = controller.lines.find(predicate);
+    assertQemuOutputHealthy(controller, label);
+    const line = findQemuLine(controller, predicate);
     if (line !== undefined) return line;
-    if (controller.lines.some((entry) => QEMU_GUEST_ERROR_PATTERN.test(entry))) {
-      throw new Error(
-        `${label} reported guest failure: ${qemuDiagnosticSummary(controller)}`,
-      );
-    }
     if (controller.spawnError !== null) throw controller.spawnError;
     if (
       controller.child.exitCode !== null ||
       controller.child.signalCode !== null
     ) {
       await withDeadline(controller.closed, 10_000, `${label} stdio close`);
-      const finalLine = controller.lines.find(predicate);
+      assertQemuOutputHealthy(controller, label);
+      const finalLine = findQemuLine(controller, predicate);
       if (finalLine !== undefined) return finalLine;
-      if (controller.lines.some((entry) => QEMU_GUEST_ERROR_PATTERN.test(entry))) {
-        throw new Error(
-          `${label} reported guest failure: ${qemuDiagnosticSummary(controller)}`,
-        );
-      }
       throw new Error(
         `${label} exited before marker: code=${controller.child.exitCode} signal=${controller.child.signalCode} ${qemuDiagnosticSummary(controller)}`,
-      );
-    }
-    if (controller.outputState.overflow) {
-      throw new Error(
-        `${label} exceeded the bounded QEMU output limit: ${qemuDiagnosticSummary(controller)}`,
       );
     }
     await delay(20, undefined, { ref: false });
@@ -582,6 +671,7 @@ async function waitForQemuLine(controller, predicate, label) {
 async function assertPidfile(controller, pidfilePath) {
   let value;
   for (let attempt = 0; attempt < 100; attempt += 1) {
+    assertQemuOutputHealthy(controller, "QEMU pidfile wait");
     try {
       value = await readFile(pidfilePath, "utf8");
       break;
@@ -590,22 +680,25 @@ async function assertPidfile(controller, pidfilePath) {
       await delay(20, undefined, { ref: false });
     }
   }
+  assertQemuOutputHealthy(controller, "QEMU pidfile wait");
   assert.equal(value?.trim(), String(controller.child.pid));
 }
 
-async function nextQmpValue(iterator, label) {
+async function nextQmpValue(controller, iterator, label) {
   const result = await withDeadline(
     iterator.next(),
     10_000,
     `QMP ${label}`,
   );
+  assertQemuOutputHealthy(controller, `QMP ${label}`);
   assert.equal(result.done, false);
   return JSON.parse(result.value);
 }
 
-async function queryBlockCache(qmpPath) {
+async function queryBlockCache(controller, qmpPath) {
   let socket;
   for (let attempt = 0; attempt < 100; attempt += 1) {
+    assertQemuOutputHealthy(controller, "QMP connect");
     try {
       socket = createConnection({ path: qmpPath });
       await withDeadline(once(socket, "connect"), 1_000, "QMP connect");
@@ -624,19 +717,19 @@ async function queryBlockCache(qmpPath) {
   const reader = createInterface({ input: socket, crlfDelay: Infinity });
   const iterator = reader[Symbol.asyncIterator]();
   try {
-    const greeting = await nextQmpValue(iterator, "greeting");
+    const greeting = await nextQmpValue(controller, iterator, "greeting");
     assert.equal(typeof greeting.QMP?.version?.qemu?.major, "number");
     socket.write(`${JSON.stringify({ execute: "qmp_capabilities", id: "caps" })}\r\n`);
     let capabilities;
     while (capabilities === undefined) {
-      const message = await nextQmpValue(iterator, "capabilities");
+      const message = await nextQmpValue(controller, iterator, "capabilities");
       if (message.id === "caps") capabilities = message;
     }
     assert.deepEqual(capabilities, { id: "caps", return: {} });
     socket.write(`${JSON.stringify({ execute: "query-block", id: "block" })}\r\n`);
     let response;
     while (response === undefined) {
-      const message = await nextQmpValue(iterator, "query-block");
+      const message = await nextQmpValue(controller, iterator, "query-block");
       if (message.id === "block") response = message;
     }
     assert.equal(Array.isArray(response.return), true);
@@ -662,7 +755,7 @@ async function waitForQemuExit(controller, label) {
   const { closed, exited } = await observeQemuTerminal(controller, label);
   if (exited.error) throw exited.error;
   assert.deepEqual(closed, { code: exited.code, signal: exited.signal });
-  assert.equal(controller.outputState.overflow, false);
+  assertQemuOutputHealthy(controller, label);
   return { code: exited.code, signal: exited.signal };
 }
 
@@ -680,8 +773,8 @@ async function observeQemuTerminal(controller, label) {
   return Object.freeze({ closed, exited });
 }
 
-function markerCount(lines, predicate) {
-  return lines.filter(predicate).length;
+function markerCount(controller, predicate) {
+  return controller.protocolLines.filter(predicate).length;
 }
 
 async function runCleanBoot(resources, configuration) {
@@ -713,7 +806,7 @@ async function runCleanBoot(resources, configuration) {
   const exit = await waitForQemuExit(controller, `${configuration.mode} boot`);
   assert.deepEqual(exit, { code: 0, signal: null });
   assert.equal(
-    markerCount(controller.lines, (line) => line === marker),
+    markerCount(controller, (line) => line === marker),
     1,
   );
   resources.qemu = null;
@@ -725,7 +818,7 @@ async function runArmedBoot(resources, configuration) {
   const controller = startQemu(arguments_);
   resources.qemu = controller;
   await assertPidfile(controller, configuration.pidfilePath);
-  const qmpCache = await queryBlockCache(configuration.qmpPath);
+  const qmpCache = await queryBlockCache(controller, configuration.qmpPath);
   const expected = `PCR_SUDDEN_GUEST_POWER_READY_V1 ${configuration.nonce}`;
   await waitForQemuLine(
     controller,
@@ -733,6 +826,7 @@ async function runArmedBoot(resources, configuration) {
     "armed boot",
   );
   await delay(QEMU_LIVENESS_PROBE_MILLISECONDS, undefined, { ref: false });
+  assertQemuOutputHealthy(controller, "armed boot liveness probe");
   assert.equal(controller.child.exitCode, null);
   assert.equal(controller.child.signalCode, null);
   process.kill(controller.child.pid, 0);
@@ -740,7 +834,7 @@ async function runArmedBoot(resources, configuration) {
   const exit = await waitForQemuExit(controller, "armed boot SIGKILL");
   assert.deepEqual(exit, { code: null, signal: "SIGKILL" });
   assert.equal(
-    markerCount(controller.lines, (line) => line === expected),
+    markerCount(controller, (line) => line === expected),
     1,
   );
   resources.qemu = null;
@@ -1335,19 +1429,45 @@ test("initramfs boot capabilities accept loadable and built-in modules", () => {
   );
 });
 
-test("QEMU marker wait consumes close-drained output and bounds guest errors", async () => {
-  const expected = `PCR_SUDDEN_GUEST_POWER_SETUP_OK_V1 ${"ab".repeat(16)}`;
-  const closeController = {
-    child: { exitCode: 0, signalCode: null },
+function qemuTestController({ exitCode = null, signalCode = null } = {}) {
+  const controller = {
+    child: {
+      exitCode,
+      kill: (signal) => {
+        controller.killSignals.push(signal);
+        return true;
+      },
+      signalCode,
+    },
+    discardingLongLine: false,
+    guestErrorCount: 0,
+    guestErrors: [],
+    killSignals: [],
     lines: [],
-    outputState: { bytes: 0, overflow: false },
+    outputState: {
+      abortRequested: false,
+      bytes: 0,
+      overflow: false,
+      protocolOverflow: false,
+    },
+    partialLine: "",
+    protocolLineCount: 0,
+    protocolLines: [],
     spawnError: null,
     stderr: "",
     stdout: "",
   };
+  controller.exit = Promise.resolve({ code: exitCode, signal: signalCode });
+  controller.closed = Promise.resolve({ code: exitCode, signal: signalCode });
+  return controller;
+}
+
+test("QEMU marker waits reject post-success errors with bounded output state", async () => {
+  const expected = `PCR_SUDDEN_GUEST_POWER_SETUP_OK_V1 ${"ab".repeat(16)}`;
+  const closeController = qemuTestController({ exitCode: 0 });
   closeController.closed = Promise.resolve().then(() => {
-    closeController.lines.push(expected);
-    closeController.stdout = `${expected}\n`;
+    recordQemuChunk(closeController, "stdout", `${expected}\n`);
+    finishQemuStdout(closeController);
     return { code: 0, signal: null };
   });
   assert.equal(
@@ -1365,15 +1485,9 @@ test("QEMU marker wait consumes close-drained output and bounds guest errors", a
   const stdout =
     `${discardedPrefix}${"x".repeat(QEMU_DIAGNOSTIC_TAIL_LIMIT)}\n` +
     `${guestError}\n`;
-  const errorController = {
-    child: { exitCode: null, signalCode: null },
-    closed: Promise.resolve({ code: 0, signal: null }),
-    lines: [guestError],
-    outputState: { bytes: Buffer.byteLength(stdout), overflow: false },
-    spawnError: null,
-    stderr: "guest stderr\n",
-    stdout,
-  };
+  const errorController = qemuTestController();
+  recordQemuChunk(errorController, "stdout", stdout);
+  recordQemuChunk(errorController, "stderr", "guest stderr\n");
   await assert.rejects(
     waitForQemuLine(errorController, () => false, "recovery boot"),
     (error) => {
@@ -1384,6 +1498,58 @@ test("QEMU marker wait consumes close-drained output and bounds guest errors", a
       assert.doesNotMatch(error.message, /discarded-prefix/u);
       return true;
     },
+  );
+
+  const postSuccessErrorController = qemuTestController({ exitCode: 0 });
+  recordQemuChunk(postSuccessErrorController, "stdout", `${expected}\n`);
+  assert.equal(
+    await waitForQemuLine(
+      postSuccessErrorController,
+      (line) => line === expected,
+      "setup boot",
+    ),
+    expected,
+  );
+  recordQemuChunk(
+    postSuccessErrorController,
+    "stdout",
+    `${guestError}\n`,
+  );
+  await assert.rejects(
+    waitForQemuExit(postSuccessErrorController, "setup boot"),
+    /reported guest failure/u,
+  );
+
+  const lineController = qemuTestController();
+  recordQemuChunk(
+    lineController,
+    "stdout",
+    Array.from(
+      { length: QEMU_LINE_HISTORY_LIMIT + 10 },
+      (_, index) => `noise-${index}\n`,
+    ).join(""),
+  );
+  assert.equal(lineController.lines.length, QEMU_LINE_HISTORY_LIMIT);
+  assert.equal(lineController.lines[0], "noise-10");
+  recordQemuChunk(
+    lineController,
+    "stdout",
+    "x".repeat(QEMU_LINE_BYTE_LIMIT + 1),
+  );
+  assert.equal(lineController.discardingLongLine, true);
+  assert.equal(lineController.partialLine, "");
+
+  const overflowController = qemuTestController();
+  recordQemuChunk(
+    overflowController,
+    "stdout",
+    "x".repeat(QEMU_OUTPUT_LIMIT + 1),
+  );
+  assert.equal(overflowController.outputState.overflow, true);
+  assert.deepEqual(overflowController.killSignals, ["SIGKILL"]);
+  assert.equal(
+    Buffer.byteLength(overflowController.stdout) <= QEMU_OUTPUT_LIMIT,
+    true,
   );
 });
 

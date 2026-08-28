@@ -68,7 +68,11 @@ superseded_by:
   already active in `/sys/module`. Setup, recovery, and error markers are
   drained through the guest serial terminal before clean power-off; host-side
   failures retain strictly parsed guest error markers and bounded 8 KiB tails
-  from both serial streams.
+  from both serial streams. The host also bounds partial lines, ordinary line
+  history, and protocol-marker history independently; aggregate output or
+  protocol overflow terminates the exact QEMU child and fails closed. A guest
+  error observed after an apparent success marker remains fatal after stdio is
+  fully drained and the process exits.
 
 ## Safety Boundary
 
