@@ -53,7 +53,6 @@ const COMMANDS = Object.freeze({
   findmnt: "/usr/bin/findmnt",
   getfacl: "/usr/bin/getfacl",
   losetup: "/usr/sbin/losetup",
-  lvchange: "/usr/sbin/lvchange",
   lvcreate: "/usr/sbin/lvcreate",
   lvremove: "/usr/sbin/lvremove",
   lvs: "/usr/sbin/lvs",
@@ -546,14 +545,9 @@ async function cleanupResources(resources) {
   }
   if (resources.volumeGroupCreated) {
     if (resources.snapshotCreated) {
-      await attempt("snapshot deactivation", async () => {
-        await runCommand(COMMANDS.lvchange, [
-          "--activate",
-          "n",
-          resources.snapshotDevice,
-        ]);
-      });
       await attempt("snapshot removal", async () => {
+        // lvremove owns noninteractive deactivation: lvchange -an on a
+        // snapshot-origin pair can still prompt even when stdin is closed.
         await runCommand(COMMANDS.lvremove, [
           "--force",
           "--yes",
@@ -563,13 +557,6 @@ async function cleanupResources(resources) {
       });
     }
     if (resources.originCreated) {
-      await attempt("origin deactivation", async () => {
-        await runCommand(COMMANDS.lvchange, [
-          "--activate",
-          "n",
-          resources.originDevice,
-        ]);
-      });
       await attempt("origin removal", async () => {
         await runCommand(COMMANDS.lvremove, [
           "--force",
