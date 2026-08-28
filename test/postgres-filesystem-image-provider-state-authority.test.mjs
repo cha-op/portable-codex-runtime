@@ -12,10 +12,12 @@ import {
 import {
   POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_AUTHORITY_CONTRACT_VERSION,
   POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION,
+  POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_PAGED_ADOPTION_AUTHORITY_CONTRACT_VERSION,
   POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT_VERSION,
   PostgresFilesystemImageProviderStateAuthorityError,
   createPostgresFilesystemImageProviderStateAdoptionAuthority,
   createPostgresFilesystemImageProviderStateAuthority,
+  createPostgresFilesystemImageProviderStatePagedAdoptionAuthority,
   createPostgresFilesystemImageProviderStateRuntimeAuthority,
 } from "../src/postgres-filesystem-image-provider-state-authority.mjs";
 import {
@@ -117,6 +119,69 @@ function adoptionHead(expectedHead) {
     frameCount: 0,
     lastChecksum: checkpointChecksum,
     ledgerBytes: 0,
+  };
+}
+
+function frozenPagedAdoptionPager({
+  arrayKey,
+  cursorKey,
+  idAt,
+  records,
+  transformPage = (page) => page,
+}) {
+  const indexes = new Map();
+  for (let index = 0; index < records.length; index += 1) {
+    indexes.set(idAt(records[index]), index);
+  }
+  let pass = 0;
+  const readPage = async function readPage(request) {
+    assert.equal(Object.isFrozen(request), true);
+    assert.equal(request.limit, 4);
+    const after = request[cursorKey === "nextAfterOperationId"
+      ? "afterOperationId"
+      : "afterStorageId"];
+    if (after === null) pass += 1;
+    const start = after === null ? 0 : indexes.get(after) + 1;
+    const end = Math.min(start + request.limit, records.length);
+    const entries = Object.freeze(records.slice(start, end));
+    const next =
+      end < records.length && entries.length !== 0
+        ? idAt(entries[entries.length - 1])
+        : null;
+    return transformPage(
+      Object.freeze({ [arrayKey]: entries, [cursorKey]: next }),
+      { after, end, pass, start },
+    );
+  };
+  Object.freeze(readPage);
+  return Object.freeze({ contractVersion: 1, readPage });
+}
+
+function frozenAdoptionPager(readPage) {
+  Object.freeze(readPage);
+  return Object.freeze({ contractVersion: 1, readPage });
+}
+
+function pagedAdoptionRequest(request, overrides = {}) {
+  return {
+    expectedHead: request.expectedHead,
+    nextHead: request.nextHead,
+    operationPager:
+      overrides.operationPager ??
+      frozenPagedAdoptionPager({
+        arrayKey: "operations",
+        cursorKey: "nextAfterOperationId",
+        idAt: (record) => record.operationId,
+        records: request.operations,
+      }),
+    storagePager:
+      overrides.storagePager ??
+      frozenPagedAdoptionPager({
+        arrayKey: "storages",
+        cursorKey: "nextAfterStorageId",
+        idAt: (wrapper) => wrapper.storage.storageId,
+        records: request.storages,
+      }),
   };
 }
 
@@ -640,6 +705,14 @@ function operationKey(providerId, anchorId, operationId) {
   return `${providerId}\0${anchorId}\0${operationId}`;
 }
 
+function parsePostgresTextArrayLiteral(value) {
+  assert.equal(typeof value, "string");
+  if (value === "{}") return [];
+  assert.equal(value.startsWith('{"'), true);
+  assert.equal(value.endsWith('"}'), true);
+  return value.slice(2, -2).split('\",\"');
+}
+
 function copyHeadRow(row) {
   return { ...row };
 }
@@ -698,6 +771,7 @@ class FakeAuthorityDatabase {
     this.operations = new Map();
     this.failCommitOnce = false;
     this.failCommitBeforeDurabilityOnce = false;
+    this.failTempTableOnce = false;
     this.afterCommitOnce = null;
     this.forceHeadCasMissOnce = false;
     this.forceOperationMutationMissOnce = false;
@@ -705,6 +779,7 @@ class FakeAuthorityDatabase {
     this.operationReadOverride = null;
     this.operationStreamOverride = null;
     this.queries = [];
+    this.recordQueries = true;
     this.releaseCalls = [];
     this.streamRowsEmitted = 0;
   }
@@ -728,6 +803,13 @@ class FakeAuthorityClient {
     this.database = database;
     this.heads = null;
     this.operations = null;
+    this.operationPageCache = new Map();
+    this.pagedAdoptionEvents = null;
+    this.pagedAdoptionOperationIds = null;
+    this.pagedAdoptionOperations = null;
+    this.pagedAdoptionReplay = null;
+    this.pagedAdoptionStorageIds = null;
+    this.pagedAdoptionStorages = null;
   }
 
   query(...args) {
@@ -739,12 +821,14 @@ class FakeAuthorityClient {
       typeof args[0].submit === "function";
     const text = typeof args[0] === "string" ? args[0] : args[0].text;
     const values = typeof args[0] === "string" ? args[1] : args[0].values;
-    this.database.queries.push([text, values]);
+    if (this.database.recordQueries) this.database.queries.push([text, values]);
 
     if (text === "DISCARD ALL") return result("DISCARD");
     if (text.startsWith("BEGIN ")) {
       this.heads = cloneMap(this.database.heads, copyHeadRow);
       this.operations = cloneMap(this.database.operations, copyOperationRow);
+      this.operationPageCache.clear();
+      this.#dropPagedAdoptionTemporaryTables();
       return result("BEGIN");
     }
     if (
@@ -769,11 +853,13 @@ class FakeAuthorityClient {
     if (text === "ROLLBACK") {
       this.heads = null;
       this.operations = null;
+      this.#dropPagedAdoptionTemporaryTables();
       return result("ROLLBACK");
     }
     if (text === "COMMIT") {
       if (this.database.failCommitBeforeDurabilityOnce) {
         this.database.failCommitBeforeDurabilityOnce = false;
+        this.#dropPagedAdoptionTemporaryTables();
         throw new Error("commit outcome unavailable before durability");
       }
       this.database.heads = this.heads;
@@ -785,9 +871,18 @@ class FakeAuthorityClient {
       }
       if (this.database.failCommitOnce) {
         this.database.failCommitOnce = false;
+        this.#dropPagedAdoptionTemporaryTables();
         throw new Error("commit acknowledgement lost");
       }
+      this.#dropPagedAdoptionTemporaryTables();
       return result("COMMIT");
+    }
+    if (
+      text.includes(
+        "pg_temp.filesystem_image_provider_adoption_v2_",
+      )
+    ) {
+      return this.#pagedAdoptionTemporaryQuery(text, values);
     }
     if (text.includes("session_authority.filesystem_image_provider_heads")) {
       return this.#headQuery(text, values);
@@ -839,6 +934,273 @@ class FakeAuthorityClient {
       return response;
     }
     throw new Error(`unexpected fake query: ${text}`);
+  }
+
+  #dropPagedAdoptionTemporaryTables() {
+    this.pagedAdoptionEvents = null;
+    this.pagedAdoptionOperationIds = null;
+    this.pagedAdoptionOperations = null;
+    this.pagedAdoptionReplay = null;
+    this.pagedAdoptionStorageIds = null;
+    this.pagedAdoptionStorages = null;
+  }
+
+  #pagedAdoptionTemporaryQuery(text, values) {
+    if (text.startsWith("CREATE TEMPORARY TABLE ")) {
+      if (this.database.failTempTableOnce) {
+        this.database.failTempTableOnce = false;
+        return result("TEMPORARY TABLE PERMISSION DENIED");
+      }
+      if (text.includes("adoption_v2_operations")) {
+        this.pagedAdoptionOperations = new Map();
+        this.pagedAdoptionOperationIds = new Set();
+      } else if (text.includes("adoption_v2_events")) {
+        this.pagedAdoptionEvents = new Map();
+      } else if (text.includes("adoption_v2_storages")) {
+        this.pagedAdoptionStorages = new Map();
+        this.pagedAdoptionStorageIds = new Set();
+      } else if (text.includes("adoption_v2_replay")) {
+        this.pagedAdoptionReplay = new Map();
+      } else {
+        throw new Error(`unexpected fake temporary table: ${text}`);
+      }
+      return result("CREATE");
+    }
+
+    if (
+      text.startsWith(
+        "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_operations",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionOperations, null);
+      assert.equal(values.length % 8, 0);
+      const rows = [];
+      for (let offset = 0; offset < values.length; offset += 8) {
+        const ordinal = values[offset];
+        const operationId = values[offset + 1];
+        if (
+          this.pagedAdoptionOperations.has(ordinal) ||
+          this.pagedAdoptionOperationIds.has(operationId)
+        ) {
+          continue;
+        }
+        const stored = {
+          ordinal,
+          operation_id: operationId,
+          storage_id: values[offset + 2],
+          prepared_state_revision: values[offset + 3],
+          committed_state_revision: values[offset + 4],
+          record_state: values[offset + 5],
+          record_bytes: Buffer.from(values[offset + 6], "hex"),
+          record_sha256: values[offset + 7],
+        };
+        this.pagedAdoptionOperations.set(ordinal, stored);
+        this.pagedAdoptionOperationIds.add(operationId);
+        rows.push({ ordinal });
+      }
+      return result("INSERT", rows);
+    }
+
+    if (
+      text.startsWith(
+        "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_events",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionEvents, null);
+      assert.equal(values.length % 3, 0);
+      const rows = [];
+      for (let offset = 0; offset < values.length; offset += 3) {
+        const revision = values[offset];
+        if (this.pagedAdoptionEvents.has(revision)) continue;
+        this.pagedAdoptionEvents.set(revision, {
+          revision,
+          event_type: values[offset + 1],
+          operation_ordinal: values[offset + 2],
+        });
+        rows.push({ revision });
+      }
+      return result("INSERT", rows);
+    }
+
+    if (
+      text.startsWith(
+        "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_storages",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionStorages, null);
+      assert.equal(values.length % 5, 0);
+      const rows = [];
+      for (let offset = 0; offset < values.length; offset += 5) {
+        const ordinal = values[offset];
+        const storageId = values[offset + 1];
+        if (
+          this.pagedAdoptionStorages.has(ordinal) ||
+          this.pagedAdoptionStorageIds.has(storageId)
+        ) {
+          continue;
+        }
+        const stored = {
+          ordinal,
+          storage_id: storageId,
+          current_attachment_origin_operation_id: values[offset + 2],
+          storage_bytes: Buffer.from(values[offset + 3], "hex"),
+          wrapper_bytes: Buffer.from(values[offset + 4], "hex"),
+        };
+        this.pagedAdoptionStorages.set(ordinal, stored);
+        this.pagedAdoptionStorageIds.add(storageId);
+        rows.push({ ordinal });
+      }
+      return result("INSERT", rows);
+    }
+
+    if (
+      text.startsWith(
+        "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_replay",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionReplay, null);
+      assert.equal(values.length % 4, 0);
+      const rows = [];
+      for (let offset = 0; offset < values.length; offset += 4) {
+        const storageId = values[offset];
+        this.pagedAdoptionReplay.set(storageId, {
+          storage_id: storageId,
+          storage_bytes:
+            values[offset + 1] === null
+              ? null
+              : Buffer.from(values[offset + 1], "hex"),
+          current_attachment_origin_operation_id: values[offset + 2],
+          pending_operation_id: values[offset + 3],
+        });
+        rows.push({ storage_id: storageId });
+      }
+      return result("INSERT", rows);
+    }
+
+    if (
+      text.includes(
+        "FROM pg_temp.filesystem_image_provider_adoption_v2_events AS event",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionEvents, null);
+      assert.notEqual(this.pagedAdoptionOperations, null);
+      const afterRevision = BigInt(values[0]);
+      const limit = Number(values[1]);
+      const rows = [];
+      for (let offset = 1n; offset <= BigInt(limit); offset += 1n) {
+        const event = this.pagedAdoptionEvents.get(
+          String(afterRevision + offset),
+        );
+        if (event === undefined) break;
+          const operation = this.pagedAdoptionOperations.get(
+            event.operation_ordinal,
+          );
+          assert.notEqual(operation, undefined);
+        rows.push({
+            revision: event.revision,
+            event_type: event.event_type,
+            record_state: operation.record_state,
+            record_bytes: Buffer.from(operation.record_bytes),
+            record_sha256: operation.record_sha256,
+        });
+      }
+      return result("SELECT", rows);
+    }
+
+    if (
+      text.includes(
+        "FROM pg_temp.filesystem_image_provider_adoption_v2_operations",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionOperations, null);
+      const afterOrdinal = BigInt(values[0]);
+      const limit = Number(values[1]);
+      const rows = [];
+      for (let offset = 1n; offset <= BigInt(limit); offset += 1n) {
+        const row = this.pagedAdoptionOperations.get(
+          String(afterOrdinal + offset),
+        );
+        if (row === undefined) break;
+        rows.push({
+          ...row,
+          record_bytes: Buffer.from(row.record_bytes),
+        });
+      }
+      return result("SELECT", rows);
+    }
+
+    if (
+      text.includes(
+        "FROM pg_temp.filesystem_image_provider_adoption_v2_storages",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionStorages, null);
+      let rows = [...this.pagedAdoptionStorages.values()];
+      if (text.includes("WHERE ordinal >")) {
+        const afterOrdinal = BigInt(values[0]);
+        rows = rows
+          .filter((row) => BigInt(row.ordinal) > afterOrdinal)
+          .sort((left, right) =>
+            BigInt(left.ordinal) < BigInt(right.ordinal) ? -1 : 1,
+          );
+      } else {
+        const afterStorageId = values.length === 2 ? values[0] : null;
+        rows = rows
+          .filter(
+            (row) =>
+              afterStorageId === null || row.storage_id > afterStorageId,
+          )
+          .sort((left, right) =>
+            left.storage_id < right.storage_id ? -1 : 1,
+          );
+      }
+      const limit = Number(values[values.length - 1]);
+      return result(
+        "SELECT",
+        rows.slice(0, limit).map((row) => ({
+          ...row,
+          storage_bytes: Buffer.from(row.storage_bytes),
+          wrapper_bytes: Buffer.from(row.wrapper_bytes),
+        })),
+      );
+    }
+
+    if (
+      text.includes(
+        "FROM pg_temp.filesystem_image_provider_adoption_v2_replay",
+      )
+    ) {
+      assert.notEqual(this.pagedAdoptionReplay, null);
+      let rows;
+      if (text.includes("storage_id = ANY")) {
+        rows = parsePostgresTextArrayLiteral(values[0])
+          .map((storageId) => this.pagedAdoptionReplay.get(storageId))
+          .filter((row) => row !== undefined);
+      } else {
+        const afterStorageId = values.length === 2 ? values[0] : null;
+        rows = [...this.pagedAdoptionReplay.values()].filter(
+          (row) =>
+              row.storage_bytes !== null &&
+              (afterStorageId === null || row.storage_id > afterStorageId),
+          );
+      }
+      rows.sort((left, right) =>
+        left.storage_id < right.storage_id ? -1 : 1,
+      );
+      const limit = Number(values[values.length - 1]);
+      return result(
+        "SELECT",
+        rows.slice(0, limit).map((row) => ({
+          ...row,
+          storage_bytes:
+            row.storage_bytes === null
+              ? null
+              : Buffer.from(row.storage_bytes),
+        })),
+      );
+    }
+
+    throw new Error(`unexpected fake paged adoption query: ${text}`);
   }
 
   #headQuery(text, values) {
@@ -964,6 +1326,29 @@ class FakeAuthorityClient {
     return result("UPDATE", [copyHeadRow(updated)]);
   }
 
+  #orderedOperationRows(providerId, anchorId, preparedOnly, byStorageId) {
+    const cacheKey = `${providerId}\0${anchorId}\0${
+      preparedOnly ? "prepared" : "all"
+    }\0${byStorageId ? "storage" : "operation"}`;
+    if (!this.operationPageCache.has(cacheKey)) {
+      const key = byStorageId ? "storage_id" : "operation_id";
+      this.operationPageCache.set(
+        cacheKey,
+        [...this.operations.values()]
+          .filter(
+            (row) =>
+              row.provider_id === providerId &&
+              row.anchor_id === anchorId &&
+              (!preparedOnly || row.state === "prepared"),
+          )
+          .sort((left, right) =>
+            left[key] < right[key] ? -1 : left[key] > right[key] ? 1 : 0,
+          ),
+      );
+    }
+    return this.operationPageCache.get(cacheKey);
+  }
+
   #operationQuery(text, values) {
     if (text.startsWith("SELECT ")) {
       if (this.database.operationReadOverride !== null) {
@@ -1036,35 +1421,25 @@ class FakeAuthorityClient {
           ? values[2]
           : null;
       const maximumRows = Number(values[values.length - 1]);
-      const rows = [...this.operations.values()]
-        .filter(
-          (row) =>
-            row.provider_id === values[0] &&
-            row.anchor_id === values[1] &&
-            (!text.includes("state = 'prepared'") || row.state === "prepared") &&
-            (after === null ||
-              (text.includes("storage_id COLLATE")
-                ? row.storage_id > after
-                : row.operation_id > after)),
-        )
-        .sort((left, right) =>
-          (text.includes("storage_id COLLATE")
-            ? left.storage_id
-            : left.operation_id) <
-          (text.includes("storage_id COLLATE")
-            ? right.storage_id
-            : right.operation_id)
-            ? -1
-            : (text.includes("storage_id COLLATE")
-                  ? left.storage_id
-                  : left.operation_id) >
-                (text.includes("storage_id COLLATE")
-                  ? right.storage_id
-                  : right.operation_id)
-              ? 1
-              : 0,
-        )
-        .slice(0, maximumRows)
+      const byStorageId = text.includes("storage_id COLLATE");
+      const key = byStorageId ? "storage_id" : "operation_id";
+      const ordered = this.#orderedOperationRows(
+        values[0],
+        values[1],
+        text.includes("state = 'prepared'"),
+        byStorageId,
+      );
+      let lower = 0;
+      let upper = ordered.length;
+      if (after !== null) {
+        while (lower < upper) {
+          const middle = Math.floor((lower + upper) / 2);
+          if (ordered[middle][key] <= after) lower = middle + 1;
+          else upper = middle;
+        }
+      }
+      const rows = ordered
+        .slice(lower, lower + maximumRows)
         .map(copyOperationRow);
       return result("SELECT", rows);
     }
@@ -1073,6 +1448,7 @@ class FakeAuthorityClient {
       return result(text.startsWith("INSERT ") ? "INSERT" : "UPDATE");
     }
     if (text.startsWith("INSERT ")) {
+      this.operationPageCache.clear();
       const adopted = text.includes("committed_record_sha256, adoption_id)");
       const width = adopted ? 17 : 11;
       assert.equal(values.length % width, 0);
@@ -1144,6 +1520,7 @@ class FakeAuthorityClient {
       adoption_id: stored.adoption_id,
     };
     this.operations.set(key, updated);
+    this.operationPageCache.clear();
     return result("UPDATE", [copyOperationRow(updated)]);
   }
 
@@ -1179,13 +1556,22 @@ function createFixture() {
       anchorId: "host-primary",
       ...overrides,
     });
+  const createPagedAdoptionAuthority = (overrides = {}) =>
+    createPostgresFilesystemImageProviderStatePagedAdoptionAuthority({
+      store,
+      providerId: "filesystem-image-ext4",
+      anchorId: "host-primary",
+      ...overrides,
+    });
   return {
     adoptionAuthority: createAdoptionAuthority(),
     authority: createAuthority(),
     createAdoptionAuthority,
     createAuthority,
+    createPagedAdoptionAuthority,
     createRuntimeAuthority,
     database,
+    pagedAdoptionAuthority: createPagedAdoptionAuthority(),
     runtimeAuthority: createRuntimeAuthority(),
     store,
   };
@@ -1337,7 +1723,8 @@ test("exposes a frozen exact receiver-independent authority surface", async () =
 });
 
 test("exposes distinct frozen runtime and adoption capabilities", async () => {
-  const { adoptionAuthority, runtimeAuthority } = createFixture();
+  const { adoptionAuthority, pagedAdoptionAuthority, runtimeAuthority } =
+    createFixture();
   assert.equal(
     POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT_VERSION,
     3,
@@ -1403,6 +1790,18 @@ test("exposes distinct frozen runtime and adoption capabilities", async () => {
   assert.equal(adoptionAuthority.contractVersion, 1);
   assert.equal(Object.isFrozen(adoptionAuthority), true);
   assert.equal(Object.isFrozen(adoptionAuthority.compareAndAdopt), true);
+
+  assert.equal(
+    POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_PAGED_ADOPTION_AUTHORITY_CONTRACT_VERSION,
+    2,
+  );
+  assert.deepEqual(Reflect.ownKeys(pagedAdoptionAuthority), [
+    "contractVersion",
+    "compareAndAdopt",
+  ]);
+  assert.equal(pagedAdoptionAuthority.contractVersion, 2);
+  assert.equal(Object.isFrozen(pagedAdoptionAuthority), true);
+  assert.equal(Object.isFrozen(pagedAdoptionAuthority.compareAndAdopt), true);
 });
 
 test("legacy authority rejects stored v3 heads while runtime dual-reads v2 and v3", async () => {
@@ -2532,6 +2931,580 @@ function preparedBatchAdoptionFixture(operationCount = 65) {
   };
 }
 
+function indexedPagedAdoptionFixture(operationCount = 9) {
+  const fixture = completeProvisionAdoptionFixture(operationCount);
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(fixture.expectedHead),
+  );
+  for (let index = 0; index < fixture.operations.length; index += 1) {
+    const record = fixture.operations[index];
+    fixture.database.operations.set(
+      operationKey(
+        "filesystem-image-ext4",
+        "host-primary",
+        record.operationId,
+      ),
+      storedOperationRow(record, fixture.expectedHead.lastChecksum),
+    );
+  }
+  return fixture;
+}
+
+function lightweightPagedAdoptionCapacityFixture(operationCount) {
+  const fixture = createFixture();
+  const operations = Array.from({ length: operationCount }, (_, index) => {
+    const ordinal = String(index + 1).padStart(6, "0");
+    return preparedRecord({
+      operationId: `operation-${ordinal}`,
+      revision: String(index + 1),
+      storageId: `storage-${ordinal}`,
+    });
+  });
+  const checkpointChecksum = "c".repeat(64);
+  const expectedHead = {
+    ...GENESIS,
+    anchorRevision: String(operationCount + 1),
+    generation: "1",
+    stateRevision: String(operationCount),
+    baseHeadChecksum: "b".repeat(64),
+    checkpointStateRevision: String(operationCount),
+    checkpointFrameCount: operationCount + 2,
+    checkpointChecksum,
+    checkpointBytes: 1,
+    frameCount: 0,
+    lastChecksum: checkpointChecksum,
+    ledgerBytes: 0,
+  };
+  const request = {
+    expectedHead,
+    nextHead: adoptionHead(expectedHead),
+    operations,
+    storages: [],
+  };
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(expectedHead, { operationIndexStateRevision: null }),
+  );
+  fixture.database.recordQueries = false;
+  return { ...fixture, operations, request };
+}
+
+test("paged adoption preserves the v1 manifest across multiple legacy pages", async () => {
+  const legacy = completeProvisionAdoptionFixture(9);
+  legacy.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(legacy.expectedHead, { operationIndexStateRevision: null }),
+  );
+  assert.equal(
+    await legacy.adoptionAuthority.compareAndAdopt(legacy.request),
+    true,
+  );
+  const legacyManifest = legacy.database.heads.get(
+    identityKey("filesystem-image-ext4", "host-primary"),
+  ).operation_index_adoption_id;
+
+  const paged = completeProvisionAdoptionFixture(9);
+  paged.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(paged.expectedHead, { operationIndexStateRevision: null }),
+  );
+  assert.equal(
+    await paged.pagedAdoptionAuthority.compareAndAdopt(
+      pagedAdoptionRequest(paged.request),
+    ),
+    true,
+  );
+  const pagedHead = paged.database.heads.get(
+    identityKey("filesystem-image-ext4", "host-primary"),
+  );
+  assert.equal(pagedHead.operation_index_adoption_id, legacyManifest);
+  assert.equal(paged.database.operations.size, 9);
+  assert.equal(
+    paged.database.queries.filter(([text]) =>
+      text.startsWith("CREATE TEMPORARY TABLE pg_temp."),
+    ).length,
+    4,
+  );
+  assert.equal(
+    paged.database.queries
+      .filter(([text]) => text.startsWith("CREATE TEMPORARY TABLE pg_temp."))
+      .every(([text]) => text.endsWith("ON COMMIT DROP")),
+    true,
+  );
+  assert.equal(
+    paged.database.queries.some(
+      ([text]) =>
+        text.includes(
+          "FROM pg_temp.filesystem_image_provider_adoption_v2_operations AS operation",
+        ) && text.includes("ORDER BY operation.ordinal"),
+    ),
+    true,
+  );
+  assert.equal(
+    await paged.pagedAdoptionAuthority.compareAndAdopt(
+      pagedAdoptionRequest(paged.request),
+    ),
+    true,
+  );
+  assert.equal(paged.database.operations.size, 9);
+});
+
+test("paged adoption preserves the v1 manifest across indexed operation and storage pages", async () => {
+  const legacy = indexedPagedAdoptionFixture();
+  assert.equal(
+    await legacy.adoptionAuthority.compareAndAdopt(legacy.request),
+    true,
+  );
+  const legacyManifest = legacy.database.heads.get(
+    identityKey("filesystem-image-ext4", "host-primary"),
+  ).operation_index_adoption_id;
+
+  const paged = indexedPagedAdoptionFixture();
+  const before = cloneMap(paged.database.operations, copyOperationRow);
+  assert.equal(
+    await paged.pagedAdoptionAuthority.compareAndAdopt(
+      pagedAdoptionRequest(paged.request),
+    ),
+    true,
+  );
+  assert.deepEqual(paged.database.operations, before);
+  assert.equal(
+    paged.database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ).operation_index_adoption_id,
+    legacyManifest,
+  );
+  assert.equal(
+    paged.database.queries.some(
+      ([text]) =>
+        text.startsWith(
+          "INSERT INTO session_authority.filesystem_image_provider_operations",
+        ) && text.includes("adoption_id)"),
+    ),
+    false,
+  );
+});
+
+test("paged adoption rejects mutable and Proxy pager surfaces before SQL", async () => {
+  const fixture = legacyAdoptionFixture();
+  const valid = pagedAdoptionRequest(fixture.request);
+  const mutablePager = {
+    contractVersion: 1,
+    readPage: valid.operationPager.readPage,
+  };
+  await assert.rejects(
+    fixture.pagedAdoptionAuthority.compareAndAdopt({
+      ...valid,
+      operationPager: mutablePager,
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+
+  let trapCalls = 0;
+  const proxyPager = new Proxy(valid.operationPager, {
+    ownKeys() {
+      trapCalls += 1;
+      return [];
+    },
+  });
+  await assert.rejects(
+    fixture.pagedAdoptionAuthority.compareAndAdopt({
+      ...valid,
+      operationPager: proxyPager,
+    }),
+    authorityError(
+      "invalid_postgres_filesystem_image_provider_state_authority_request",
+    ),
+  );
+  assert.equal(trapCalls, 0);
+  assert.equal(fixture.database.queries.length, 0);
+});
+
+test("paged adoption rolls back mutable, sparse, oversized, and bad-cursor pages", async (t) => {
+  const cases = [
+    {
+      name: "mutable result",
+      operationPager: frozenAdoptionPager(async function readPage() {
+        return { operations: [], nextAfterOperationId: null };
+      }),
+    },
+    {
+      name: "sparse records",
+      operationPager: frozenAdoptionPager(async function readPage() {
+        return Object.freeze({
+          operations: Object.freeze(new Array(1)),
+          nextAfterOperationId: null,
+        });
+      }),
+    },
+    {
+      name: "oversized records",
+      operationPager: frozenAdoptionPager(async function readPage() {
+        return Object.freeze({
+          operations: Object.freeze(new Array(5).fill(preparedRecord())),
+          nextAfterOperationId: null,
+        });
+      }),
+    },
+    {
+      name: "short nonterminal page",
+      operationPager: frozenAdoptionPager(async function readPage() {
+        return Object.freeze({
+          operations: Object.freeze([preparedRecord()]),
+          nextAfterOperationId: "operation-1",
+        });
+      }),
+    },
+    {
+      name: "wrong cursor",
+      operationPager: frozenAdoptionPager(async function readPage() {
+        const operations = Object.freeze(
+          Array.from({ length: 4 }, (_, index) =>
+            preparedRecord({
+              operationId: `operation-${index + 1}`,
+              revision: String(index + 1),
+              storageId: `storage-${index + 1}`,
+            }),
+          ),
+        );
+        return Object.freeze({
+          operations,
+          nextAfterOperationId: "operation-wrong",
+        });
+      }),
+    },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const fixture = legacyAdoptionFixture();
+      const request = pagedAdoptionRequest(fixture.request, {
+        operationPager: entry.operationPager,
+      });
+      await assert.rejects(
+        fixture.pagedAdoptionAuthority.compareAndAdopt(request),
+        authorityError(
+          "invalid_postgres_filesystem_image_provider_state_authority_request",
+        ),
+      );
+      assert.equal(
+        fixture.database.queries.some(([text]) => text === "ROLLBACK"),
+        true,
+      );
+      assert.deepEqual(
+        fixture.database.heads.get(
+          identityKey("filesystem-image-ext4", "host-primary"),
+        ),
+        headRow(fixture.expectedHead, { operationIndexStateRevision: null }),
+      );
+    });
+  }
+});
+
+test("paged adoption rejects operation order, repeated pages, and second-pass mutation", async (t) => {
+  await t.test("operation order", async () => {
+    const fixture = preparedBatchAdoptionFixture(2);
+    const operationPager = frozenPagedAdoptionPager({
+      arrayKey: "operations",
+      cursorKey: "nextAfterOperationId",
+      idAt: (record) => record.operationId,
+      records: [...fixture.operations].reverse(),
+    });
+    await assert.rejects(
+      fixture.pagedAdoptionAuthority.compareAndAdopt(
+        pagedAdoptionRequest(fixture.request, { operationPager }),
+      ),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+  });
+
+  await t.test("repeated page", async () => {
+    const fixture = preparedBatchAdoptionFixture(5);
+    const firstPage = Object.freeze(fixture.operations.slice(0, 4));
+    const operationPager = frozenPagedAdoptionPager({
+      arrayKey: "operations",
+      cursorKey: "nextAfterOperationId",
+      idAt: (record) => record.operationId,
+      records: fixture.operations,
+      transformPage(page, { after, pass }) {
+        if (pass === 1 && after !== null) {
+          return Object.freeze({
+            operations: firstPage,
+            nextAfterOperationId: null,
+          });
+        }
+        return page;
+      },
+    });
+    await assert.rejects(
+      fixture.pagedAdoptionAuthority.compareAndAdopt(
+        pagedAdoptionRequest(fixture.request, { operationPager }),
+      ),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+  });
+
+  await t.test("second-pass content mutation", async () => {
+    const fixture = preparedBatchAdoptionFixture(5);
+    fixture.database.failCommitOnce = true;
+    const operationPager = frozenPagedAdoptionPager({
+      arrayKey: "operations",
+      cursorKey: "nextAfterOperationId",
+      idAt: (record) => record.operationId,
+      records: fixture.operations,
+      transformPage(page, { pass, start }) {
+        if (pass === 2 && start === 0) {
+          return Object.freeze({
+            operations: Object.freeze([
+              {
+                ...page.operations[0],
+                preparedChecksum: "b".repeat(64),
+              },
+              ...page.operations.slice(1),
+            ]),
+            nextAfterOperationId: page.nextAfterOperationId,
+          });
+        }
+        return page;
+      },
+    });
+    await assert.rejects(
+      fixture.pagedAdoptionAuthority.compareAndAdopt(
+        pagedAdoptionRequest(fixture.request, { operationPager }),
+      ),
+      authorityError(
+        "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
+      ),
+    );
+    assert.equal(fixture.database.operations.size, 5);
+  });
+});
+
+test("paged adoption rejects revision holes and storage replay mismatches", async (t) => {
+  await t.test("revision hole", async () => {
+    const fixture = preparedBatchAdoptionFixture(5);
+    const operations = fixture.operations.map((record, index) =>
+      index === 3 ? { ...record, preparedStateRevision: "6" } : record,
+    );
+    await assert.rejects(
+      fixture.pagedAdoptionAuthority.compareAndAdopt(
+        pagedAdoptionRequest({ ...fixture.request, operations }),
+      ),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+    assert.equal(fixture.database.operations.size, 0);
+  });
+
+  await t.test("storage mismatch", async () => {
+    const fixture = legacyAdoptionFixture();
+    const storages = [
+      {
+        currentAttachmentOriginOperationId: null,
+        storage: { ...fixture.committed.storageState, revision: "2" },
+      },
+    ];
+    await assert.rejects(
+      fixture.pagedAdoptionAuthority.compareAndAdopt(
+        pagedAdoptionRequest({ ...fixture.request, storages }),
+      ),
+      authorityError(
+        "invalid_postgres_filesystem_image_provider_state_authority_request",
+      ),
+    );
+    assert.equal(fixture.database.operations.size, 0);
+  });
+});
+
+test("paged adoption rolls back when PostgreSQL TEMP privilege is unavailable", async () => {
+  const fixture = legacyAdoptionFixture();
+  fixture.database.failTempTableOnce = true;
+  await assert.rejects(
+    fixture.pagedAdoptionAuthority.compareAndAdopt(
+      pagedAdoptionRequest(fixture.request),
+    ),
+    authorityError(
+      "postgres_filesystem_image_provider_state_authority_state_invalid",
+    ),
+  );
+  assert.equal(
+    fixture.database.queries.some(([text]) => text === "ROLLBACK"),
+    true,
+  );
+  assert.equal(fixture.database.operations.size, 0);
+  assert.deepEqual(
+    fixture.database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ),
+    headRow(fixture.expectedHead, { operationIndexStateRevision: null }),
+  );
+});
+
+test("paged adoption rebuilds staging from null after a lost commit acknowledgement", async () => {
+  const fixture = completeProvisionAdoptionFixture(5);
+  fixture.database.heads.set(
+    identityKey("filesystem-image-ext4", "host-primary"),
+    headRow(fixture.expectedHead, { operationIndexStateRevision: null }),
+  );
+  fixture.database.failCommitOnce = true;
+  const operationRequests = [];
+  const storageRequests = [];
+  const operationPager = frozenPagedAdoptionPager({
+    arrayKey: "operations",
+    cursorKey: "nextAfterOperationId",
+    idAt: (record) => record.operationId,
+    records: fixture.request.operations,
+    transformPage(page, { after }) {
+      operationRequests.push(after);
+      return page;
+    },
+  });
+  const storagePager = frozenPagedAdoptionPager({
+    arrayKey: "storages",
+    cursorKey: "nextAfterStorageId",
+    idAt: (wrapper) => wrapper.storage.storageId,
+    records: fixture.request.storages,
+    transformPage(page, { after }) {
+      storageRequests.push(after);
+      return page;
+    },
+  });
+  assert.equal(
+    await fixture.pagedAdoptionAuthority.compareAndAdopt(
+      pagedAdoptionRequest(fixture.request, {
+        operationPager,
+        storagePager,
+      }),
+    ),
+    true,
+  );
+  assert.deepEqual(operationRequests, [
+    null,
+    "operation-004",
+    null,
+    "operation-004",
+  ]);
+  assert.deepEqual(storageRequests, [
+    null,
+    "storage-004",
+    null,
+    "storage-004",
+  ]);
+});
+
+test("paged adoption ACK readback returns false only for an exact unchanged source", async () => {
+  const fixture = legacyAdoptionFixture();
+  fixture.database.failCommitBeforeDurabilityOnce = true;
+  assert.equal(
+    await fixture.pagedAdoptionAuthority.compareAndAdopt(
+      pagedAdoptionRequest(fixture.request),
+    ),
+    false,
+  );
+  assert.deepEqual(
+    fixture.database.heads.get(
+      identityKey("filesystem-image-ext4", "host-primary"),
+    ),
+    headRow(fixture.expectedHead, { operationIndexStateRevision: null }),
+  );
+  assert.equal(fixture.database.operations.size, 0);
+});
+
+test("paged adoption ACK readback classifies target row mutation as uncertain", async () => {
+  const fixture = legacyAdoptionFixture();
+  fixture.database.afterCommitOnce = (database) => {
+    const row = database.operations.get(
+      operationKey("filesystem-image-ext4", "host-primary", "operation-1"),
+    );
+    row.adoption_id = null;
+    row.committed_checksum_provenance = "indexed-frame-v1";
+    row.committed_checksum = fixture.expectedHead.lastChecksum;
+  };
+  fixture.database.failCommitOnce = true;
+  await assert.rejects(
+    fixture.pagedAdoptionAuthority.compareAndAdopt(
+      pagedAdoptionRequest(fixture.request),
+    ),
+    authorityError(
+      "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
+    ),
+  );
+});
+
+test(
+  "paged adoption accepts 65,536 lightweight operations",
+  { timeout: 120_000 },
+  async () => {
+    const fixture = lightweightPagedAdoptionCapacityFixture(65_536);
+    assert.equal(
+      await fixture.pagedAdoptionAuthority.compareAndAdopt(
+        pagedAdoptionRequest(fixture.request),
+      ),
+      true,
+    );
+    assert.equal(fixture.database.operations.size, 65_536);
+    assert.equal(
+      fixture.database.heads.get(
+        identityKey("filesystem-image-ext4", "host-primary"),
+      ).operation_index_state_revision,
+      "65536",
+    );
+  },
+);
+
+test(
+  "paged adoption accepts more than 64 MiB of aggregate canonical material",
+  { timeout: 120_000 },
+  async () => {
+    const fixture = completeProvisionAdoptionFixture(
+      32,
+      "x".repeat(700 * 1024),
+    );
+    fixture.database.heads.set(
+      identityKey("filesystem-image-ext4", "host-primary"),
+      headRow(fixture.expectedHead, { operationIndexStateRevision: null }),
+    );
+    fixture.database.recordQueries = false;
+    let aggregateCanonicalBytes = 0;
+    for (let index = 0; index < fixture.operations.length; index += 1) {
+      const record = fixture.operations[index];
+      const prepared = {
+        kind: record.kind,
+        operationId: record.operationId,
+        preparedChecksum: record.preparedChecksum,
+        preparedStateRevision: record.preparedStateRevision,
+        request: record.request,
+        state: "prepared",
+        storageId: record.storageId,
+        storageStateBefore: record.storageStateBefore,
+      };
+      const committedBytes = Buffer.byteLength(canonicalJson(record), "utf8");
+      assert.equal(committedBytes <= 4 * 1024 * 1024, true);
+      aggregateCanonicalBytes +=
+        committedBytes + Buffer.byteLength(canonicalJson(prepared), "utf8");
+      aggregateCanonicalBytes += Buffer.byteLength(
+        canonicalJson(fixture.request.storages[index]),
+        "utf8",
+      );
+    }
+    assert.equal(aggregateCanonicalBytes > 64 * 1024 * 1024, true);
+    assert.equal(
+      await fixture.pagedAdoptionAuthority.compareAndAdopt(
+        pagedAdoptionRequest(fixture.request),
+      ),
+      true,
+    );
+    assert.equal(fixture.database.operations.size, 32);
+  },
+);
+
 test(
   "adoption keeps both complete-array capacities fixed at 65,535",
   { concurrency: false },
@@ -3312,7 +4285,7 @@ test("atomically appends prepared and committed rows with canonical bytes and th
   const lineageReadQuery = lineageReadQueries[0];
   assert.match(
     lineageReadQuery[0],
-    /WHERE provider_id = \$1 AND anchor_id = \$2 AND storage_id = \$3 AND state = 'committed' ORDER BY committed_state_revision DESC, operation_id COLLATE pg_catalog\."C" DESC LIMIT 1/u,
+    /FROM session_authority\.filesystem_image_provider_operations AS operation WHERE operation\.provider_id = \$1 AND operation\.anchor_id = \$2 AND operation\.storage_id = \$3 AND operation\.state = 'committed' ORDER BY operation\.committed_state_revision DESC, operation\.operation_id COLLATE pg_catalog\."C" DESC LIMIT 1/u,
   );
   assert.deepEqual(lineageReadQuery[1], [
     "filesystem-image-ext4",

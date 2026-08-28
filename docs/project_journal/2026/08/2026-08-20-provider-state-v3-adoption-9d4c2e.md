@@ -3,7 +3,7 @@ id: 20260820-9d4c2e
 title: Provider-State Version 3 Adoption
 status: completed
 created: 2026-08-20
-updated: 2026-08-20
+updated: 2026-08-28
 branch: wip/provider-state-v3-adoption
 pr: https://github.com/cha-op/portable-codex-runtime/pull/56
 supersedes: []
@@ -20,6 +20,8 @@ superseded_by:
   recovery work, while PostgreSQL supplies permanent committed replay.
 - Bound ext4-to-Podman attachment reconstruction to the exact committed attach
   or restore-attach origin operation.
+- Completed the capacity follow-up with an explicit paged adoption version 2
+  transport while preserving version 1 and migration 011 unchanged.
 
 ## Current State
 
@@ -42,6 +44,15 @@ superseded_by:
   source and target heads, every canonical operation and checksum-provenance
   choice, final storages, and attachment-origin IDs. Callers never provide the
   manifest ID or PostgreSQL transaction ID.
+- `createPostgresFilesystemImageProviderStatePagedAdoptionAuthority()` has the
+  parallel frozen surface `{ contractVersion: 2, compareAndAdopt }`. Its exact
+  request replaces the complete arrays with contract-version-1 operation and
+  storage pagers. Exclusive cursors make the page streams restartable; the
+  authority fixes every request at four items, stages and replays normalised
+  rows through `pg_temp` relations created with `ON COMMIT DROP` in the same
+  `SERIALIZABLE` transaction, and keeps pager versions, cursors, and page
+  boundaries out of the manifest. The same canonical state therefore retains
+  the exact version 1 manifest bytes for every valid page partition.
 - Migration 011 records the manifest and database-supplied xid on the exact
   covering version 2-to-3 rotation. Only that transaction may import tagged
   rows or write the unavailable legacy committed-checksum provenance. Its
@@ -150,13 +161,13 @@ superseded_by:
   operations, but it is not globally constant.
 - The full-array adoption version 1 request accepts at most 65,535 operations,
   65,535 storages, and 64 MiB of aggregate canonical
-  operation/prepared-projection/storage material. A valid version 2 state
-  outside those operational limits fails with `state_capacity_exhausted`
-  before candidate cleanup or creation. Supporting the wider version 2 format
-  range requires a future streaming or paged adoption contract. These limits
-  apply only to adoption version 1; a legal version 3 runtime projection is
-  instead bounded by its exact stored head and streamed attachment-origin
-  batches, not by the adoption envelope.
+  operation/prepared-projection/storage material. A larger request still fails
+  that exact contract with `state_capacity_exhausted` before candidate cleanup
+  or creation. Paged contract version 2 removes only those full-array transport
+  limits. It does not change the 4 MiB per-record/frame-payload bound, the
+  active-tail 65,535-frame/64 MiB envelope, the uint32 checkpoint-count limits,
+  or legal version 3 runtime projection, which remains bounded by its exact
+  stored head and streamed attachment-origin batches.
 - Runtime projection reads and validates the exact stored head before it
   enumerates or canonicalizes caller-supplied attachment origins. A stale or
   forged expected head therefore cannot select a larger normalization bound or
@@ -173,8 +184,8 @@ superseded_by:
 
 ## Follow-up
 
-- Add a versioned streaming or paged adoption contract for version 2 state
-  beyond the full-array operational capacity.
+- The capacity follow-up is completed in
+  `2026-08-28-provider-state-adoption-capacity-7b6d41.md`.
 - Keep power-loss/crash-prefix evidence, automatic stale-writer fencing,
   differential export/compression, encryption, registry trust, and remote
   transport in separate slices.

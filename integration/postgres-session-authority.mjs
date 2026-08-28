@@ -120,6 +120,7 @@ import {
 import {
   PostgresFilesystemImageProviderStateAuthorityError,
   createPostgresFilesystemImageProviderStateAdoptionAuthority,
+  createPostgresFilesystemImageProviderStatePagedAdoptionAuthority,
   createPostgresFilesystemImageProviderStateAuthority,
   createPostgresFilesystemImageProviderStateRuntimeAuthority,
 } from "../src/postgres-filesystem-image-provider-state-authority.mjs";
@@ -633,6 +634,8 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     `operation-index-concurrent-adoption-${randomUUID()}`;
   const lifecycleRaceAnchorId =
     `operation-index-lifecycle-race-${randomUUID()}`;
+  const lineageOrderingAnchorId =
+    `operation-index-lineage-ordering-${randomUUID()}`;
   const revisionRaceAnchorId =
     `operation-index-revision-race-${randomUUID()}`;
   const progressValidationAnchorId =
@@ -659,6 +662,12 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     });
   const createAdoptionAuthority = (selectedStore, selectedAnchorId) =>
     createPostgresFilesystemImageProviderStateAdoptionAuthority({
+      store: selectedStore,
+      providerId,
+      anchorId: selectedAnchorId,
+    });
+  const createPagedAdoptionAuthority = (selectedStore, selectedAnchorId) =>
+    createPostgresFilesystemImageProviderStatePagedAdoptionAuthority({
       store: selectedStore,
       providerId,
       anchorId: selectedAnchorId,
@@ -766,6 +775,20 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     result: { status: "created" },
     storageState: provisionedStorage(prepared.storageId),
   });
+  const committedCheckpointRecord = (prepared, revision) => ({
+    ...prepared,
+    state: "committed",
+    committedStateRevision: revision,
+    expectedStorage: {
+      lifecycle: prepared.storageStateBefore.lifecycle,
+      revision: prepared.storageStateBefore.revision,
+    },
+    result: { status: "checkpointed" },
+    storageState: {
+      ...prepared.storageStateBefore,
+      revision: (BigInt(prepared.storageStateBefore.revision) + 1n).toString(),
+    },
+  });
   const canonicalRecordJson = (value) => {
     if (value === null || typeof value !== "object") {
       return JSON.stringify(value);
@@ -790,6 +813,60 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
       hash.update(`${bytes.length}\0`, "utf8").update(bytes);
     }
     return hash.digest("hex");
+  };
+  const createOperationPager = (operations, tracker = undefined) => {
+    const readPage = Object.freeze(
+      async function readPage({ afterOperationId, limit }) {
+        if (tracker !== undefined) {
+          tracker.operationRequests.push({ afterOperationId, limit });
+        }
+        const start =
+          afterOperationId === null
+            ? 0
+            : operations.findIndex(
+                ({ operationId }) => operationId > afterOperationId,
+              );
+        const normalizedStart = start === -1 ? operations.length : start;
+        const page = Object.freeze(
+          operations.slice(normalizedStart, normalizedStart + limit),
+        );
+        return Object.freeze({
+          operations: page,
+          nextAfterOperationId:
+            normalizedStart + page.length < operations.length
+              ? page[page.length - 1].operationId
+              : null,
+        });
+      },
+    );
+    return Object.freeze({ contractVersion: 1, readPage });
+  };
+  const createStoragePager = (storages, tracker = undefined) => {
+    const readPage = Object.freeze(
+      async function readPage({ afterStorageId, limit }) {
+        if (tracker !== undefined) {
+          tracker.storageRequests.push({ afterStorageId, limit });
+        }
+        const start =
+          afterStorageId === null
+            ? 0
+            : storages.findIndex(
+                ({ storage }) => storage.storageId > afterStorageId,
+              );
+        const normalizedStart = start === -1 ? storages.length : start;
+        const page = Object.freeze(
+          storages.slice(normalizedStart, normalizedStart + limit),
+        );
+        return Object.freeze({
+          storages: page,
+          nextAfterStorageId:
+            normalizedStart + page.length < storages.length
+              ? page[page.length - 1].storage.storageId
+              : null,
+        });
+      },
+    );
+    return Object.freeze({ contractVersion: 1, readPage });
   };
   const stableStorageProjectionChecksum = (storage) =>
     createHash("sha256")
@@ -2557,6 +2634,105 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     [{ operation_id: operationZ, state: "committed" }],
   );
 
+  // The query projects numeric revisions as text. Revision 11 must still read
+  // committed revision 10 rather than the lexicographically greater 8.
+  const lineageOrderingAuthority = createAuthority(
+    store,
+    lineageOrderingAnchorId,
+  );
+  const lineageOrderingStorageId =
+    `provider-storage-lineage-ordering-${randomUUID()}`;
+  let lineageOrderingHead = genesis;
+  let lineageOrderingStorage = null;
+  const appendLineageOperation = async (kind, index) => {
+    const preparedHead = appendHead(
+      lineageOrderingHead,
+      (BigInt(lineageOrderingHead.stateRevision) + 1n)
+        .toString(16)
+        .padStart(64, "0"),
+      Number(lineageOrderingHead.ledgerBytes) + 512,
+    );
+    const prepared = preparedRecord({
+      checksum: preparedHead.lastChecksum,
+      kind,
+      operationId: `provider-operation-lineage-${index}-${randomUUID()}`,
+      revision: preparedHead.stateRevision,
+      storageId: lineageOrderingStorageId,
+      storageStateBefore: lineageOrderingStorage,
+    });
+    assert.equal(
+      await lineageOrderingAuthority.compareAndAdvance({
+        expectedHead: lineageOrderingHead,
+        nextHead: preparedHead,
+        transition: {
+          contractVersion: 1,
+          type: "append-prepared-v1",
+          frameChecksum: preparedHead.lastChecksum,
+          record: prepared,
+        },
+      }),
+      true,
+    );
+    const committedHead = appendHead(
+      preparedHead,
+      (BigInt(preparedHead.stateRevision) + 1n)
+        .toString(16)
+        .padStart(64, "0"),
+      Number(preparedHead.ledgerBytes) + 512,
+    );
+    const committed =
+      kind === "provision"
+        ? committedRecord(prepared, committedHead.stateRevision)
+        : committedCheckpointRecord(prepared, committedHead.stateRevision);
+    assert.equal(
+      await lineageOrderingAuthority.compareAndAdvance({
+        expectedHead: preparedHead,
+        nextHead: committedHead,
+        transition: {
+          contractVersion: 1,
+          type: "append-committed-v1",
+          frameChecksum: committedHead.lastChecksum,
+          record: committed,
+        },
+      }),
+      true,
+    );
+    lineageOrderingHead = committedHead;
+    lineageOrderingStorage = committed.storageState;
+  };
+  await appendLineageOperation("provision", 0);
+  for (let index = 1; index <= 4; index += 1) {
+    await appendLineageOperation("checkpoint", index);
+  }
+  assert.equal(lineageOrderingHead.stateRevision, "10");
+  assert.equal(lineageOrderingStorage.revision, "5");
+  const crossDigitPreparedHead = appendHead(
+    lineageOrderingHead,
+    "b".repeat(64),
+    Number(lineageOrderingHead.ledgerBytes) + 512,
+  );
+  const crossDigitPrepared = preparedRecord({
+    checksum: crossDigitPreparedHead.lastChecksum,
+    kind: "checkpoint",
+    operationId: `provider-operation-lineage-cross-digit-${randomUUID()}`,
+    revision: crossDigitPreparedHead.stateRevision,
+    storageId: lineageOrderingStorageId,
+    storageStateBefore: lineageOrderingStorage,
+  });
+  assert.equal(
+    await lineageOrderingAuthority.compareAndAdvance({
+      expectedHead: lineageOrderingHead,
+      nextHead: crossDigitPreparedHead,
+      transition: {
+        contractVersion: 1,
+        type: "append-prepared-v1",
+        frameChecksum: crossDigitPreparedHead.lastChecksum,
+        record: crossDigitPrepared,
+      },
+    }),
+    true,
+  );
+
   const duplicateProvisionHead = appendHead(
     committedZHead,
     "2".repeat(64),
@@ -3085,14 +3261,14 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     checkpointFrameCount: streamingOperationCount + 2,
   };
   assert.equal(
-    await createAdoptionAuthority(
+    await createPagedAdoptionAuthority(
       store,
       streamingAdoptionAnchorId,
     ).compareAndAdopt({
       expectedHead: streamingExpectedHead,
       nextHead: streamingCutHead,
-      operations: streamingOperations,
-      storages: [],
+      operationPager: createOperationPager(streamingOperations),
+      storagePager: createStoragePager([]),
     }),
     true,
   );
@@ -3966,49 +4142,45 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     { operations: [], nextAfterStorageId: null },
   );
 
-  const adoptionAcknowledgementLossPreparedHead = appendHead(
-    genesis,
-    "6".repeat(64),
-    512,
-  );
-  const adoptionAcknowledgementLossCommittedHead = appendHead(
-    adoptionAcknowledgementLossPreparedHead,
-    "7".repeat(64),
-    1024,
-  );
-  const adoptionAcknowledgementLossOperationId =
-    `provider-operation-adoption-ack-loss-${randomUUID()}`;
-  const adoptionAcknowledgementLossPrepared = preparedRecord({
-    checksum: adoptionAcknowledgementLossPreparedHead.lastChecksum,
-    operationId: adoptionAcknowledgementLossOperationId,
-    revision: adoptionAcknowledgementLossPreparedHead.stateRevision,
-    storageId: `provider-storage-adoption-ack-loss-${randomUUID()}`,
-  });
-  const adoptionAcknowledgementLossCommitted = committedRecord(
-    adoptionAcknowledgementLossPrepared,
-    adoptionAcknowledgementLossCommittedHead.stateRevision,
-  );
-  const adoptionAcknowledgementLossHeadAnchor = createHeadAnchor(
-    store,
-    adoptionAcknowledgementLossAnchorId,
-  );
+  const adoptionAcknowledgementLossOperations = [];
+  for (let index = 0; index < 5; index += 1) {
+    const ordinal = String(index + 1).padStart(4, "0");
+    const prepared = preparedRecord({
+      checksum: "6".repeat(64),
+      operationId: `provider-operation-adoption-ack-loss-${ordinal}`,
+      revision: String(index * 2 + 1),
+      storageId: `provider-storage-adoption-ack-loss-${ordinal}`,
+    });
+    adoptionAcknowledgementLossOperations.push(
+      committedRecord(prepared, String(index * 2 + 2)),
+    );
+  }
+  const adoptionAcknowledgementLossCommittedHead = {
+    ...genesis,
+    anchorRevision: "10",
+    stateRevision: "10",
+    frameCount: 10,
+    lastChecksum: "7".repeat(64),
+    ledgerBytes: 5_120,
+  };
   assert.equal(
-    await adoptionAcknowledgementLossHeadAnchor.compareAndAdvance({
-      expectedHead: genesis,
-      nextHead: adoptionAcknowledgementLossPreparedHead,
-    }),
-    true,
-  );
-  assert.equal(
-    await adoptionAcknowledgementLossHeadAnchor.compareAndAdvance({
-      expectedHead: adoptionAcknowledgementLossPreparedHead,
-      nextHead: adoptionAcknowledgementLossCommittedHead,
-    }),
-    true,
+    (
+      await pool.query(
+        rawHeadInsertQuery,
+        rawHeadInsertValues(
+          adoptionAcknowledgementLossAnchorId,
+          adoptionAcknowledgementLossCommittedHead,
+          null,
+        ),
+      )
+    ).rowCount,
+    1,
   );
   const adoptionAcknowledgementLossCutHead = {
     ...rotationHead(adoptionAcknowledgementLossCommittedHead),
     contractVersion: FILESYSTEM_IMAGE_PROVIDER_STATE_HEAD_CONTRACT_VERSION,
+    checkpointBytes: 5_120,
+    checkpointFrameCount: 7,
   };
   const adoptionAcknowledgementLossPool =
     commitAcknowledgementLossAfterQueryPool(
@@ -4023,20 +4195,31 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     dedicatedPool: adoptionAcknowledgementLossPool,
     maxTransactionAttempts: 1,
   });
+  const adoptionAcknowledgementLossPagerTracker = {
+    operationRequests: [],
+    storageRequests: [],
+  };
+  const adoptionAcknowledgementLossStorages =
+    adoptionAcknowledgementLossOperations.map((operation) =>
+      Object.freeze({
+        currentAttachmentOriginOperationId: null,
+        storage: operation.storageState,
+      }));
   assert.equal(
-    await createAdoptionAuthority(
+    await createPagedAdoptionAuthority(
       adoptionAcknowledgementLossStore,
       adoptionAcknowledgementLossAnchorId,
     ).compareAndAdopt({
       expectedHead: adoptionAcknowledgementLossCommittedHead,
       nextHead: adoptionAcknowledgementLossCutHead,
-      operations: [adoptionAcknowledgementLossCommitted],
-      storages: [
-        {
-          currentAttachmentOriginOperationId: null,
-          storage: adoptionAcknowledgementLossCommitted.storageState,
-        },
-      ],
+      operationPager: createOperationPager(
+        adoptionAcknowledgementLossOperations,
+        adoptionAcknowledgementLossPagerTracker,
+      ),
+      storagePager: createStoragePager(
+        adoptionAcknowledgementLossStorages,
+        adoptionAcknowledgementLossPagerTracker,
+      ),
     }),
     true,
   );
@@ -4044,6 +4227,34 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
     adoptionAcknowledgementLossPool.didLoseAcknowledgement(),
     true,
   );
+  assert.deepEqual(adoptionAcknowledgementLossPagerTracker.operationRequests, [
+    { afterOperationId: null, limit: 4 },
+    {
+      afterOperationId:
+        adoptionAcknowledgementLossOperations[3].operationId,
+      limit: 4,
+    },
+    { afterOperationId: null, limit: 4 },
+    {
+      afterOperationId:
+        adoptionAcknowledgementLossOperations[3].operationId,
+      limit: 4,
+    },
+  ]);
+  assert.deepEqual(adoptionAcknowledgementLossPagerTracker.storageRequests, [
+    { afterStorageId: null, limit: 4 },
+    {
+      afterStorageId:
+        adoptionAcknowledgementLossStorages[3].storage.storageId,
+      limit: 4,
+    },
+    { afterStorageId: null, limit: 4 },
+    {
+      afterStorageId:
+        adoptionAcknowledgementLossStorages[3].storage.storageId,
+      limit: 4,
+    },
+  ]);
   const durableAdoptionAcknowledgementLossAuthority = createRuntimeAuthority(
     store,
     adoptionAcknowledgementLossAnchorId,
@@ -4055,9 +4266,9 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   assert.deepEqual(
     await durableAdoptionAcknowledgementLossAuthority.readOperation({
       expectedHead: adoptionAcknowledgementLossCutHead,
-      operationId: adoptionAcknowledgementLossOperationId,
+      operationId: adoptionAcknowledgementLossOperations[0].operationId,
     }),
-    adoptionAcknowledgementLossCommitted,
+    adoptionAcknowledgementLossOperations[0],
   );
 
   const acknowledgementLossPool = commitAcknowledgementLossAfterQueryPool(

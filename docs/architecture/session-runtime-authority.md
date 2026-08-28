@@ -2572,12 +2572,12 @@ version 2 adapter accept only `indexed-frame-v1`; an active operation tail also
 requires equality with `head.lastChecksum`.
 
 Migration 011 (schema version 11) adds the one-time adoption receipt and
-transaction window. The provider-locked reducer validates the complete version
-2 checkpoint and active tail, including payload sequence, exact revision
-coverage, one pending operation per storage, full before-state lineage, final
-projection, and attachment origins. It writes and syncs a covering version 3
-checkpoint and empty log before the adoption authority performs its database
-cut.
+transaction window. It remains unchanged by the later paged transport. The
+provider-locked reducer validates the complete version 2 checkpoint and active
+tail, including payload sequence, exact revision coverage, one pending
+operation per storage, full before-state lineage, final projection, and
+attachment origins. It writes and syncs a covering version 3 checkpoint and
+empty log before the adoption authority performs its database cut.
 
 The deterministic manifest binds the provider and anchor, both heads, every
 canonical operation and chosen checksum provenance, all final storages, and
@@ -2591,6 +2591,37 @@ boundary exactly once. Head-only, partial, duplicate, extra, cross-manifest,
 or later-transaction writes roll back. Already-indexed source and target
 history are each revalidated with one ordered row stream; only the legacy
 history import retains fixed 64-row write batches.
+
+The original
+`POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION`
+and `createPostgresFilesystemImageProviderStateAdoptionAuthority()` remain at
+contract version 1 with the exact frozen surface
+`{ contractVersion: 1, compareAndAdopt }` and complete `operations` and
+`storages` request arrays. The explicit
+`POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_PAGED_ADOPTION_AUTHORITY_CONTRACT_VERSION`
+and `createPostgresFilesystemImageProviderStatePagedAdoptionAuthority()` expose
+the exact frozen surface `{ contractVersion: 2, compareAndAdopt }`. Its request
+is exactly `{ expectedHead, nextHead, operationPager, storagePager }`; each
+pager has `{ contractVersion: 1, readPage }`. Operation page requests and
+results are `{ afterOperationId, limit }` and
+`{ operations, nextAfterOperationId }`; storage paging uses the corresponding
+`afterStorageId`, `storages`, and `nextAfterStorageId` fields. The authority,
+not the caller, supplies a fixed `limit` of four. These exclusive cursors make
+collection restartable while bounding each pager invocation. Each
+`SERIALIZABLE` attempt starts each pager at a null cursor exactly once and
+stages its canonical rows; all replay, import, and comparison work later in
+that transaction reads only the temporary relations. A serialization retry or
+acknowledgement-loss readback uses a new transaction and stages each pager once
+again from null. Constant-size manifest IDs and counts retained from the first
+attempt make any cross-attempt source drift fail closed.
+
+Both page streams are normalised into `pg_temp` staging and replay relations
+created with `ON COMMIT DROP` inside the same `SERIALIZABLE` PostgreSQL
+transaction that performs the adoption. The staged canonical rows feed the
+unchanged manifest algorithm, migration 011 import window, and deferred
+coverage proof. Pager contract versions, cursors, and page boundaries are not
+manifest input, so every valid page partition of one state preserves the exact
+version 1 manifest bytes.
 
 Cold adoption recovery identifies the retained predecessor from either its
 checkpoint or its active ledger. Checkpoint envelopes bind their generation;
@@ -2649,17 +2680,23 @@ version 3 appends keep `indexed-frame-v1`; arbitrary-age reads come from the
 permanent index. An adopted prepared row may later acquire a native indexed
 suffix.
 
-Filesystem candidate publication precedes the database adoption. Exact target
-head, marker, manifest, and full-row readback proves success after a lost COMMIT
-acknowledgement; exact unchanged source proves failure; every other observation
-preserves both generations and reports uncertainty. The full-array adoption
-version 1 API admits at most 65,535 operations, 65,535 storages, and 64 MiB of
-aggregate canonical operation/prepared-projection/storage material. Those
-limits apply only to adoption, not to a legal version 3 runtime projection.
-Valid version 2 state outside those adoption limits fails with
-`state_capacity_exhausted` before candidate mutation and requires a future
-streaming contract. Migration 011
-claims every prepared and committed revision in an internal unique event
+Filesystem candidate publication and its durable `pending` marker precede the
+database adoption. Exact target head, marker, manifest, and full-row readback
+prove success after a lost COMMIT acknowledgement; exact unchanged source
+proves failure; every other observation preserves both generations and reports
+uncertainty. Only exact success plus target-projection validation publishes the
+durable `verified` marker, and verified recovery replays the same manifest
+before completing source cleanup. These candidate, pending, acknowledgement-
+loss, verified, and cold-recovery rules are identical for both transport
+versions. The full-array adoption version 1 API remains capped at 65,535
+operations, 65,535 storages, and 64 MiB of aggregate canonical operation/
+prepared-projection/storage material. An oversized version 1 request still
+fails with `state_capacity_exhausted` before candidate mutation. Paged contract
+version 2 removes only those v1 transport limits; the 4 MiB per-record/frame-
+payload bound, active-tail 65,535-frame/64 MiB envelope, uint32 checkpoint-count
+limits, and legal version 3 runtime-projection bounds remain unchanged and
+distinct. Migration 011 claims every prepared and committed revision in an
+internal unique event
 registry. Existing non-null markers are validated during migration; later
 indexed heads can append only one claimed revision or rotate without changing
 the revision, while bulk adoption keeps its full-range deferred proof. A raw

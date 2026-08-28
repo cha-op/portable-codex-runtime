@@ -22,6 +22,8 @@ export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_RUNTIME_AUTHORITY_CONTRACT
   3;
 export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_ADOPTION_AUTHORITY_CONTRACT_VERSION =
   1;
+export const POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_PAGED_ADOPTION_AUTHORITY_CONTRACT_VERSION =
+  2;
 
 const MAX_CANONICAL_BYTES = 768 * 1024;
 const MAX_OPERATION_RECORD_BYTES = 4 * 1024 * 1024;
@@ -43,6 +45,7 @@ const MAX_PAGE_SIZE = 4;
 const MAX_ADOPTION_OPERATIONS = 65_535;
 const MAX_ADOPTION_STORAGES = 65_535;
 const MAX_ADOPTION_INSERT_BATCH_SIZE = 64;
+const PAGED_ADOPTION_PAGE_SIZE = 4;
 // Runtime projection batching is independent from the frozen adoption ABI.
 const MAX_RUNTIME_ATTACHMENT_ORIGIN_BATCH_SIZE = 65_535;
 // The complete-array ABI also has one shared canonical-material budget. The
@@ -122,6 +125,24 @@ const ADOPTION_KEYS = Object.freeze([
   "nextHead",
   "operations",
   "storages",
+]);
+const PAGED_ADOPTION_KEYS = Object.freeze([
+  "expectedHead",
+  "nextHead",
+  "operationPager",
+  "storagePager",
+]);
+const PAGED_ADOPTION_PAGER_KEYS = Object.freeze([
+  "contractVersion",
+  "readPage",
+]);
+const PAGED_ADOPTION_OPERATION_PAGE_KEYS = Object.freeze([
+  "operations",
+  "nextAfterOperationId",
+]);
+const PAGED_ADOPTION_STORAGE_PAGE_KEYS = Object.freeze([
+  "storages",
+  "nextAfterStorageId",
 ]);
 const ADOPTION_STORAGE_KEYS = Object.freeze([
   "currentAttachmentOriginOperationId",
@@ -346,11 +367,11 @@ const READ_ALL_OPERATIONS_QUERY = [
 ].join(" ");
 const READ_LATEST_COMMITTED_STORAGE_QUERY = [
   `SELECT ${OPERATION_COLUMNS}`,
-  "FROM session_authority.filesystem_image_provider_operations",
-  "WHERE provider_id = $1 AND anchor_id = $2 AND storage_id = $3",
-  "AND state = 'committed'",
-  "ORDER BY committed_state_revision DESC,",
-  'operation_id COLLATE pg_catalog."C" DESC',
+  "FROM session_authority.filesystem_image_provider_operations AS operation",
+  "WHERE operation.provider_id = $1 AND operation.anchor_id = $2",
+  "AND operation.storage_id = $3 AND operation.state = 'committed'",
+  "ORDER BY operation.committed_state_revision DESC,",
+  'operation.operation_id COLLATE pg_catalog."C" DESC',
   "LIMIT 1",
 ].join(" ");
 const INSERT_PREPARED_QUERY = [
@@ -416,6 +437,95 @@ const INSERT_ADOPTED_OPERATION_PREFIX = [
   "committed_record_sha256, adoption_id)",
 ].join(" ");
 
+const CREATE_PAGED_ADOPTION_OPERATIONS_STAGE_QUERY = [
+  "CREATE TEMPORARY TABLE pg_temp.filesystem_image_provider_adoption_v2_operations",
+  '(ordinal pg_catalog.numeric PRIMARY KEY, operation_id pg_catalog.text COLLATE pg_catalog."C" NOT NULL UNIQUE,',
+  'storage_id pg_catalog.text COLLATE pg_catalog."C" NOT NULL, prepared_state_revision pg_catalog.numeric NOT NULL,',
+  "committed_state_revision pg_catalog.numeric, record_state pg_catalog.text NOT NULL,",
+  "record_bytes pg_catalog.bytea NOT NULL, record_sha256 pg_catalog.text NOT NULL)",
+  "ON COMMIT DROP",
+].join(" ");
+const CREATE_PAGED_ADOPTION_EVENTS_STAGE_QUERY = [
+  "CREATE TEMPORARY TABLE pg_temp.filesystem_image_provider_adoption_v2_events",
+  "(revision pg_catalog.numeric PRIMARY KEY, event_type pg_catalog.text NOT NULL,",
+  "operation_ordinal pg_catalog.numeric NOT NULL)",
+  "ON COMMIT DROP",
+].join(" ");
+const CREATE_PAGED_ADOPTION_STORAGES_STAGE_QUERY = [
+  "CREATE TEMPORARY TABLE pg_temp.filesystem_image_provider_adoption_v2_storages",
+  '(ordinal pg_catalog.numeric PRIMARY KEY, storage_id pg_catalog.text COLLATE pg_catalog."C" NOT NULL UNIQUE,',
+  'current_attachment_origin_operation_id pg_catalog.text COLLATE pg_catalog."C",',
+  "storage_bytes pg_catalog.bytea NOT NULL, wrapper_bytes pg_catalog.bytea NOT NULL)",
+  "ON COMMIT DROP",
+].join(" ");
+const CREATE_PAGED_ADOPTION_REPLAY_QUERY = [
+  "CREATE TEMPORARY TABLE pg_temp.filesystem_image_provider_adoption_v2_replay",
+  '(storage_id pg_catalog.text COLLATE pg_catalog."C" PRIMARY KEY, storage_bytes pg_catalog.bytea,',
+  'current_attachment_origin_operation_id pg_catalog.text COLLATE pg_catalog."C",',
+  'pending_operation_id pg_catalog.text COLLATE pg_catalog."C")',
+  "ON COMMIT DROP",
+].join(" ");
+const READ_PAGED_ADOPTION_OPERATIONS_STAGE_QUERY = [
+  "SELECT operation.ordinal::pg_catalog.text AS ordinal,",
+  "operation.operation_id, operation.storage_id,",
+  "operation.prepared_state_revision::pg_catalog.text AS prepared_state_revision,",
+  "operation.committed_state_revision::pg_catalog.text AS committed_state_revision,",
+  "operation.record_state, operation.record_bytes, operation.record_sha256",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_operations AS operation",
+  "WHERE operation.ordinal > $1::pg_catalog.numeric",
+  "ORDER BY operation.ordinal",
+  "LIMIT $2::pg_catalog.int4",
+].join(" ");
+const READ_PAGED_ADOPTION_EVENTS_QUERY = [
+  "SELECT event.revision::pg_catalog.text AS revision, event.event_type,",
+  "operation.record_state, operation.record_bytes, operation.record_sha256",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_events AS event",
+  "INNER JOIN pg_temp.filesystem_image_provider_adoption_v2_operations AS operation",
+  "ON operation.ordinal = event.operation_ordinal",
+  "WHERE event.revision > $1::pg_catalog.numeric",
+  "ORDER BY event.revision LIMIT $2::pg_catalog.int4",
+].join(" ");
+const READ_PAGED_ADOPTION_REPLAY_STATES_QUERY = [
+  "SELECT storage_id, storage_bytes, current_attachment_origin_operation_id,",
+  "pending_operation_id",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_replay",
+  "WHERE storage_id = ANY($1::pg_catalog.text[])",
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $2::pg_catalog.int4",
+].join(" ");
+const READ_PAGED_ADOPTION_STORAGES_STAGE_FIRST_QUERY = [
+  "SELECT ordinal::pg_catalog.text AS ordinal, storage_id,",
+  "current_attachment_origin_operation_id, storage_bytes, wrapper_bytes",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_storages",
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $1::pg_catalog.int4",
+].join(" ");
+const READ_PAGED_ADOPTION_STORAGES_STAGE_AFTER_QUERY = [
+  "SELECT ordinal::pg_catalog.text AS ordinal, storage_id,",
+  "current_attachment_origin_operation_id, storage_bytes, wrapper_bytes",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_storages",
+  'WHERE storage_id COLLATE pg_catalog."C" > $1 COLLATE pg_catalog."C"',
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $2::pg_catalog.int4",
+].join(" ");
+const READ_PAGED_ADOPTION_REPLAY_FIRST_QUERY = [
+  "SELECT storage_id, storage_bytes, current_attachment_origin_operation_id,",
+  "pending_operation_id",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_replay",
+  "WHERE storage_bytes IS NOT NULL",
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $1::pg_catalog.int4",
+].join(" ");
+const READ_PAGED_ADOPTION_REPLAY_AFTER_QUERY = [
+  "SELECT storage_id, storage_bytes, current_attachment_origin_operation_id,",
+  "pending_operation_id",
+  "FROM pg_temp.filesystem_image_provider_adoption_v2_replay",
+  "WHERE storage_bytes IS NOT NULL",
+  'AND storage_id COLLATE pg_catalog."C" > $1 COLLATE pg_catalog."C"',
+  'ORDER BY storage_id COLLATE pg_catalog."C"',
+  "LIMIT $2::pg_catalog.int4",
+].join(" ");
+
 const reflectApplyIntrinsic = Reflect.apply;
 const reflectOwnKeysIntrinsic = Reflect.ownKeys;
 const arrayEveryIntrinsic = Array.prototype.every;
@@ -437,6 +547,7 @@ const BufferConstructor = Buffer;
 const createHashIntrinsic = createHash;
 const hashDigestIntrinsic = Hash.prototype.digest;
 const hashUpdateIntrinsic = Hash.prototype.update;
+const isAsyncFunctionValue = utilTypes.isAsyncFunction;
 const isProxyValue = utilTypes.isProxy;
 const jsonParseIntrinsic = JSON.parse;
 const jsonStringifyIntrinsic = JSON.stringify;
@@ -492,12 +603,22 @@ function arrayIncludes(value, candidate) {
   return callIntrinsic(arrayIncludesIntrinsic, value, [candidate]);
 }
 
+function arrayJoin(value, separator) {
+  return callIntrinsic(arrayJoinIntrinsic, value, [separator]);
+}
+
 function arrayIsArray(value) {
   return callIntrinsic(arrayIsArrayIntrinsic, ArrayConstructor, [value]);
 }
 
 function arrayPush(value, candidate) {
   return callIntrinsic(arrayPushIntrinsic, value, [candidate]);
+}
+
+function arrayPushAll(value, candidates) {
+  for (let index = 0; index < candidates.length; index += 1) {
+    arrayPush(value, candidates[index]);
+  }
 }
 
 function bufferByteLength(value, encoding) {
@@ -752,6 +873,25 @@ function frozenDenseDataArrayLength(value, maximumLength, code) {
   // frozen dense indexed payload; each index is validated by descriptor as it
   // is hashed below, and inert extra own properties are not projection input.
   return value.length;
+}
+
+function frozenExactDenseDataArray(value, maximumLength, code) {
+  const length = frozenDenseDataArrayLength(value, maximumLength, code);
+  let keys;
+  try {
+    keys = reflectOwnKeys(value);
+  } catch {
+    fail(code);
+  }
+  ensure(keys.length === length + 1, code);
+  const normalized = [];
+  for (let index = 0; index < length; index += 1) {
+    arrayPush(
+      normalized,
+      ownFrozenDataValue(value, StringConstructor(index), code),
+    );
+  }
+  return objectFreeze(normalized);
 }
 
 function consumeAdoptionCanonicalBytes(budget, bytes, code) {
@@ -2795,6 +2935,997 @@ function normalizeAdoptionRequest(value, identity, code) {
   });
 }
 
+function normalizePagedAdoptionPager(value, code) {
+  const pager = exactDataObject(value, PAGED_ADOPTION_PAGER_KEYS, code);
+  ensure(objectIsFrozen(value), code);
+  const readPage = pager.readPage;
+  ensure(
+    pager.contractVersion === 1 &&
+      typeof readPage === "function" &&
+      !isProxyValue(readPage) &&
+      isAsyncFunctionValue(readPage) &&
+      objectIsFrozen(readPage),
+    code,
+  );
+  return objectFreeze({ contractVersion: 1, readPage });
+}
+
+function normalizePagedAdoptionRequest(value, code) {
+  const input = exactDataObject(value, PAGED_ADOPTION_KEYS, code);
+  const expectedHead = canonicalHead(input.expectedHead, code);
+  const nextHead = canonicalHead(input.nextHead, code);
+  ensure(isAdoptionRotation(expectedHead, nextHead, code), code);
+  return objectFreeze({
+    expectedHead,
+    nextHead,
+    operationPager: normalizePagedAdoptionPager(input.operationPager, code),
+    storagePager: normalizePagedAdoptionPager(input.storagePager, code),
+  });
+}
+
+function beginPagedAdoptionManifest(
+  identity,
+  provenance,
+  expectedHead,
+  nextHead,
+) {
+  const hash = createHashIntrinsic("sha256");
+  callIntrinsic(hashUpdateIntrinsic, hash, [ADOPTION_MANIFEST_DOMAIN]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [
+    `header\0${canonicalString({
+      anchorId: identity.anchorId,
+      expectedHead,
+      nextHead,
+      provenance,
+      providerId: identity.providerId,
+    })}\0`,
+    "utf8",
+  ]);
+  return hash;
+}
+
+function updatePagedAdoptionManifestOperation(hash, material) {
+  callIntrinsic(hashUpdateIntrinsic, hash, ["operation\0", "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [`${material.sha256}\0`, "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [material.bytes]);
+  callIntrinsic(hashUpdateIntrinsic, hash, ["\0", "utf8"]);
+}
+
+function updatePagedAdoptionManifestStorage(hash, wrapperBytes) {
+  callIntrinsic(hashUpdateIntrinsic, hash, ["storage\0", "utf8"]);
+  callIntrinsic(hashUpdateIntrinsic, hash, [wrapperBytes]);
+  callIntrinsic(hashUpdateIntrinsic, hash, ["\0", "utf8"]);
+}
+
+function pagedAdoptionOperationsStageInsertQuery(batchSize) {
+  let tuples = "";
+  for (let index = 0; index < batchSize; index += 1) {
+    const offset = index * 8;
+    if (index !== 0) tuples += ", ";
+    tuples += arrayJoin([
+      `($${offset + 1}::pg_catalog.numeric, $${offset + 2},`,
+      `$${offset + 3}, $${offset + 4}::pg_catalog.numeric,`,
+      `$${offset + 5}::pg_catalog.numeric, $${offset + 6},`,
+      `pg_catalog.decode($${offset + 7}, 'hex'), $${offset + 8})`,
+    ], " ");
+  }
+  return arrayJoin([
+    "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_operations",
+    "(ordinal, operation_id, storage_id, prepared_state_revision,",
+    "committed_state_revision, record_state, record_bytes, record_sha256)",
+    `VALUES ${tuples}`,
+    "ON CONFLICT DO NOTHING RETURNING ordinal::pg_catalog.text AS ordinal",
+  ], " ");
+}
+
+function pagedAdoptionEventsStageInsertQuery(batchSize) {
+  let tuples = "";
+  for (let index = 0; index < batchSize; index += 1) {
+    const offset = index * 3;
+    if (index !== 0) tuples += ", ";
+    tuples += `($${offset + 1}::pg_catalog.numeric, $${offset + 2}, $${
+      offset + 3
+    }::pg_catalog.numeric)`;
+  }
+  return arrayJoin([
+    "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_events",
+    "(revision, event_type, operation_ordinal)",
+    `VALUES ${tuples}`,
+    "ON CONFLICT DO NOTHING RETURNING revision::pg_catalog.text AS revision",
+  ], " ");
+}
+
+function pagedAdoptionStoragesStageInsertQuery(batchSize) {
+  let tuples = "";
+  for (let index = 0; index < batchSize; index += 1) {
+    const offset = index * 5;
+    if (index !== 0) tuples += ", ";
+    tuples += arrayJoin([
+      `($${offset + 1}::pg_catalog.numeric, $${offset + 2},`,
+      `$${offset + 3}, pg_catalog.decode($${offset + 4}, 'hex'),`,
+      `pg_catalog.decode($${offset + 5}, 'hex'))`,
+    ], " ");
+  }
+  return arrayJoin([
+    "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_storages",
+    "(ordinal, storage_id, current_attachment_origin_operation_id,",
+    "storage_bytes, wrapper_bytes)",
+    `VALUES ${tuples}`,
+    "ON CONFLICT DO NOTHING RETURNING ordinal::pg_catalog.text AS ordinal",
+  ], " ");
+}
+
+function pagedAdoptionReplayUpsertQuery(batchSize) {
+  let tuples = "";
+  for (let index = 0; index < batchSize; index += 1) {
+    const offset = index * 4;
+    if (index !== 0) tuples += ", ";
+    tuples += arrayJoin([
+      `($${offset + 1}, CASE WHEN $${offset + 2}::pg_catalog.text IS NULL`,
+      `THEN NULL ELSE pg_catalog.decode($${offset + 2}, 'hex') END,`,
+      `$${offset + 3}, $${offset + 4})`,
+    ], " ");
+  }
+  return arrayJoin([
+    "INSERT INTO pg_temp.filesystem_image_provider_adoption_v2_replay",
+    "(storage_id, storage_bytes, current_attachment_origin_operation_id,",
+    "pending_operation_id)",
+    `VALUES ${tuples}`,
+    "ON CONFLICT (storage_id) DO UPDATE SET",
+    "storage_bytes = EXCLUDED.storage_bytes,",
+    "current_attachment_origin_operation_id =",
+    "EXCLUDED.current_attachment_origin_operation_id,",
+    "pending_operation_id = EXCLUDED.pending_operation_id",
+    "RETURNING storage_id",
+  ], " ");
+}
+
+function commandWithoutRows(result, expectedCommand, code) {
+  const command = ownDataValue(result, "command", code);
+  const rowCount = ownDataValue(result, "rowCount", code);
+  const rows = ownDataValue(result, "rows", code);
+  ensure(
+    command === expectedCommand &&
+      (rowCount === null || rowCount === 0) &&
+      !isProxyValue(rows) &&
+      arrayIsArray(rows) &&
+      objectGetPrototypeOf(rows) === arrayPrototype &&
+      rows.length === 0,
+    code,
+  );
+}
+
+async function createPagedAdoptionTemporaryTables(transaction, code) {
+  const queries = [
+    CREATE_PAGED_ADOPTION_OPERATIONS_STAGE_QUERY,
+    CREATE_PAGED_ADOPTION_EVENTS_STAGE_QUERY,
+    CREATE_PAGED_ADOPTION_STORAGES_STAGE_QUERY,
+    CREATE_PAGED_ADOPTION_REPLAY_QUERY,
+  ];
+  for (let index = 0; index < queries.length; index += 1) {
+    const result = await queryTransaction(transaction, queries[index], [], code);
+    commandWithoutRows(result, "CREATE", code);
+  }
+}
+
+async function callPagedAdoptionReadPage(readPage, request, code) {
+  try {
+    return await callIntrinsic(readPage, undefined, [objectFreeze(request)]);
+  } catch {
+    fail(code);
+  }
+}
+
+function normalizePagedAdoptionOperationPage(value, afterOperationId, code) {
+  const page = exactDataObject(
+    value,
+    PAGED_ADOPTION_OPERATION_PAGE_KEYS,
+    code,
+  );
+  ensure(objectIsFrozen(value), code);
+  const source = frozenExactDenseDataArray(
+    page.operations,
+    PAGED_ADOPTION_PAGE_SIZE,
+    code,
+  );
+  const materials = [];
+  let previousOperationId = afterOperationId;
+  for (let index = 0; index < source.length; index += 1) {
+    const material = recordMaterial(source[index], code);
+    ensure(
+      previousOperationId === null ||
+        material.record.operationId > previousOperationId,
+      code,
+    );
+    previousOperationId = material.record.operationId;
+    arrayPush(materials, material);
+  }
+  const nextAfterOperationId =
+    page.nextAfterOperationId === null
+      ? null
+      : canonicalOpaqueId(page.nextAfterOperationId, code);
+  if (materials.length === 0) {
+    ensure(afterOperationId === null && nextAfterOperationId === null, code);
+  } else if (nextAfterOperationId !== null) {
+    ensure(
+      materials.length === PAGED_ADOPTION_PAGE_SIZE &&
+        nextAfterOperationId ===
+          materials[materials.length - 1].record.operationId,
+      code,
+    );
+  } else {
+    ensure(materials.length <= PAGED_ADOPTION_PAGE_SIZE, code);
+  }
+  return objectFreeze({
+    materials: objectFreeze(materials),
+    nextAfterOperationId,
+  });
+}
+
+function normalizePagedAdoptionStoragePage(value, afterStorageId, code) {
+  const page = exactDataObject(
+    value,
+    PAGED_ADOPTION_STORAGE_PAGE_KEYS,
+    code,
+  );
+  ensure(objectIsFrozen(value), code);
+  const source = frozenExactDenseDataArray(
+    page.storages,
+    PAGED_ADOPTION_PAGE_SIZE,
+    code,
+  );
+  const storages = [];
+  let previousStorageId = afterStorageId;
+  for (let index = 0; index < source.length; index += 1) {
+    const wrapper = exactDataObject(source[index], ADOPTION_STORAGE_KEYS, code);
+    const storage = canonicalStorageState(wrapper.storage, code);
+    const currentAttachmentOriginOperationId =
+      wrapper.currentAttachmentOriginOperationId === null
+        ? null
+        : canonicalOpaqueId(
+            wrapper.currentAttachmentOriginOperationId,
+            code,
+          );
+    ensure(
+      (storage.lifecycle === "attached") ===
+        (currentAttachmentOriginOperationId !== null) &&
+        (previousStorageId === null || storage.storageId > previousStorageId),
+      code,
+    );
+    previousStorageId = storage.storageId;
+    const normalized = objectFreeze({
+      currentAttachmentOriginOperationId,
+      storage,
+    });
+    arrayPush(
+      storages,
+      objectFreeze({
+        storageBytes: bufferFrom(canonicalString(storage), "utf8"),
+        wrapper: normalized,
+        wrapperBytes: bufferFrom(canonicalString(normalized), "utf8"),
+      }),
+    );
+  }
+  const nextAfterStorageId =
+    page.nextAfterStorageId === null
+      ? null
+      : canonicalOpaqueId(page.nextAfterStorageId, code);
+  if (storages.length === 0) {
+    ensure(afterStorageId === null && nextAfterStorageId === null, code);
+  } else if (nextAfterStorageId !== null) {
+    ensure(
+      storages.length === PAGED_ADOPTION_PAGE_SIZE &&
+        nextAfterStorageId ===
+          storages[storages.length - 1].wrapper.storage.storageId,
+      code,
+    );
+  } else {
+    ensure(storages.length <= PAGED_ADOPTION_PAGE_SIZE, code);
+  }
+  return objectFreeze({
+    nextAfterStorageId,
+    storages: objectFreeze(storages),
+  });
+}
+
+async function stagePagedAdoptionOperations(
+  transaction,
+  pager,
+  indexedHash,
+  legacyHash,
+  code,
+) {
+  let afterOperationId = null;
+  let ordinal = 0n;
+  do {
+    const rawPage = await callPagedAdoptionReadPage(
+      pager.readPage,
+      { afterOperationId, limit: PAGED_ADOPTION_PAGE_SIZE },
+      code,
+    );
+    const page = normalizePagedAdoptionOperationPage(
+      rawPage,
+      afterOperationId,
+      code,
+    );
+    const operationValues = [];
+    const eventValues = [];
+    for (let index = 0; index < page.materials.length; index += 1) {
+      ordinal += 1n;
+      const material = page.materials[index];
+      const record = material.record;
+      arrayPushAll(operationValues, [
+        StringConstructor(ordinal),
+        record.operationId,
+        record.storageId,
+        record.preparedStateRevision,
+        record.state === "committed" ? record.committedStateRevision : null,
+        record.state,
+        bufferToString(material.bytes, "hex"),
+        material.sha256,
+      ]);
+      arrayPushAll(eventValues, [
+        record.preparedStateRevision,
+        "prepared",
+        StringConstructor(ordinal),
+      ]);
+      if (record.state === "committed") {
+        arrayPushAll(eventValues, [
+          record.committedStateRevision,
+          "committed",
+          StringConstructor(ordinal),
+        ]);
+      }
+      updatePagedAdoptionManifestOperation(indexedHash, material);
+      updatePagedAdoptionManifestOperation(legacyHash, material);
+    }
+    if (page.materials.length !== 0) {
+      const insertedOperations = await queryTransaction(
+        transaction,
+        pagedAdoptionOperationsStageInsertQuery(page.materials.length),
+        operationValues,
+        code,
+      );
+      ensure(
+        rowsFromResult(
+          insertedOperations,
+          "INSERT",
+          page.materials.length,
+          code,
+        ).length === page.materials.length,
+        code,
+      );
+      const eventCount = eventValues.length / 3;
+      const insertedEvents = await queryTransaction(
+        transaction,
+        pagedAdoptionEventsStageInsertQuery(eventCount),
+        eventValues,
+        code,
+      );
+      ensure(
+        rowsFromResult(insertedEvents, "INSERT", eventCount, code).length ===
+          eventCount,
+        code,
+      );
+    }
+    afterOperationId = page.nextAfterOperationId;
+  } while (afterOperationId !== null);
+  return ordinal;
+}
+
+async function stagePagedAdoptionStorages(
+  transaction,
+  pager,
+  indexedHash,
+  legacyHash,
+  code,
+) {
+  let afterStorageId = null;
+  let ordinal = 0n;
+  do {
+    const rawPage = await callPagedAdoptionReadPage(
+      pager.readPage,
+      { afterStorageId, limit: PAGED_ADOPTION_PAGE_SIZE },
+      code,
+    );
+    const page = normalizePagedAdoptionStoragePage(
+      rawPage,
+      afterStorageId,
+      code,
+    );
+    const values = [];
+    for (let index = 0; index < page.storages.length; index += 1) {
+      ordinal += 1n;
+      const staged = page.storages[index];
+      arrayPushAll(values, [
+        StringConstructor(ordinal),
+        staged.wrapper.storage.storageId,
+        staged.wrapper.currentAttachmentOriginOperationId,
+        bufferToString(staged.storageBytes, "hex"),
+        bufferToString(staged.wrapperBytes, "hex"),
+      ]);
+      updatePagedAdoptionManifestStorage(indexedHash, staged.wrapperBytes);
+      updatePagedAdoptionManifestStorage(legacyHash, staged.wrapperBytes);
+    }
+    if (page.storages.length !== 0) {
+      const inserted = await queryTransaction(
+        transaction,
+        pagedAdoptionStoragesStageInsertQuery(page.storages.length),
+        values,
+        code,
+      );
+      ensure(
+        rowsFromResult(inserted, "INSERT", page.storages.length, code)
+          .length === page.storages.length,
+        code,
+      );
+    }
+    afterStorageId = page.nextAfterStorageId;
+  } while (afterStorageId !== null);
+  return ordinal;
+}
+
+function normalizePagedAdoptionStagedOperationRow(value, code) {
+  const row = exactDataObject(
+    value,
+    [
+      "ordinal",
+      "operation_id",
+      "storage_id",
+      "prepared_state_revision",
+      "committed_state_revision",
+      "record_state",
+      "record_bytes",
+      "record_sha256",
+    ],
+    code,
+  );
+  const ordinal = canonicalUint64(row.ordinal, code, { positive: true }).value;
+  const operationId = canonicalOpaqueId(row.operation_id, code);
+  const storageId = canonicalOpaqueId(row.storage_id, code);
+  const preparedStateRevision = canonicalUint64(
+    row.prepared_state_revision,
+    code,
+    { positive: true },
+  ).value;
+  ensure(row.record_state === "prepared" || row.record_state === "committed", code);
+  const committedStateRevision =
+    row.committed_state_revision === null
+      ? null
+      : canonicalUint64(row.committed_state_revision, code, {
+          positive: true,
+        }).value;
+  ensure(
+    (row.record_state === "committed") ===
+      (committedStateRevision !== null) &&
+      bufferIsBuffer(row.record_bytes) &&
+      row.record_bytes.length >= 1 &&
+      row.record_bytes.length <= MAX_OPERATION_RECORD_BYTES,
+    code,
+  );
+  return objectFreeze({
+    committedStateRevision,
+    operationId,
+    ordinal,
+    preparedStateRevision,
+    recordBytes: bufferFrom(row.record_bytes),
+    recordSha256: canonicalChecksum(row.record_sha256, code),
+    recordState: row.record_state,
+    storageId,
+  });
+}
+
+function normalizePagedAdoptionStagedStorageRow(value, code) {
+  const row = exactDataObject(
+    value,
+    [
+      "ordinal",
+      "storage_id",
+      "current_attachment_origin_operation_id",
+      "storage_bytes",
+      "wrapper_bytes",
+    ],
+    code,
+  );
+  ensure(
+    bufferIsBuffer(row.storage_bytes) &&
+      row.storage_bytes.length >= 1 &&
+      row.storage_bytes.length <= MAX_OPERATION_RECORD_BYTES &&
+      bufferIsBuffer(row.wrapper_bytes) &&
+      row.wrapper_bytes.length >= 1 &&
+      row.wrapper_bytes.length <= MAX_OPERATION_RECORD_BYTES,
+    code,
+  );
+  return objectFreeze({
+    currentAttachmentOriginOperationId:
+      row.current_attachment_origin_operation_id === null
+        ? null
+        : canonicalOpaqueId(
+            row.current_attachment_origin_operation_id,
+            code,
+          ),
+    ordinal: canonicalUint64(row.ordinal, code, { positive: true }).value,
+    storageBytes: bufferFrom(row.storage_bytes),
+    storageId: canonicalOpaqueId(row.storage_id, code),
+    wrapperBytes: bufferFrom(row.wrapper_bytes),
+  });
+}
+
+async function readPagedAdoptionStagedOperations(
+  transaction,
+  afterOrdinal,
+  limit,
+  code,
+) {
+  const result = await queryTransaction(
+    transaction,
+    READ_PAGED_ADOPTION_OPERATIONS_STAGE_QUERY,
+    [afterOrdinal, StringConstructor(limit)],
+    code,
+  );
+  const rows = rowsFromResult(result, "SELECT", limit, code);
+  const normalized = [];
+  let previousOrdinal = BigIntConstructor(afterOrdinal);
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = normalizePagedAdoptionStagedOperationRow(rows[index], code);
+    ensure(BigIntConstructor(row.ordinal) === previousOrdinal + 1n, code);
+    previousOrdinal += 1n;
+    arrayPush(normalized, row);
+  }
+  return objectFreeze(normalized);
+}
+
+function parsePagedAdoptionStorageBytes(value, code) {
+  ensure(
+    bufferIsBuffer(value) &&
+      value.length >= 1 &&
+      value.length <= MAX_OPERATION_RECORD_BYTES,
+    code,
+  );
+  const bytes = bufferFrom(value);
+  const text = bufferToString(bytes, "utf8");
+  ensure(bufferEquals(bufferFrom(text, "utf8"), bytes), code);
+  let parsed;
+  try {
+    parsed = jsonParseIntrinsic(text);
+  } catch {
+    fail(code);
+  }
+  const storage = canonicalStorageState(parsed, code);
+  ensure(
+    bufferEquals(bufferFrom(canonicalString(storage), "utf8"), bytes),
+    code,
+  );
+  return storage;
+}
+
+function normalizePagedAdoptionReplayRow(value, code) {
+  const row = exactDataObject(
+    value,
+    [
+      "storage_id",
+      "storage_bytes",
+      "current_attachment_origin_operation_id",
+      "pending_operation_id",
+    ],
+    code,
+  );
+  const storage =
+    row.storage_bytes === null
+      ? null
+      : parsePagedAdoptionStorageBytes(row.storage_bytes, code);
+  const currentAttachmentOriginOperationId =
+    row.current_attachment_origin_operation_id === null
+      ? null
+      : canonicalOpaqueId(
+          row.current_attachment_origin_operation_id,
+          code,
+        );
+  ensure(
+    storage === null
+      ? currentAttachmentOriginOperationId === null
+      : (storage.lifecycle === "attached") ===
+        (currentAttachmentOriginOperationId !== null),
+    code,
+  );
+  return objectFreeze({
+    currentAttachmentOriginOperationId,
+    pendingOperationId:
+      row.pending_operation_id === null
+        ? null
+        : canonicalOpaqueId(row.pending_operation_id, code),
+    storage,
+    storageId: canonicalOpaqueId(row.storage_id, code),
+  });
+}
+
+async function readPagedAdoptionReplayStates(
+  transaction,
+  storageIds,
+  code,
+) {
+  const result = await queryTransaction(
+    transaction,
+    READ_PAGED_ADOPTION_REPLAY_STATES_QUERY,
+    [postgresTextArrayLiteral(storageIds), StringConstructor(storageIds.length)],
+    code,
+  );
+  const rows = rowsFromResult(result, "SELECT", storageIds.length, code);
+  const states = new MapConstructor();
+  for (let index = 0; index < rows.length; index += 1) {
+    const state = normalizePagedAdoptionReplayRow(rows[index], code);
+    ensure(
+      arrayIncludes(storageIds, state.storageId) &&
+        !mapHas(states, state.storageId),
+      code,
+    );
+    mapSet(states, state.storageId, {
+      currentAttachmentOriginOperationId:
+        state.currentAttachmentOriginOperationId,
+      pendingOperationId: state.pendingOperationId,
+      storage: state.storage,
+    });
+  }
+  for (let index = 0; index < storageIds.length; index += 1) {
+    const storageId = storageIds[index];
+    if (!mapHas(states, storageId)) {
+      mapSet(states, storageId, {
+        currentAttachmentOriginOperationId: null,
+        pendingOperationId: null,
+        storage: null,
+      });
+    }
+  }
+  return states;
+}
+
+async function writePagedAdoptionReplayStates(
+  transaction,
+  storageIds,
+  states,
+  code,
+) {
+  const values = [];
+  for (let index = 0; index < storageIds.length; index += 1) {
+    const storageId = storageIds[index];
+    const state = mapGet(states, storageId);
+    arrayPushAll(values, [
+      storageId,
+      state.storage === null
+        ? null
+        : bufferToString(
+            bufferFrom(canonicalString(state.storage), "utf8"),
+            "hex",
+          ),
+      state.currentAttachmentOriginOperationId,
+      state.pendingOperationId,
+    ]);
+  }
+  const result = await queryTransaction(
+    transaction,
+    pagedAdoptionReplayUpsertQuery(storageIds.length),
+    values,
+    code,
+  );
+  ensure(
+    rowsFromResult(result, "INSERT", storageIds.length, code).length ===
+      storageIds.length,
+    code,
+  );
+}
+
+async function replayPagedAdoptionEvents(
+  transaction,
+  expectedHead,
+  code,
+) {
+  let previousRevision = 0n;
+  for (;;) {
+    const result = await queryTransaction(
+      transaction,
+      READ_PAGED_ADOPTION_EVENTS_QUERY,
+      [StringConstructor(previousRevision), StringConstructor(PAGED_ADOPTION_PAGE_SIZE)],
+      code,
+    );
+    const rows = rowsFromResult(
+      result,
+      "SELECT",
+      PAGED_ADOPTION_PAGE_SIZE,
+      code,
+    );
+    if (rows.length === 0) break;
+    const events = [];
+    const storageIds = [];
+    const storageIdSet = new SetConstructor();
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = exactDataObject(
+        rows[index],
+        [
+          "revision",
+          "event_type",
+          "record_state",
+          "record_bytes",
+          "record_sha256",
+        ],
+        code,
+      );
+      const revision = canonicalUint64(row.revision, code, {
+        positive: true,
+      }).value;
+      ensure(
+        BigIntConstructor(revision) === previousRevision + 1n &&
+          (row.event_type === "prepared" || row.event_type === "committed") &&
+          (row.record_state === "prepared" || row.record_state === "committed") &&
+          (row.event_type !== "committed" || row.record_state === "committed"),
+        code,
+      );
+      const material = parseRecordBytes(
+        row.record_bytes,
+        row.record_state,
+        canonicalChecksum(row.record_sha256, code),
+        code,
+      );
+      ensure(
+        revision ===
+          (row.event_type === "prepared"
+            ? material.record.preparedStateRevision
+            : material.record.committedStateRevision),
+        code,
+      );
+      previousRevision += 1n;
+      arrayPush(events, objectFreeze({ material, type: row.event_type }));
+      if (!callIntrinsic(setHasIntrinsic, storageIdSet, [material.record.storageId])) {
+        callIntrinsic(setAddIntrinsic, storageIdSet, [material.record.storageId]);
+        arrayPush(storageIds, material.record.storageId);
+      }
+    }
+    const states = await readPagedAdoptionReplayStates(
+      transaction,
+      storageIds,
+      code,
+    );
+    for (let index = 0; index < events.length; index += 1) {
+      const event = events[index];
+      const record = event.material.record;
+      const state = mapGet(states, record.storageId);
+      if (event.type === "prepared") {
+        ensure(
+          state.pendingOperationId === null &&
+            canonicalEqual(state.storage, record.storageStateBefore),
+          code,
+        );
+        assertPreparePrecondition(state.storage, record.kind, code);
+        state.pendingOperationId = record.operationId;
+        continue;
+      }
+      ensure(state.pendingOperationId === record.operationId, code);
+      state.pendingOperationId = null;
+      assertStorageTransition(
+        state.storage,
+        record.storageState,
+        record.kind,
+        code,
+      );
+      let nextOrigin = state.currentAttachmentOriginOperationId;
+      if (record.storageState.lifecycle !== "attached") {
+        nextOrigin = null;
+      } else if (
+        record.kind === "attach" ||
+        record.kind === "restore-attach"
+      ) {
+        nextOrigin = record.operationId;
+      }
+      ensure(
+        nextOrigin !== null || record.storageState.lifecycle !== "attached",
+        code,
+      );
+      state.storage = record.storageState;
+      state.currentAttachmentOriginOperationId = nextOrigin;
+    }
+    await writePagedAdoptionReplayStates(
+      transaction,
+      storageIds,
+      states,
+      code,
+    );
+  }
+  ensure(
+    previousRevision === BigIntConstructor(expectedHead.stateRevision),
+    code,
+  );
+}
+
+async function readPagedAdoptionStagedStoragePage(
+  transaction,
+  afterStorageId,
+  code,
+) {
+  const result = await queryTransaction(
+    transaction,
+    afterStorageId === null
+      ? READ_PAGED_ADOPTION_STORAGES_STAGE_FIRST_QUERY
+      : READ_PAGED_ADOPTION_STORAGES_STAGE_AFTER_QUERY,
+    afterStorageId === null
+      ? [StringConstructor(PAGED_ADOPTION_PAGE_SIZE)]
+      : [afterStorageId, StringConstructor(PAGED_ADOPTION_PAGE_SIZE)],
+    code,
+  );
+  const rows = rowsFromResult(
+    result,
+    "SELECT",
+    PAGED_ADOPTION_PAGE_SIZE,
+    code,
+  );
+  const normalized = [];
+  let previousStorageId = afterStorageId;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = normalizePagedAdoptionStagedStorageRow(rows[index], code);
+    ensure(
+      previousStorageId === null || row.storageId > previousStorageId,
+      code,
+    );
+    previousStorageId = row.storageId;
+    arrayPush(normalized, row);
+  }
+  return objectFreeze(normalized);
+}
+
+async function readPagedAdoptionCurrentReplayPage(
+  transaction,
+  afterStorageId,
+  code,
+) {
+  const result = await queryTransaction(
+    transaction,
+    afterStorageId === null
+      ? READ_PAGED_ADOPTION_REPLAY_FIRST_QUERY
+      : READ_PAGED_ADOPTION_REPLAY_AFTER_QUERY,
+    afterStorageId === null
+      ? [StringConstructor(PAGED_ADOPTION_PAGE_SIZE)]
+      : [afterStorageId, StringConstructor(PAGED_ADOPTION_PAGE_SIZE)],
+    code,
+  );
+  const rows = rowsFromResult(
+    result,
+    "SELECT",
+    PAGED_ADOPTION_PAGE_SIZE,
+    code,
+  );
+  const normalized = [];
+  let previousStorageId = afterStorageId;
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = normalizePagedAdoptionReplayRow(rows[index], code);
+    ensure(
+      row.storage !== null &&
+        (previousStorageId === null || row.storageId > previousStorageId),
+      code,
+    );
+    previousStorageId = row.storageId;
+    arrayPush(normalized, row);
+  }
+  return objectFreeze(normalized);
+}
+
+async function validatePagedAdoptionStorages(transaction, code) {
+  let stagedAfterStorageId = null;
+  let replayAfterStorageId = null;
+  for (;;) {
+    const staged = await readPagedAdoptionStagedStoragePage(
+      transaction,
+      stagedAfterStorageId,
+      code,
+    );
+    const replay = await readPagedAdoptionCurrentReplayPage(
+      transaction,
+      replayAfterStorageId,
+      code,
+    );
+    ensure(staged.length === replay.length, code);
+    if (staged.length === 0) return;
+    for (let index = 0; index < staged.length; index += 1) {
+      const expected = staged[index];
+      const observed = replay[index];
+      const expectedStorage = parsePagedAdoptionStorageBytes(
+        expected.storageBytes,
+        code,
+      );
+      ensure(
+        expected.storageId === expectedStorage.storageId &&
+          expected.storageId === observed.storageId &&
+          canonicalEqual(expectedStorage, observed.storage) &&
+          expected.currentAttachmentOriginOperationId ===
+            observed.currentAttachmentOriginOperationId,
+        code,
+      );
+      const expectedWrapper = objectFreeze({
+        currentAttachmentOriginOperationId:
+          expected.currentAttachmentOriginOperationId,
+        storage: expectedStorage,
+      });
+      ensure(
+        bufferEquals(
+          expected.wrapperBytes,
+          bufferFrom(canonicalString(expectedWrapper), "utf8"),
+        ),
+        code,
+      );
+    }
+    stagedAfterStorageId = staged[staged.length - 1].storageId;
+    replayAfterStorageId = replay[replay.length - 1].storageId;
+  }
+}
+
+async function preparePagedAdoptionMaterialInTransaction(
+  transaction,
+  identity,
+  input,
+  requestCode,
+  stateCode,
+) {
+  await createPagedAdoptionTemporaryTables(transaction, stateCode);
+  const indexedHash = beginPagedAdoptionManifest(
+    identity,
+    "indexed-frame-v1-retained",
+    input.expectedHead,
+    input.nextHead,
+  );
+  const legacyHash = beginPagedAdoptionManifest(
+    identity,
+    "unavailable-adopted-v2",
+    input.expectedHead,
+    input.nextHead,
+  );
+  const operationCount = await stagePagedAdoptionOperations(
+    transaction,
+    input.operationPager,
+    indexedHash,
+    legacyHash,
+    requestCode,
+  );
+  const storageCount = await stagePagedAdoptionStorages(
+    transaction,
+    input.storagePager,
+    indexedHash,
+    legacyHash,
+    requestCode,
+  );
+  const manifestIds = objectFreeze({
+    indexed: callIntrinsic(hashDigestIntrinsic, indexedHash, ["hex"]),
+    legacy: callIntrinsic(hashDigestIntrinsic, legacyHash, ["hex"]),
+  });
+  await replayPagedAdoptionEvents(
+    transaction,
+    input.expectedHead,
+    requestCode,
+  );
+  await validatePagedAdoptionStorages(transaction, requestCode);
+  return objectFreeze({
+    ...input,
+    manifestIds,
+    operationCount,
+    storageCount,
+  });
+}
+
+function requireDeterministicPagedAdoptionMaterial(input, state, code) {
+  if (state.value === null) {
+    state.value = objectFreeze({
+      indexedManifestId: input.manifestIds.indexed,
+      legacyManifestId: input.manifestIds.legacy,
+      operationCount: input.operationCount,
+      storageCount: input.storageCount,
+    });
+    return;
+  }
+  ensure(
+    state.value.indexedManifestId === input.manifestIds.indexed &&
+      state.value.legacyManifestId === input.manifestIds.legacy &&
+      state.value.operationCount === input.operationCount &&
+      state.value.storageCount === input.storageCount,
+    code,
+  );
+}
+
 function selectAdoptionManifest(input, mode) {
   return objectFreeze({
     ...input,
@@ -3227,6 +4358,373 @@ async function resolveAdoptionCommitOutcome(store, identity, input, code) {
           observed,
           input,
           code,
+        );
+        return false;
+      }
+      fail(
+        "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
+      );
+    });
+  } catch {
+    fail(
+      "postgres_filesystem_image_provider_state_adoption_commit_outcome_uncertain",
+    );
+  }
+}
+
+async function verifyPagedAdoptionRowsInTransaction(
+  transaction,
+  identity,
+  snapshot,
+  input,
+  mode,
+  code,
+) {
+  let afterOrdinal = "0";
+  let afterOperationId = null;
+  for (;;) {
+    const staged = await readPagedAdoptionStagedOperations(
+      transaction,
+      afterOrdinal,
+      PAGED_ADOPTION_PAGE_SIZE,
+      code,
+    );
+    const limit = staged.length === 0 ? 1 : staged.length;
+    const result = await queryTransaction(
+      transaction,
+      afterOperationId === null
+        ? READ_OPERATIONS_PAGE_FIRST_QUERY
+        : READ_OPERATIONS_PAGE_AFTER_QUERY,
+      afterOperationId === null
+        ? [identity.providerId, identity.anchorId, StringConstructor(limit)]
+        : [
+            identity.providerId,
+            identity.anchorId,
+            afterOperationId,
+            StringConstructor(limit),
+          ],
+      code,
+    );
+    const rows = rowsFromResult(result, "SELECT", limit, code);
+    ensure(rows.length === staged.length, code);
+    if (staged.length === 0) return;
+    for (let index = 0; index < rows.length; index += 1) {
+      const material = normalizeOperationRow(rows[index], identity, code);
+      const expected = staged[index];
+      assertOperationVisibleAtHead(material, snapshot, code);
+      ensure(
+        material.record.operationId === expected.operationId &&
+          material.record.storageId === expected.storageId &&
+          material.record.preparedStateRevision ===
+            expected.preparedStateRevision &&
+          (material.record.state === "committed"
+            ? material.record.committedStateRevision ===
+              expected.committedStateRevision
+            : expected.committedStateRevision === null) &&
+          material.record.state === expected.recordState &&
+          material.sha256 === expected.recordSha256 &&
+          bufferEquals(material.bytes, expected.recordBytes),
+        code,
+      );
+      if (mode === "indexed") {
+        ensure(
+          material.adoptionId === null &&
+            (material.record.state !== "committed" ||
+              (material.committedChecksumProvenance === "indexed-frame-v1" &&
+                material.committedChecksum !== null)),
+          code,
+        );
+      } else {
+        ensure(
+          mode === "legacy" &&
+            material.adoptionId === input.manifestId &&
+            (material.record.state !== "committed" ||
+              (material.committedChecksumProvenance ===
+                "unavailable-adopted-v2" &&
+                material.committedChecksum === null)),
+          code,
+        );
+      }
+    }
+    afterOrdinal = staged[staged.length - 1].ordinal;
+    afterOperationId = staged[staged.length - 1].operationId;
+  }
+}
+
+async function ensurePagedAdoptionRowsEmptyInTransaction(
+  transaction,
+  identity,
+  code,
+) {
+  const result = await queryTransaction(
+    transaction,
+    READ_OPERATIONS_PAGE_FIRST_QUERY,
+    [identity.providerId, identity.anchorId, "1"],
+    code,
+  );
+  ensure(rowsFromResult(result, "SELECT", 1, code).length === 0, code);
+}
+
+async function sourcePagedAdoptionModeInTransaction(
+  transaction,
+  identity,
+  snapshot,
+  input,
+  code,
+) {
+  ensure(
+    snapshot.exists &&
+      headEqual(snapshot.head, input.expectedHead) &&
+      snapshot.operationIndexAdoptionId === null &&
+      snapshot.operationIndexAdoptionXid === null,
+    code,
+  );
+  if (snapshot.operationIndexStateRevision === null) {
+    await ensurePagedAdoptionRowsEmptyInTransaction(
+      transaction,
+      identity,
+      code,
+    );
+    return "legacy";
+  }
+  ensure(
+    snapshot.operationIndexStateRevision === input.expectedHead.stateRevision,
+    code,
+  );
+  await verifyPagedAdoptionRowsInTransaction(
+    transaction,
+    identity,
+    snapshot,
+    selectAdoptionManifest(input, "indexed"),
+    "indexed",
+    code,
+  );
+  return "indexed";
+}
+
+async function verifyTargetPagedAdoptionInTransaction(
+  transaction,
+  identity,
+  snapshot,
+  input,
+  code,
+) {
+  ensure(targetAdoptionSnapshotMatches(snapshot, input), code);
+  await verifyPagedAdoptionRowsInTransaction(
+    transaction,
+    identity,
+    snapshot,
+    input,
+    input.sourceMode,
+    code,
+  );
+}
+
+async function insertPagedAdoptedOperationsInTransaction(
+  transaction,
+  identity,
+  input,
+  code,
+) {
+  let afterOrdinal = "0";
+  for (;;) {
+    const staged = await readPagedAdoptionStagedOperations(
+      transaction,
+      afterOrdinal,
+      PAGED_ADOPTION_PAGE_SIZE,
+      code,
+    );
+    if (staged.length === 0) return;
+    const materials = [];
+    const values = [];
+    for (let index = 0; index < staged.length; index += 1) {
+      const row = staged[index];
+      const material = parseRecordBytes(
+        row.recordBytes,
+        row.recordState,
+        row.recordSha256,
+        code,
+      );
+      ensure(
+        material.record.operationId === row.operationId &&
+          material.record.storageId === row.storageId &&
+          material.record.preparedStateRevision === row.preparedStateRevision &&
+          (material.record.state === "prepared" ||
+            material.record.committedStateRevision ===
+              row.committedStateRevision),
+        code,
+      );
+      arrayPush(materials, material);
+      arrayPushAll(
+        values,
+        adoptedOperationValues(identity, material, input.manifestId, code),
+      );
+    }
+    const result = await queryTransaction(
+      transaction,
+      adoptedOperationBatchQuery(staged.length),
+      values,
+      code,
+    );
+    const rows = rowsFromResult(result, "INSERT", staged.length, code);
+    ensure(rows.length === staged.length, code);
+    const returned = new MapConstructor();
+    for (let index = 0; index < rows.length; index += 1) {
+      const stored = normalizeOperationRow(rows[index], identity, code);
+      ensure(!mapHas(returned, stored.record.operationId), code);
+      mapSet(returned, stored.record.operationId, stored);
+    }
+    for (let index = 0; index < materials.length; index += 1) {
+      const material = materials[index];
+      const stored = mapGet(returned, material.record.operationId);
+      ensure(
+        stored !== undefined &&
+          operationMaterialsEqual(stored, material) &&
+          stored.adoptionId === input.manifestId &&
+          (stored.record.state !== "committed" ||
+            (stored.committedChecksumProvenance ===
+              "unavailable-adopted-v2" &&
+              stored.committedChecksum === null)),
+        code,
+      );
+    }
+    afterOrdinal = staged[staged.length - 1].ordinal;
+  }
+}
+
+async function compareAndAdoptPagedInTransaction(
+  transaction,
+  identity,
+  outerInput,
+  deterministicMaterial,
+  requestCode,
+  stateCode,
+) {
+  const input = await preparePagedAdoptionMaterialInTransaction(
+    transaction,
+    identity,
+    outerInput,
+    requestCode,
+    stateCode,
+  );
+  requireDeterministicPagedAdoptionMaterial(
+    input,
+    deterministicMaterial,
+    requestCode,
+  );
+  const observed = await readHeadSnapshotInTransaction(
+    transaction,
+    identity,
+    stateCode,
+    true,
+    FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+  );
+  const idempotentInput = selectedAdoptionForTarget(observed, input);
+  if (idempotentInput !== null) {
+    await verifyTargetPagedAdoptionInTransaction(
+      transaction,
+      identity,
+      observed,
+      idempotentInput,
+      stateCode,
+    );
+    return true;
+  }
+  if (!observed.exists || !headEqual(observed.head, input.expectedHead)) {
+    return false;
+  }
+  const sourceMode = await sourcePagedAdoptionModeInTransaction(
+    transaction,
+    identity,
+    observed,
+    input,
+    stateCode,
+  );
+  const selectedInput = selectAdoptionManifest(input, sourceMode);
+  const update = await queryTransaction(
+    transaction,
+    ADOPT_HEAD_QUERY,
+    adoptionHeadValues(
+      identity,
+      selectedInput,
+      observed.operationIndexStateRevision,
+    ),
+    stateCode,
+  );
+  const rows = rowsFromResult(update, "UPDATE", 1, stateCode);
+  if (rows.length === 0) return false;
+  const adopted = normalizeHeadRow(rows[0], identity, stateCode);
+  ensure(targetAdoptionSnapshotMatches(adopted, selectedInput), stateCode);
+  if (sourceMode === "legacy") {
+    await insertPagedAdoptedOperationsInTransaction(
+      transaction,
+      identity,
+      selectedInput,
+      stateCode,
+    );
+  }
+  await verifyTargetPagedAdoptionInTransaction(
+    transaction,
+    identity,
+    adopted,
+    selectedInput,
+    stateCode,
+  );
+  return true;
+}
+
+async function resolvePagedAdoptionCommitOutcome(
+  store,
+  identity,
+  outerInput,
+  deterministicMaterial,
+  requestCode,
+  stateCode,
+) {
+  try {
+    return await runSerializable(store, async (transaction) => {
+      const input = await preparePagedAdoptionMaterialInTransaction(
+        transaction,
+        identity,
+        outerInput,
+        requestCode,
+        stateCode,
+      );
+      requireDeterministicPagedAdoptionMaterial(
+        input,
+        deterministicMaterial,
+        requestCode,
+      );
+      const observed = await readHeadSnapshotInTransaction(
+        transaction,
+        identity,
+        stateCode,
+        true,
+        FILESYSTEM_IMAGE_PROVIDER_STATE_V2_HEAD_CONTRACT_VERSION,
+      );
+      const selectedInput = selectedAdoptionForTarget(observed, input);
+      if (selectedInput !== null) {
+        await verifyTargetPagedAdoptionInTransaction(
+          transaction,
+          identity,
+          observed,
+          selectedInput,
+          stateCode,
+        );
+        return true;
+      }
+      if (
+        observed.exists &&
+        headEqual(observed.head, input.expectedHead) &&
+        observed.operationIndexAdoptionId === null &&
+        observed.operationIndexAdoptionXid === null
+      ) {
+        await sourcePagedAdoptionModeInTransaction(
+          transaction,
+          identity,
+          observed,
+          input,
+          stateCode,
         );
         return false;
       }
@@ -3703,8 +5201,78 @@ export function createPostgresFilesystemImageProviderStateAdoptionAuthority(
   });
 }
 
+export function createPostgresFilesystemImageProviderStatePagedAdoptionAuthority(
+  ...args
+) {
+  const optionCode =
+    "invalid_postgres_filesystem_image_provider_state_authority_options";
+  ensure(args.length === 1, optionCode);
+  const options = exactDataObject(args[0], OPTION_KEYS, optionCode);
+  ensure(
+    callIntrinsic(isPostgresSerializableStore, undefined, [options.store]) ===
+      true,
+    optionCode,
+  );
+  const store = options.store;
+  const identity = objectFreeze({
+    providerId: canonicalOpaqueId(options.providerId, optionCode),
+    anchorId: canonicalOpaqueId(options.anchorId, optionCode),
+  });
+  const requestCode =
+    "invalid_postgres_filesystem_image_provider_state_authority_request";
+  const stateCode =
+    "postgres_filesystem_image_provider_state_authority_state_invalid";
+
+  const compareAndAdopt = async function compareAndAdopt(...adoptionArgs) {
+    ensure(adoptionArgs.length === 1, requestCode);
+    const input = normalizePagedAdoptionRequest(
+      adoptionArgs[0],
+      requestCode,
+    );
+    const deterministicMaterial = { value: null };
+    try {
+      return await runSerializable(store, async (transaction) =>
+        await compareAndAdoptPagedInTransaction(
+          transaction,
+          identity,
+          input,
+          deterministicMaterial,
+          requestCode,
+          stateCode,
+        ),
+      );
+    } catch (error) {
+      if (
+        error instanceof PostgresSerializableStoreError &&
+        error.code === "transaction_commit_outcome_uncertain" &&
+        error.commitState === "uncertain"
+      ) {
+        return await resolvePagedAdoptionCommitOutcome(
+          store,
+          identity,
+          input,
+          deterministicMaterial,
+          requestCode,
+          stateCode,
+        );
+      }
+      throw error;
+    }
+  };
+
+  objectFreeze(compareAndAdopt);
+  return objectFreeze({
+    contractVersion:
+      POSTGRES_FILESYSTEM_IMAGE_PROVIDER_STATE_PAGED_ADOPTION_AUTHORITY_CONTRACT_VERSION,
+    compareAndAdopt,
+  });
+}
+
 objectFreeze(PostgresFilesystemImageProviderStateAuthorityError.prototype);
 objectFreeze(PostgresFilesystemImageProviderStateAuthorityError);
 objectFreeze(createPostgresFilesystemImageProviderStateAuthority);
 objectFreeze(createPostgresFilesystemImageProviderStateRuntimeAuthority);
 objectFreeze(createPostgresFilesystemImageProviderStateAdoptionAuthority);
+objectFreeze(
+  createPostgresFilesystemImageProviderStatePagedAdoptionAuthority,
+);
