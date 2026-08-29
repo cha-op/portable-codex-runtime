@@ -78,6 +78,8 @@ const EXECUTABLES = Object.freeze({
 const ORIGIN_SIZE_BYTES = 64 * 1024 * 1024;
 const SNAPSHOT_COW_BYTES = 16 * 1024 * 1024;
 const BACKING_SIZE_BYTES = 160 * 1024 * 1024;
+const MAX_DIAGNOSTIC_TEXT_BYTES = 1024;
+const MAX_COMMAND_DIAGNOSTICS = 32;
 
 function exact(values) {
   return Object.freeze(Object.assign(Object.create(null), values));
@@ -89,6 +91,14 @@ function deepFreeze(value) {
     for (const child of Object.values(value)) deepFreeze(child);
   }
   return value;
+}
+
+function boundedDiagnosticText(value) {
+  if (typeof value !== "string") return "";
+  if (Buffer.byteLength(value, "utf8") <= MAX_DIAGNOSTIC_TEXT_BYTES) {
+    return value;
+  }
+  return `${Buffer.from(value, "utf8").subarray(0, MAX_DIAGNOSTIC_TEXT_BYTES).toString("utf8")}...[truncated]`;
 }
 
 async function command(executable, args, options = {}) {
@@ -385,11 +395,37 @@ test(
     let resolveCalls = 0;
     let authorityCalls = 0;
     let snapshotLvcreateCalls = 0;
+    const commandDiagnostics = [];
     const commandRunner = async (executable, args, options) => {
       if (executable === EXECUTABLES.lvcreate && args[0] === "--snapshot") {
         snapshotLvcreateCalls += 1;
       }
-      return command(executable, args, options);
+      try {
+        const completion = await command(executable, args, options);
+        if (commandDiagnostics.length < MAX_COMMAND_DIAGNOSTICS) {
+          commandDiagnostics.push({
+            args: [...args],
+            executable,
+            status: "ok",
+            stderr: boundedDiagnosticText(completion.stderr),
+            stdout: boundedDiagnosticText(completion.stdout),
+          });
+        }
+        return completion;
+      } catch (error) {
+        if (commandDiagnostics.length < MAX_COMMAND_DIAGNOSTICS) {
+          commandDiagnostics.push({
+            args: [...args],
+            code: error?.code ?? null,
+            executable,
+            signal: error?.signal ?? null,
+            status: "failed",
+            stderr: boundedDiagnosticText(error?.stderr),
+            stdout: boundedDiagnosticText(error?.stdout),
+          });
+        }
+        throw error;
+      }
     };
     const driver = createLvmAtomicCrashCaptureDriver({
       blockdevExecutable: EXECUTABLES.blockdev,
@@ -462,10 +498,21 @@ test(
       backend: firstProvider,
       request,
     });
-    const captured = await capturePreparedAtomicCrashCheckpoint({
-      captureAuthority: stoppedCapability,
-      preparedCapture: prepared,
-    });
+    let captured;
+    try {
+      captured = await capturePreparedAtomicCrashCheckpoint({
+        captureAuthority: stoppedCapability,
+        preparedCapture: prepared,
+      });
+    } catch (error) {
+      t.diagnostic(JSON.stringify({
+        authorityCalls,
+        commandDiagnostics,
+        resolveCalls,
+        snapshotLvcreateCalls,
+      }));
+      throw error;
+    }
     assert.equal(captured.artifact.objectIdentityScheme, "lvm-lv-uuid-v1");
     assert.equal(captured.artifact.readOnly, true);
     assert.equal(captured.artifact.byteLength, String(ORIGIN_SIZE_BYTES));
