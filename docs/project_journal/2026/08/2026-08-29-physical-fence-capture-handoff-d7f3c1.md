@@ -98,6 +98,11 @@ superseded_by:
   `SESSION_AUTHORITY_DATABASE_URL` is not configured locally. The Ubuntu
   PostgreSQL CI job remains the required execution evidence for migration 013,
   its deferred terminal-blocker constraint, and the same-transaction handoff.
+- The first PostgreSQL CI execution exposed one invalid schema-qualified SQL
+  type alias in migration 013: `pg_catalog.bigint` is not a catalog type name.
+  The migration now uses the canonical `pg_catalog.int8` name used elsewhere
+  in the repository; the current-head PostgreSQL rerun supplies the execution
+  evidence for that correction.
 
 ## Evidence
 

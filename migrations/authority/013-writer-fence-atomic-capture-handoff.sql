@@ -445,7 +445,7 @@ BEGIN
             ) = capture.request #> '{expectedSession,document}'
             AND session.revision =
               (capture.request #>>
-                '{expectedSession,revision}')::pg_catalog.bigint + 1
+                '{expectedSession,revision}')::pg_catalog.int8 + 1
             AND session.created_at =
               (capture.request #>>
                 '{expectedSession,createdAt}')::pg_catalog.timestamptz
