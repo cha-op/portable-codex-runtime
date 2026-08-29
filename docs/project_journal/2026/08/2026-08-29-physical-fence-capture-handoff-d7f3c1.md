@@ -101,8 +101,16 @@ superseded_by:
 - The first PostgreSQL CI execution exposed one invalid schema-qualified SQL
   type alias in migration 013: `pg_catalog.bigint` is not a catalog type name.
   The migration now uses the canonical `pg_catalog.int8` name used elsewhere
-  in the repository; the current-head PostgreSQL rerun supplies the execution
-  evidence for that correction.
+  in the repository. The next execution reached the V2 scenario and exposed
+  two integration-fixture defects: the successor-conflict assertion erased an
+  active pointer without restoring snapshot revision consistency, and legacy
+  row-by-row teardown attempted to delete the deliberately immutable blocker.
+  The fixture now submits the capture operation's valid active-null predecessor
+  snapshot, allowing the stored active blocker to win before stale-snapshot
+  comparison, and rebuilds its dedicated authority schema between top-level
+  scenarios. Production constraints remain unchanged; the current-head
+  PostgreSQL rerun supplies final execution evidence for the migration and
+  fixture corrections.
 
 ## Evidence
 

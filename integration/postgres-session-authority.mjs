@@ -9856,124 +9856,21 @@ test(
     const assembledDurableCutEvidence = new Map();
     t.after(async () => {
       try {
-        if (sessionIds.length > 0) {
-          const cleanupClient = await pool.connect();
-          let cleanupTransactionOpen = false;
-          try {
-            await cleanupClient.query("BEGIN");
-            cleanupTransactionOpen = true;
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.restore_destination_generations",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.checkpoint_catalogue",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.capture_attempt_tombstones",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.capture_attempt_claims",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.writer_supervisor_state_gc",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.writer_supervisor_state_owners",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.reservations",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.operation_claims",
-                "WHERE operation_id IN (",
-                "SELECT operation_id",
-                "FROM session_authority.operation_id_registry",
-                "WHERE session_id = ANY($1::uuid[])",
-                "AND claim_type IN (",
-                "'restore-launch-intent-v2',",
-                "'restore-activation-launch-intent-v1',",
-                "'writer-stop-capture-intent-v3',",
-                "'writer-fence-atomic-capture-intent-v2'",
-                ")",
-                ")",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.operation_id_registry",
-                "WHERE session_id = ANY($1::uuid[])",
-                "AND claim_type IN (",
-                "'restore-launch-intent-v2',",
-                "'restore-activation-launch-intent-v1',",
-                "'writer-stop-capture-intent-v3',",
-                "'writer-fence-atomic-capture-intent-v2'",
-                ")",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.operation_claims",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.operation_id_registry",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query(
-              [
-                "DELETE FROM session_authority.sessions",
-                "WHERE session_id = ANY($1::uuid[])",
-              ].join(" "),
-              [sessionIds],
-            );
-            await cleanupClient.query("COMMIT");
-            cleanupTransactionOpen = false;
-          } finally {
-            if (cleanupTransactionOpen) {
-              await cleanupClient.query("ROLLBACK");
-            }
-            cleanupClient.release();
-          }
-        }
+        await guardPool.end();
       } finally {
         try {
-          await guardPool.end();
+          // This file owns a dedicated integration schema and already rebuilds
+          // it from scratch. Reset that schema between top-level scenarios so
+          // cleanup cannot weaken the production blocker's no-delete invariant.
+          if (sessionIds.length > 0) {
+            await pool.query(
+              "DROP SCHEMA IF EXISTS session_authority CASCADE",
+            );
+            const resetStore = new PostgresSerializableStore({
+              dedicatedPool: pool,
+            });
+            await resetStore.migrate();
+          }
         } finally {
           await pool.end();
         }
@@ -12011,9 +11908,9 @@ test(
           readBack,
         );
 
-        const successorExpected = structuredClone(handedOff.session);
-        successorExpected.document.activeOperation = null;
-        const successorInput = writerAttachmentInput(successorExpected);
+        const successorInput = writerAttachmentInput(
+          handedOff.capture.operation.expectedSession,
+        );
         const beforeSuccessorReserve = await authority.readSession({
           sessionId,
         });
