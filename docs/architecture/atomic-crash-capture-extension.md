@@ -404,15 +404,50 @@ restore a writable generation, or admit a higher-epoch writer. Until those
 later transitions exist, an exact committed handoff remains fail-closed and
 the session stays blocked from successor admission.
 
+## Private Podman Verified-Stop Fence
+
+The first concrete V2 provider is a private, local verified-stop adapter for
+the exact rootless Podman writer launched by the trusted supervisor. Its
+protected property is deliberately narrower than storage fencing: the exact
+`(supervisorId, stateOwnerId, launchAttemptId, containerId,
+processIncarnationId, writerIncarnationId)` incarnation no longer has its
+supervised `/session` write access to the exact source attachment. It does not
+claim that an arbitrary host process, another Podman engine, a remote writer,
+or the block device itself has been fenced.
+
+Fresh provider dispatch starts only from the exact durable `started` record
+bound to the force-fence operation. Before Podman stop it commits the same
+operation ID as the supervisor's stop identity. It then joins the container
+lifecycle, requires exact stopped inspection with no container PID, persists
+the revision-4 stopped tombstone, removes the exact container, and proves both
+the anchored container name and complete container ID absent. The opaque fence
+proof binds the complete force-fence request and terminal supervisor identity;
+lease expiry, the newly allocated database epoch, pathname absence, or a bare
+PID exit cannot produce it.
+
+The optional force-fence reconciliation extension admits no second logical
+dispatch. An exact `stopping` record may continue only its already-authorized
+idempotent stop, and an exact revision-4 record may repeat removal plus both
+absence observations. A still-`started`, missing, crossed, unreadable, or
+otherwise ambiguous record returns non-authorizing `unknown`. The V2
+composition uses committed provider readback only to finish the dedicated
+atomic handoff finalizer; committed authority replay performs no provider
+work.
+
+The composition stops at the existing `DETACHED` session with the predetermined
+atomic capture still active in `prepared`. It does not call the capture
+catalogue or LVM provider, create an artifact, release the blocker, repair a
+tail, or admit a successor writer. The assembled ext4 backend and public
+deployment remain `fencing: "manual"`; this private opt-in path therefore does
+not widen production capability discovery.
+
 ## Deliberate Non-Capabilities
 
-The complete-stop composition and durable physical-fence handoff foundation
-still do not provide or select:
+The complete-stop composition, durable handoff, and private verified-stop
+provider still do not provide or select:
 
-- a concrete automatic stale-writer fence provider or real provider evidence;
-  version 2 authenticates a proof returned by a separately trusted provider,
-  while the complete-stop path accepts only its conclusively joined local
-  writer stop;
+- fencing for a remote, partitioned, administrator-created, or otherwise
+  unsupervised writer, or storage-native epoch enforcement;
 - dispatch or reconciliation of the prepared physical-fence-bound capture, or
   release of that durable blocker;
 - integration with the current clean checkpoint path, lifecycle facade,
@@ -421,13 +456,13 @@ still do not provide or select:
 - restore or publication of a writable restore destination; or
 - admission of a new writer lease or fencing epoch.
 
-The private composition closes only the local complete-stop branch. The
-durable version 2 handoff closes the restart-safe authority gap between an
-authenticated physical fence and a prepared atomic capture, but it does not
-perform either external effect. A future production recovery path must connect
-a real fence provider and atomic provider to that authority before stale-writer
-takeover is possible. Cloud, filesystem-native, thin-LVM, and other snapshot
-adapters also remain separate work.
+The private provider closes only the exact locally supervised Podman-writer
+branch. The durable version 2 handoff now consumes that authenticated physical
+stop and installs the prepared atomic capture, but it does not dispatch the
+capture. A future production recovery path must finish that exact capture,
+repair, and successor-admission sequence before stale-writer takeover is
+usable. Remote-host, cloud, filesystem-native, storage-epoch, thin-LVM, and
+other fence or snapshot adapters remain separate work.
 
 ## Required Future Ordering
 

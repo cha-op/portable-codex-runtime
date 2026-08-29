@@ -212,6 +212,8 @@ const WRITER_FORCE_FENCE_FINALIZATION_INPUT_KEYS = Object.freeze([
   "operationId",
   "request",
 ]);
+const WRITER_FORCE_FENCE_PROVIDER_BINDING_READ_INPUT_KEYS =
+  Object.freeze(["operationId"]);
 const WRITER_FORCE_FENCE_ATOMIC_CAPTURE_HANDOFF_PROOF_KEYS =
   Object.freeze([
     "before",
@@ -7018,6 +7020,21 @@ function writerForceFenceFinalizationInput(options) {
     expectedOperationRevision,
     fenceResult: structurallyCanonicalForceFenceResult(
       normalized.fenceResult,
+      "invalid_operation_request",
+    ),
+  });
+}
+
+function writerForceFenceProviderBindingReadInput(options) {
+  const normalized = exactPlainObject(
+    options,
+    WRITER_FORCE_FENCE_PROVIDER_BINDING_READ_INPUT_KEYS,
+    "invalid_operation_request",
+  );
+  return deepFreeze({
+    operationId: canonicalOpaqueId(
+      normalized.operationId,
+      128,
       "invalid_operation_request",
     ),
   });
@@ -14825,6 +14842,69 @@ export class PostgresSessionAuthority {
     });
   }
 
+  async readWriterForceFenceProviderBinding(options) {
+    const readInput = writerForceFenceProviderBindingReadInput(options);
+    return runSerializable(this.#store, async (transaction) => {
+      const operation = await readOperationSnapshot(
+        transaction,
+        readInput.operationId,
+        false,
+      );
+      ensure(
+        operation !== null &&
+          operation.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
+          (operation.state === "starting" ||
+            operation.state === "uncertain"),
+        "operation_state_invalid",
+      );
+      const input = canonicalOperationInput(
+        inputForOperation(operation),
+        OPERATION_INPUT_KEYS,
+      );
+      const request = writerForceFenceOperationRequest(
+        input,
+        "operation_state_invalid",
+      );
+      ensure(
+        request.contractVersion ===
+          WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2,
+        "operation_state_invalid",
+      );
+      const session = await readSessionSnapshot(
+        transaction,
+        operation.sessionId,
+        false,
+      );
+      const reservation = await readReservationSnapshot(
+        transaction,
+        operation.operationId,
+        false,
+      );
+      ensure(reservation !== null, "operation_state_invalid");
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      validateActivePointer(session, operation, reservation);
+      const relation =
+        await validateWriterForceFenceAtomicCaptureRelations(
+          transaction,
+          operation,
+          false,
+        );
+      ensure(relation !== null, "operation_state_invalid");
+      const writerEpoch = session.document.writerEpoch;
+      return deepFreeze({
+        expectedSession: input.expectedSession,
+        fenceRequest: forceFenceRequestFor(
+          input,
+          writerEpoch,
+          "operation_state_invalid",
+        ),
+        operationId: input.operationId,
+        writerEpoch,
+      });
+    });
+  }
+
   async reconcileWriterForceFenceAtomicCaptureHandoff(options) {
     const input = canonicalOperationInput(options);
     const request = writerForceFenceOperationRequest(input);
@@ -14863,7 +14943,22 @@ export class PostgresSessionAuthority {
             observed,
           );
         }
+        const writerEpoch =
+          observed.operation.state === "starting" ||
+          observed.operation.state === "uncertain"
+            ? session.document.writerEpoch
+            : null;
         return operationReceipt({
+          ...(writerEpoch === null
+            ? {}
+            : {
+                fenceRequest: forceFenceRequestFor(
+                  input,
+                  writerEpoch,
+                  "operation_state_invalid",
+                ),
+                writerEpoch,
+              }),
           operation: observed.operation,
           reservation: observed.reservation,
           session,

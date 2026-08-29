@@ -20,6 +20,7 @@ import {
   SESSION_AUTH_MODE,
   SESSION_WORKER_LAYOUT,
   SESSION_WORKER_ROOT,
+  STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
   SessionStorageContractError,
   assertAtomicCrashCaptureBackend,
   assertAtomicCrashCaptureRequest,
@@ -49,6 +50,8 @@ import {
   assertStorageBackend,
   assertStorageBackendCapabilities,
   assertStorageForceFenceRequest,
+  assertStorageForceFenceReconciliationBackend,
+  assertStorageForceFenceReconciliationResult,
   assertStorageForceFenceResult,
   assertStorageMutationMatchesLeaseSnapshot,
   assertStorageMutationRequest,
@@ -2320,6 +2323,94 @@ test("checkpoint capture reconciliation is an optional versioned backend extensi
   }
 });
 
+test("storage force-fence reconciliation is an optional versioned backend extension", () => {
+  const base = storageBackend();
+  assert.equal(STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION, 1);
+  assert.equal(assertStorageBackend(base), base);
+  assert.throws(
+    () => assertStorageForceFenceReconciliationBackend(base),
+    assertCode("invalid_storage_backend"),
+  );
+
+  const reconcileForceFence = async () => {};
+  const extended = {
+    ...base,
+    forceFenceReconciliationContractVersion:
+      STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    reconcileForceFence,
+  };
+  assert.equal(assertStorageBackend(extended), extended);
+  assert.equal(
+    assertStorageForceFenceReconciliationBackend(extended),
+    extended,
+  );
+
+  for (const invalid of [
+    { ...extended, forceFenceReconciliationContractVersion: 2 },
+    { ...extended, reconcileForceFence: undefined },
+    { ...extended, reconcileForceFence: Promise.resolve() },
+    { ...extended, reconcileForceFence: { then() {} } },
+    { ...extended, reconcileForceFence: new Proxy(reconcileForceFence, {}) },
+  ]) {
+    assert.throws(
+      () => assertStorageForceFenceReconciliationBackend(invalid),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+
+  let reads = 0;
+  for (const field of [
+    "forceFenceReconciliationContractVersion",
+    "reconcileForceFence",
+  ]) {
+    const accessor = { ...extended };
+    Object.defineProperty(accessor, field, {
+      enumerable: true,
+      get() {
+        reads += 1;
+        return field === "forceFenceReconciliationContractVersion"
+          ? STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION
+          : reconcileForceFence;
+      },
+    });
+    assert.throws(
+      () => assertStorageForceFenceReconciliationBackend(accessor),
+      assertCode("invalid_storage_backend"),
+    );
+  }
+  assert.equal(reads, 0);
+
+  const inherited = Object.create({
+    forceFenceReconciliationContractVersion:
+      STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    reconcileForceFence,
+  });
+  Object.assign(inherited, base);
+  assert.throws(
+    () => assertStorageForceFenceReconciliationBackend(inherited),
+    assertCode("invalid_storage_backend"),
+  );
+
+  let traps = 0;
+  const hostile = new Proxy(extended, {
+    get() {
+      traps += 1;
+      throw new Error("force-fence reconciliation proxy get must not run");
+    },
+    getOwnPropertyDescriptor() {
+      traps += 1;
+      throw new Error(
+        "force-fence reconciliation proxy descriptor must not run",
+      );
+    },
+  });
+  assert.throws(
+    () => assertStorageForceFenceReconciliationBackend(hostile),
+    assertCode("invalid_storage_backend"),
+  );
+  assert.equal(traps, 0);
+});
+
 test("prepared checkpoint capture is an optional versioned backend extension", () => {
   const base = storageBackend();
   assert.equal(PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION, 1);
@@ -3078,6 +3169,225 @@ test("storage force-fence envelopes are exact frozen defensive proofs", () => {
     () => assertStorageMutationRequest(forceFenceRequest()),
     assertCode("invalid_storage_mutation"),
   );
+});
+
+test("storage force-fence reconciliation returns exact frozen committed or unknown outcomes", () => {
+  const request = forceFenceRequest();
+  const result = {
+    ...request,
+    proofId: "proof-force-fence-001",
+    status: "fenced",
+  };
+  const committedInput = {
+    contractVersion: STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "committed",
+    result,
+  };
+  const unknownInput = {
+    contractVersion: STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "unknown",
+    result: null,
+  };
+
+  const committed = assertStorageForceFenceReconciliationResult(
+    committedInput,
+    { request },
+  );
+  const unknown = assertStorageForceFenceReconciliationResult(unknownInput, {
+    request,
+  });
+
+  assert.deepEqual(committed, committedInput);
+  assert.deepEqual(unknown, unknownInput);
+  assert.equal(Object.isFrozen(committed), true);
+  assert.equal(Object.isFrozen(committed.result), true);
+  assert.equal(Object.isFrozen(committed.result.revokedFence), true);
+  assert.equal(Object.isFrozen(committed.result.target), true);
+  assert.equal(Object.isFrozen(unknown), true);
+  assert.equal(Object.hasOwn(unknown, "result"), true);
+  assert.equal(unknown.result, null);
+
+  result.proofId = "proof-mutated";
+  result.revokedFence.holderId = "holder-mutated";
+  result.target.attachmentId = "attachment-mutated";
+  assert.equal(committed.result.proofId, "proof-force-fence-001");
+  assert.equal(committed.result.revokedFence.holderId, "host-001");
+  assert.equal(committed.result.target.attachmentId, "attachment-001");
+});
+
+test("storage force-fence reconciliation rejects crossed request projections and non-proofs", () => {
+  const request = forceFenceRequest();
+  const resultFor = (candidate) => ({
+    ...candidate,
+    proofId: "proof-force-fence-crossed",
+    status: "fenced",
+  });
+  const crossedRequests = [
+    forceFenceRequest({ backendId: "other-backend" }),
+    forceFenceRequest({ fencingEpoch: "9007199254740995" }),
+    forceFenceRequest({ operationId: "operation-force-fence-002" }),
+    forceFenceRequest({ sessionId: OTHER_RUNTIME_SESSION_ID }),
+    forceFenceRequest({ storageId: "volume-002" }),
+    forceFenceRequest({
+      revokedFence: {
+        ...request.revokedFence,
+        fencingEpoch: "9007199254740992",
+      },
+    }),
+    forceFenceRequest({
+      revokedFence: { ...request.revokedFence, holderId: "host-002" },
+    }),
+    forceFenceRequest({
+      revokedFence: { ...request.revokedFence, leaseId: "lease-002" },
+    }),
+    forceFenceRequest({
+      target: { ...request.target, attachmentId: "attachment-002" },
+    }),
+  ];
+
+  for (const crossed of crossedRequests) {
+    assert.throws(
+      () =>
+        assertStorageForceFenceReconciliationResult(
+          {
+            contractVersion:
+              STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+            outcome: "committed",
+            result: resultFor(crossed),
+          },
+          { request },
+        ),
+      assertCode("invalid_storage_force_fence_reconciliation"),
+    );
+  }
+
+  for (const invalidResult of [
+    { ...resultFor(request), proofId: "" },
+    { ...resultFor(request), proofId: "proof/crossed" },
+    { ...resultFor(request), status: "detached" },
+  ]) {
+    assert.throws(
+      () =>
+        assertStorageForceFenceReconciliationResult(
+          {
+            contractVersion:
+              STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+            outcome: "committed",
+            result: invalidResult,
+          },
+          { request },
+        ),
+      assertCode("invalid_storage_force_fence_reconciliation"),
+    );
+  }
+});
+
+test("storage force-fence reconciliation keeps unknown fail-closed and rejects executable envelopes", () => {
+  const request = forceFenceRequest();
+  const result = {
+    ...request,
+    proofId: "proof-force-fence-001",
+    status: "fenced",
+  };
+  const committed = {
+    contractVersion: STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "committed",
+    result,
+  };
+  const unknown = {
+    contractVersion: STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "unknown",
+    result: null,
+  };
+
+  for (const invalid of [
+    { ...committed, contractVersion: 2 },
+    { ...committed, outcome: "unknown" },
+    { ...committed, result: null },
+    { ...committed, unexpected: true },
+    { ...unknown, outcome: "absent" },
+    { ...unknown, outcome: "absent-and-quiescent" },
+    { ...unknown, result },
+    { ...unknown, unexpected: true },
+    {
+      contractVersion: STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+      outcome: "unknown",
+    },
+    Promise.resolve(unknown),
+    {
+      ...unknown,
+      then() {},
+    },
+  ]) {
+    assert.throws(
+      () => assertStorageForceFenceReconciliationResult(invalid, { request }),
+      assertCode("invalid_storage_force_fence_reconciliation"),
+    );
+  }
+
+  assert.throws(
+    () => assertStorageForceFenceReconciliationResult(unknown),
+    assertCode("invalid_storage_force_fence_reconciliation"),
+  );
+  assert.throws(
+    () =>
+      assertStorageForceFenceReconciliationResult(unknown, {
+        request,
+        previousResult: result,
+      }),
+    assertCode("invalid_storage_force_fence_reconciliation"),
+  );
+
+  let reads = 0;
+  const accessor = { ...unknown };
+  Object.defineProperty(accessor, "outcome", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return "unknown";
+    },
+  });
+  assert.throws(
+    () => assertStorageForceFenceReconciliationResult(accessor, { request }),
+    assertCode("invalid_storage_force_fence_reconciliation"),
+  );
+
+  const options = { request };
+  Object.defineProperty(options, "request", {
+    enumerable: true,
+    get() {
+      reads += 1;
+      return request;
+    },
+  });
+  assert.throws(
+    () => assertStorageForceFenceReconciliationResult(unknown, options),
+    assertCode("invalid_storage_force_fence_reconciliation"),
+  );
+  assert.equal(reads, 0);
+
+  let traps = 0;
+  const hostile = new Proxy(unknown, {
+    get() {
+      traps += 1;
+      throw new Error("force-fence reconciliation proxy get must not run");
+    },
+    getPrototypeOf() {
+      traps += 1;
+      throw new Error(
+        "force-fence reconciliation proxy prototype must not run",
+      );
+    },
+    ownKeys() {
+      traps += 1;
+      throw new Error("force-fence reconciliation proxy keys must not run");
+    },
+  });
+  assert.throws(
+    () => assertStorageForceFenceReconciliationResult(hostile, { request }),
+    assertCode("invalid_storage_force_fence_reconciliation"),
+  );
+  assert.equal(traps, 0);
 });
 
 test("storage force-fence requests reject invalid exact fields and non-advancing epochs", () => {

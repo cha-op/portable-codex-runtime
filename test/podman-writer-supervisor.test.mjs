@@ -31,17 +31,28 @@ import {
   PODMAN_WRITER_LAUNCH_RECEIPT_VERSION,
   PODMAN_WRITER_RECONCILE_RECEIPT_VERSION,
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+  PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
   PodmanWriterSupervisorError,
   createPodmanWriterFilesystemAuthorityComposition,
   createPodmanWriterSupervisor,
   createPodmanWriterSupervisorBundle,
+  getPodmanWriterVerifiedStopFenceController,
   isPodmanWriterSupervisorBundlePair,
 } from "../src/podman-writer-supervisor.mjs";
+import {
+  PODMAN_EXT4_VERIFIED_STOP_FENCE_PROVIDER_CONTRACT_VERSION,
+  PodmanExt4VerifiedStopFenceProviderError,
+  createPodmanExt4VerifiedStopFenceProvider,
+} from "../src/podman-ext4-verified-stop-fence-provider.mjs";
 import {
   PODMAN_WRITER_SUPERVISOR_STATE_COLLECTION_CONTRACT_VERSION,
   createPodmanWriterSupervisorStateBundle,
   preparePodmanWriterSupervisorStateOwner,
 } from "../src/podman-writer-supervisor-state.mjs";
+import {
+  assertStorageForceFenceReconciliationBackend,
+  assertStorageForceFenceResult,
+} from "../src/session-storage-contracts.mjs";
 
 const DIGEST = `sha256:${"a".repeat(64)}`;
 const CONFIG_DIGEST = `sha256:${"b".repeat(64)}`;
@@ -830,6 +841,10 @@ function successfulRunner(attachmentRoot, events, settings = {}) {
       return { stderr: "", stdout: `${CONTAINER_ID}\n` };
     }
     if (arguments_[0] === "stop") {
+      if (settings.stopRejectOnce === true) {
+        settings.stopRejectOnce = false;
+        throw new Error("simulated ambiguous stop");
+      }
       running = false;
       return { stderr: "", stdout: `${CONTAINER_ID}\n` };
     }
@@ -1108,6 +1123,180 @@ function bundleOptions(options, stateBundle) {
   delete value.state;
   delete value.stateOwnerId;
   return exact(value);
+}
+
+function jsonSha256(value) {
+  return crypto.createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function sha256Text(...parts) {
+  const hash = crypto.createHash("sha256");
+  for (const part of parts) hash.update(part);
+  return hash.digest("hex");
+}
+
+function verifiedStopIdentity(input) {
+  const launchAttemptId = input.attempt.launchAttemptId;
+  const supervisorId = input.attempt.request.supervisor.supervisorId;
+  const requestSha256 = sha256Text(
+    "portable-codex-runtime:podman-writer-request:v1\0",
+    JSON.stringify(input.attempt.request),
+  );
+  const processIncarnationId = `podman-process:${CONTAINER_ID}`;
+  const writerIncarnationId = `podman-writer:${sha256Text(
+    "portable-codex-runtime:podman-writer:v1\0",
+    supervisorId,
+    "\0",
+    launchAttemptId,
+    "\0",
+    requestSha256,
+    "\0",
+    CONTAINER_ID,
+  )}`;
+  return exact({
+    containerName: `codex-writer-${sha256Text(
+      "portable-codex-runtime:podman-container:v1\0",
+      supervisorId,
+      "\0",
+      launchAttemptId,
+    ).slice(0, 48)}`,
+    launchAttemptId,
+    processIncarnationId,
+    proofId: `podman-start:${sha256Text(
+      "portable-codex-runtime:podman-start-proof:v1\0",
+      supervisorId,
+      "\0",
+      launchAttemptId,
+      "\0",
+      requestSha256,
+      "\0",
+      CONTAINER_ID,
+    )}`,
+    requestSha256,
+    supervisorId,
+    writerIncarnationId,
+  });
+}
+
+function verifiedStopForceFenceRequest(input, overrides = {}) {
+  const attachment = input.attempt.request.attachment;
+  const lease = input.attempt.request.lease;
+  return exact({
+    backendId: attachment.backendId,
+    contractVersion: 1,
+    fencingEpoch: "8",
+    operationId: "force-fence-operation-001",
+    revokedFence: exact({
+      fencingEpoch: lease.fencingEpoch,
+      holderId: lease.holderId,
+      leaseId: lease.leaseId,
+    }),
+    sessionId: lease.sessionId,
+    storageId: attachment.storageId,
+    target: exact({
+      attachmentId: attachment.attachmentId,
+      kind: "attachment",
+    }),
+    ...overrides,
+  });
+}
+
+function verifiedStopBinding(base, bundle, receipt) {
+  const request = base.input.attempt.request;
+  const evidence = exact({
+    contractVersion: 1,
+    launchAttemptId: receipt.evidence.launchAttemptId,
+    processIncarnationId: receipt.evidence.processIncarnationId,
+    proofId: receipt.evidence.proofId,
+    status: "started",
+    supervisorId: receipt.evidence.supervisorId,
+    writerIncarnationId: receipt.evidence.writerIncarnationId,
+  });
+  const result = exact({
+    evidence,
+    outcome: "writer-launch-started",
+    resultVersion: 1,
+  });
+  return exact({
+    contractVersion: PODMAN_EXT4_VERIFIED_STOP_FENCE_PROVIDER_CONTRACT_VERSION,
+    launch: exact({
+      attachmentId: request.attachment.attachmentId,
+      attachmentSha256: jsonSha256(request.attachment),
+      contractVersion: 1,
+      fencingEpoch: request.fencingEpoch,
+      generation: request.generation,
+      launchAttemptId: receipt.evidence.launchAttemptId,
+      launchResultSha256: jsonSha256(result),
+      leaseId: request.lease.leaseId,
+      leaseSha256: jsonSha256(request.lease),
+      measuredImageSha256: jsonSha256(request.measuredImage),
+      processIncarnationId: receipt.evidence.processIncarnationId,
+      startedAt: "2026-08-14T10:00:02.000Z",
+      supervisorId: receipt.evidence.supervisorId,
+      supervisorProofId: receipt.evidence.proofId,
+      writerIncarnationId: receipt.evidence.writerIncarnationId,
+    }),
+    request,
+    result,
+    stateOwnerId: bundle.supervisor.stateOwnerId,
+  });
+}
+
+function verifiedStopBaseBackend() {
+  const calls = [];
+  const backend = {
+    backendId: "filesystem-backend",
+    capabilities: exact({
+      atomicPointInTimeCheckpoint: false,
+      exclusiveWriterAttachment: true,
+      fencing: "manual",
+      normalDirectoryAttachment: true,
+    }),
+    contractVersion: 1,
+  };
+  for (const name of [
+    "captureCheckpoint",
+    "destroySession",
+    "detachAttachment",
+    "forceFence",
+    "prepareWritableAttachment",
+    "provisionSession",
+    "restoreCheckpoint",
+  ]) {
+    backend[name] = function baseBackendMethod(...args) {
+      calls.push({ args, name, receiver: this });
+      return `${name}-base-result`;
+    };
+  }
+  return { backend: Object.freeze(backend), calls };
+}
+
+function verifiedStopProvider(base, bundle, binding) {
+  const lifecycle = verifiedStopBaseBackend();
+  const durableReads = [];
+  const provider = createPodmanExt4VerifiedStopFenceProvider(exact({
+    baseBackend: lifecycle.backend,
+    async resolveFenceBinding(request) {
+      const fenceRead = exact({ operationId: request.operationId });
+      durableReads.push({ input: fenceRead, name: "readForceFenceOperation" });
+      const fenceOperation = exact({
+        launchAttemptId: binding.launch.launchAttemptId,
+        stateOwnerId: binding.stateOwnerId,
+      });
+      const launchRead = exact({
+        operationId: fenceOperation.launchAttemptId,
+        stateOwnerId: fenceOperation.stateOwnerId,
+      });
+      durableReads.push({ input: launchRead, name: "readWriterLaunchAttempt" });
+      return exact({
+        binding,
+        signal: new AbortController().signal,
+      });
+    },
+    supervisor: bundle.supervisor,
+    supervisorStateCollector: bundle.supervisorStateCollector,
+  }));
+  return { durableReads, lifecycle, provider };
 }
 
 function assertSupervisorError(code) {
@@ -1476,6 +1665,349 @@ test("bundle pair provenance is exact, unforgeable, and re-established from the 
     ),
     false,
   );
+});
+
+test("verified-stop controller is private to an exact marker-backed bundle", async (t) => {
+  const base = await fixture(t);
+  const bundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  const controller = getPodmanWriterVerifiedStopFenceController(
+    bundle.supervisor,
+    bundle.supervisorStateCollector,
+  );
+  assert.deepEqual(Reflect.ownKeys(controller), [
+    "contractVersion",
+    "dispatchVerifiedStopFence",
+    "reconcileVerifiedStopFence",
+    "stateOwnerId",
+    "supervisorId",
+  ]);
+  assert.equal(
+    controller.contractVersion,
+    PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
+  );
+  assert.equal(controller.stateOwnerId, base.stateBundle.stateOwnerId);
+  assert.equal(Object.isFrozen(controller), true);
+
+  assert.throws(
+    () => getPodmanWriterVerifiedStopFenceController(
+      base.supervisor,
+      bundle.supervisorStateCollector,
+    ),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
+  assert.throws(
+    () => getPodmanWriterVerifiedStopFenceController(
+      Object.freeze({ ...bundle.supervisor }),
+      bundle.supervisorStateCollector,
+    ),
+    assertSupervisorError("invalid_podman_writer_supervisor_options"),
+  );
+});
+
+test("verified-stop provider is a dormant exact-receiver backend adapter", async (t) => {
+  const base = await fixture(t);
+  const bundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  const receipt = await bundle.supervisor.launchWriter(base.input);
+  const binding = verifiedStopBinding(base, bundle, receipt);
+  const { lifecycle, provider } = verifiedStopProvider(base, bundle, binding);
+
+  assert.strictEqual(
+    assertStorageForceFenceReconciliationBackend(provider),
+    provider,
+  );
+  assert.equal(provider.backendId, "filesystem-backend");
+  assert.equal(provider.contractVersion, 1);
+  assert.equal(provider.capabilities.fencing, "verified-detach");
+  assert.equal(lifecycle.backend.capabilities.fencing, "manual");
+  assert.equal(Object.isFrozen(provider), true);
+  assert.equal(Object.isFrozen(provider.capabilities), true);
+
+  for (const name of [
+    "captureCheckpoint",
+    "destroySession",
+    "detachAttachment",
+    "prepareWritableAttachment",
+    "provisionSession",
+    "restoreCheckpoint",
+  ]) {
+    assert.equal(provider[name](name), `${name}-base-result`);
+  }
+  assert.equal(lifecycle.calls.length, 6);
+  for (const call of lifecycle.calls) {
+    assert.strictEqual(call.receiver, lifecycle.backend);
+    assert.notEqual(call.name, "forceFence");
+  }
+  assert.throws(
+    () => provider.captureCheckpoint.call({}, "wrong receiver"),
+    /Invalid Podman ext4 verified-stop fence provider receiver/u,
+  );
+
+  const direct = createPodmanWriterSupervisor(base.options);
+  assert.throws(
+    () => createPodmanExt4VerifiedStopFenceProvider(exact({
+      baseBackend: lifecycle.backend,
+      async resolveFenceBinding() {
+        return exact({
+          binding,
+          signal: new AbortController().signal,
+        });
+      },
+      supervisor: direct,
+      supervisorStateCollector: bundle.supervisorStateCollector,
+    })),
+    (error) =>
+      error instanceof PodmanExt4VerifiedStopFenceProviderError &&
+      error.code === "invalid_podman_ext4_verified_stop_fence_options",
+  );
+});
+
+test("verified-stop fence validates the committed launch and proves exact removal", async (t) => {
+  const base = await fixture(t);
+  const bundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  const receipt = await bundle.supervisor.launchWriter(base.input);
+  const binding = verifiedStopBinding(base, bundle, receipt);
+  const request = verifiedStopForceFenceRequest(base.input);
+
+  for (const invalidBinding of [
+    exact({
+      ...binding,
+      launch: exact({ ...binding.launch, attachmentSha256: "0".repeat(64) }),
+    }),
+    exact({
+      ...binding,
+      launch: exact({ ...binding.launch, leaseSha256: "0".repeat(64) }),
+    }),
+    exact({
+      ...binding,
+      launch: exact({ ...binding.launch, launchResultSha256: "0".repeat(64) }),
+    }),
+    exact({
+      ...binding,
+      stateOwnerId: `state-owner:${"0".repeat(64)}`,
+    }),
+  ]) {
+    const { provider } = verifiedStopProvider(base, bundle, invalidBinding);
+    const count = base.events.length;
+    await assert.rejects(
+      provider.forceFence(request),
+      (error) =>
+        error instanceof PodmanExt4VerifiedStopFenceProviderError &&
+        error.code === "podman_ext4_verified_stop_fence_outcome_uncertain",
+    );
+    assert.equal(base.events.length, count);
+  }
+
+  const { durableReads, provider } = verifiedStopProvider(base, bundle, binding);
+  const beforeReconcile = base.events.length;
+  assert.deepEqual(await provider.reconcileForceFence(request), {
+    contractVersion: 1,
+    outcome: "unknown",
+    result: null,
+  });
+  assert.equal(base.events.length, beforeReconcile);
+  assert.deepEqual(
+    durableReads.slice(0, 2).map(({ name }) => name),
+    ["readForceFenceOperation", "readWriterLaunchAttempt"],
+  );
+  assert.deepEqual(
+    durableReads[0].input,
+    exact({ operationId: request.operationId }),
+  );
+  assert.deepEqual(
+    durableReads[1].input,
+    exact({
+      operationId: binding.launch.launchAttemptId,
+      stateOwnerId: binding.stateOwnerId,
+    }),
+  );
+
+  const fenceStart = base.events.length;
+  const result = await provider.forceFence(request);
+  assert.deepEqual(
+    assertStorageForceFenceResult(result, { request }),
+    result,
+  );
+  assert.match(result.proofId, /^podman-ext4-fence:[0-9a-f]{64}$/u);
+  assert.deepEqual(
+    base.events.slice(fenceStart).map((event) => event.arguments_[0]),
+    ["stop", "wait", "container", "rm", "ps", "ps"],
+  );
+  const terminal = await base.state.read(exact({
+    launchAttemptId: binding.launch.launchAttemptId,
+  }));
+  assert.equal(terminal.status, "stopped");
+  assert.equal(terminal.revision, 4);
+  assert.equal(terminal.stopOperationId, request.operationId);
+  assert.equal(terminal.containerId, CONTAINER_ID);
+  assert.equal(terminal.processIncarnationId, binding.launch.processIncarnationId);
+  assert.equal(terminal.writerIncarnationId, binding.launch.writerIncarnationId);
+  const proofEvents = base.events.slice(-2);
+  assert.equal(
+    proofEvents[0].arguments_.includes(
+      `name=^${terminal.containerName}$`,
+    ),
+    true,
+  );
+  assert.equal(
+    proofEvents[1].arguments_.includes(`id=${CONTAINER_ID}`),
+    true,
+  );
+});
+
+test("verified-stop reconciliation never initiates fencing from missing or pre-start state", async (t) => {
+  for (const status of ["missing", "preparing", "created"]) {
+    const base = await fixture(t);
+    const bundle = createPodmanWriterSupervisorBundle(
+      bundleOptions(base.options, base.stateBundle),
+    );
+    const identity = verifiedStopIdentity(base.input);
+    const receipt = exact({ evidence: exact({
+      launchAttemptId: identity.launchAttemptId,
+      processIncarnationId: identity.processIncarnationId,
+      proofId: identity.proofId,
+      supervisorId: identity.supervisorId,
+      writerIncarnationId: identity.writerIncarnationId,
+    }) });
+    const binding = verifiedStopBinding(base, bundle, receipt);
+    const request = verifiedStopForceFenceRequest(base.input);
+    if (status !== "missing") {
+      const preparing = exact({
+        containerId: null,
+        containerName: identity.containerName,
+        contractVersion: 1,
+        launchAttemptId: identity.launchAttemptId,
+        processIncarnationId: null,
+        proofId: null,
+        requestSha256: identity.requestSha256,
+        revision: 0,
+        status: "preparing",
+        stopOperationId: null,
+        stopProofId: null,
+        writerIncarnationId: null,
+      });
+      await base.state.claim(exact({ record: preparing }));
+      if (status === "created") {
+        await base.state.transition(exact({
+          expectedRevision: 0,
+          expectedStatus: "preparing",
+          record: exact({
+            ...preparing,
+            containerId: CONTAINER_ID,
+            processIncarnationId: identity.processIncarnationId,
+            revision: 1,
+            status: "created",
+            writerIncarnationId: identity.writerIncarnationId,
+          }),
+        }));
+      }
+    }
+    const { provider } = verifiedStopProvider(base, bundle, binding);
+    const eventCount = base.events.length;
+    assert.deepEqual(
+      await provider.reconcileForceFence(request),
+      { contractVersion: 1, outcome: "unknown", result: null },
+      status,
+    );
+    assert.equal(base.events.length, eventCount, status);
+    await assert.rejects(
+      provider.forceFence(request),
+      (error) =>
+        error instanceof PodmanExt4VerifiedStopFenceProviderError &&
+        error.code === "podman_ext4_verified_stop_fence_outcome_uncertain",
+      status,
+    );
+    assert.equal(base.events.length, eventCount, status);
+    const durable = await base.state.read(exact({
+      launchAttemptId: identity.launchAttemptId,
+    }));
+    assert.equal(durable?.status ?? "missing", status);
+  }
+});
+
+test("verified-stop reconciliation resumes only its stopping operation and replays rev4 source-free", async (t) => {
+  const settings = { stopRejectOnce: true };
+  const base = await fixture(t, settings);
+  const firstBundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, base.stateBundle),
+  );
+  const receipt = await firstBundle.supervisor.launchWriter(base.input);
+  const firstBinding = verifiedStopBinding(base, firstBundle, receipt);
+  const request = verifiedStopForceFenceRequest(base.input);
+  const firstProvider = verifiedStopProvider(
+    base,
+    firstBundle,
+    firstBinding,
+  ).provider;
+
+  await assert.rejects(
+    firstProvider.forceFence(request),
+    (error) =>
+      error instanceof PodmanExt4VerifiedStopFenceProviderError &&
+      error.code === "podman_ext4_verified_stop_fence_outcome_uncertain",
+  );
+  const stopping = await base.state.read(exact({
+    launchAttemptId: firstBinding.launch.launchAttemptId,
+  }));
+  assert.equal(stopping.status, "stopping");
+  assert.equal(stopping.stopOperationId, request.operationId);
+
+  const wrongOperation = verifiedStopForceFenceRequest(base.input, {
+    operationId: "force-fence-operation-002",
+  });
+  const beforeWrongOperation = base.events.length;
+  assert.deepEqual(
+    await firstProvider.reconcileForceFence(wrongOperation),
+    { contractVersion: 1, outcome: "unknown", result: null },
+  );
+  assert.equal(base.events.length, beforeWrongOperation);
+
+  const restartedOwner = await preparePodmanWriterSupervisorStateOwner(exact({
+    expectedStateOwnerId: base.stateBundle.stateOwnerId,
+    root: base.stateRoot,
+  }));
+  const restartedStateBundle = createPodmanWriterSupervisorStateBundle(exact({
+    owner: restartedOwner,
+  }));
+  const restartedBundle = createPodmanWriterSupervisorBundle(
+    bundleOptions(base.options, restartedStateBundle),
+  );
+  const restartedBinding = verifiedStopBinding(
+    base,
+    restartedBundle,
+    receipt,
+  );
+  const restartedProvider = verifiedStopProvider(
+    base,
+    restartedBundle,
+    restartedBinding,
+  ).provider;
+  const resumed = await restartedProvider.reconcileForceFence(request);
+  assert.equal(resumed.outcome, "committed");
+  assert.equal(resumed.result.status, "fenced");
+
+  await rm(base.attachmentRoot, { recursive: true });
+  const replayStart = base.events.length;
+  const replay = await restartedProvider.reconcileForceFence(request);
+  assert.deepEqual(replay, resumed);
+  assert.deepEqual(
+    base.events.slice(replayStart).map((event) => event.arguments_[0]),
+    ["rm", "ps", "ps"],
+  );
+
+  const beforeFreshReplay = base.events.length;
+  await assert.rejects(
+    restartedProvider.forceFence(request),
+    (error) =>
+      error instanceof PodmanExt4VerifiedStopFenceProviderError &&
+      error.code === "podman_ext4_verified_stop_fence_outcome_uncertain",
+  );
+  assert.equal(base.events.length, beforeFreshReplay);
 });
 
 test("constructs an atomic supervisor/state-collector bundle and collects only its owner receipt", async (t) => {

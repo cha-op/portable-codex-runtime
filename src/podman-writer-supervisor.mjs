@@ -160,6 +160,7 @@ function firstPromiseOfThree(first, second, third) {
 export const PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION = 5;
 export const PODMAN_WRITER_LAUNCH_RECEIPT_VERSION = 2;
 export const PODMAN_WRITER_RECONCILE_RECEIPT_VERSION = 2;
+export const PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION = 1;
 
 const OPAQUE_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/u;
 const STATE_OWNER_ID_PATTERN = /^state-owner:[0-9a-f]{64}$/u;
@@ -320,6 +321,50 @@ const STOP_KEYS = Object.freeze([
   "signal",
   "stopOperationId",
   "writerFence",
+  "writerIncarnationId",
+]);
+const VERIFIED_STOP_FENCE_KEYS = Object.freeze([
+  "binding",
+  "contractVersion",
+  "signal",
+  "stopOperationId",
+]);
+const VERIFIED_STOP_FENCE_BINDING_KEYS = Object.freeze([
+  "contractVersion",
+  "launch",
+  "request",
+  "result",
+  "stateOwnerId",
+]);
+const VERIFIED_STOP_FENCE_LAUNCH_KEYS = Object.freeze([
+  "attachmentId",
+  "attachmentSha256",
+  "contractVersion",
+  "fencingEpoch",
+  "generation",
+  "launchAttemptId",
+  "launchResultSha256",
+  "leaseId",
+  "leaseSha256",
+  "measuredImageSha256",
+  "processIncarnationId",
+  "startedAt",
+  "supervisorId",
+  "supervisorProofId",
+  "writerIncarnationId",
+]);
+const VERIFIED_STOP_FENCE_RESULT_KEYS = Object.freeze([
+  "evidence",
+  "outcome",
+  "resultVersion",
+]);
+const VERIFIED_STOP_FENCE_EVIDENCE_KEYS = Object.freeze([
+  "contractVersion",
+  "launchAttemptId",
+  "processIncarnationId",
+  "proofId",
+  "status",
+  "supervisorId",
   "writerIncarnationId",
 ]);
 const ATTEMPT_KEYS = Object.freeze([
@@ -496,6 +541,7 @@ const compositeFilesystemAuthorities = new WeakSet();
 const compositeFilesystemAuthorityHandleStates = new WeakMap();
 const closedCompositeFilesystemAuthorityHandles = new WeakSet();
 const markerBackedSupervisorStateCollectors = new WeakMap();
+const markerBackedVerifiedStopFenceControllers = new WeakMap();
 const abortSignalAbortedGetter = Object.getOwnPropertyDescriptor(
   AbortSignal.prototype,
   "aborted",
@@ -938,6 +984,142 @@ function normalizeStopInput(value, expected) {
     code,
   );
   return frozenRecord({ signal, stopOperationId: input.stopOperationId });
+}
+
+function normalizeVerifiedStopFenceInput(value, supervisorId, stateOwnerId) {
+  const code = "invalid_podman_writer_supervisor_request";
+  const input = exactDataObject(value, VERIFIED_STOP_FENCE_KEYS, code);
+  ensure(
+    input.contractVersion ===
+      PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
+    code,
+  );
+  const bindingValue = exactDataObject(
+    input.binding,
+    VERIFIED_STOP_FENCE_BINDING_KEYS,
+    code,
+  );
+  const typed = normalizeTypedRequest(
+    bindingValue.request,
+    supervisorId,
+    code,
+  );
+  const launch = exactDataObject(
+    bindingValue.launch,
+    VERIFIED_STOP_FENCE_LAUNCH_KEYS,
+    code,
+  );
+  const result = exactDataObject(
+    bindingValue.result,
+    VERIFIED_STOP_FENCE_RESULT_KEYS,
+    code,
+  );
+  const resultEvidence = exactDataObject(
+    result.evidence,
+    VERIFIED_STOP_FENCE_EVIDENCE_KEYS,
+    code,
+  );
+  const launchAttemptId = assertOpaqueId(launch.launchAttemptId, code);
+  const processPrefix = "podman-process:";
+  ensure(
+    typeof launch.processIncarnationId === "string" &&
+      callIntrinsic(
+        stringStartsWithIntrinsic,
+        launch.processIncarnationId,
+        [processPrefix],
+      ),
+    code,
+  );
+  const containerId = callIntrinsic(
+    stringSliceIntrinsic,
+    launch.processIncarnationId,
+    [processPrefix.length],
+  );
+  const digestOfRequest = requestDigest(typed.request);
+  const expectedWriterIncarnationId = writerIncarnationId(
+    supervisorId,
+    launchAttemptId,
+    digestOfRequest,
+    containerId,
+  );
+  const expectedStartProofId = startProofId(
+    supervisorId,
+    launchAttemptId,
+    digestOfRequest,
+    containerId,
+  );
+  // The launch pointer is not accepted as a logical assertion alone. Its four
+  // content hashes bind the original attachment, lease, measured image, and
+  // committed launch result, while the derived Podman IDs bind that result to
+  // the exact durable supervisor incarnation selected below.
+  ensure(
+    bindingValue.contractVersion ===
+        PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION &&
+      bindingValue.stateOwnerId === stateOwnerId &&
+      regexpTest(FULL_CONTAINER_ID_PATTERN, containerId) &&
+      launch.contractVersion === 1 &&
+      launch.attachmentId === typed.attachment.attachmentId &&
+      launch.attachmentSha256 === sha256Parts(canonicalJson(typed.attachment)) &&
+      launch.fencingEpoch === typed.lease.fencingEpoch &&
+      sameData(launch.generation, typed.generation) &&
+      launch.launchResultSha256 === sha256Parts(canonicalJson(result)) &&
+      launch.leaseId === typed.lease.leaseId &&
+      launch.leaseSha256 === sha256Parts(canonicalJson(typed.lease)) &&
+      launch.measuredImageSha256 ===
+        sha256Parts(canonicalJson(typed.request.measuredImage)) &&
+      launch.processIncarnationId === processIncarnationId(containerId) &&
+      assertIsoInstant(launch.startedAt, code) === launch.startedAt &&
+      assertIsoInstant(typed.generation.committedAt, code) ===
+        typed.generation.committedAt &&
+      callIntrinsic(dateParseIntrinsic, DateConstructor, [launch.startedAt]) >=
+        callIntrinsic(dateParseIntrinsic, DateConstructor, [
+          typed.generation.committedAt,
+        ]) &&
+      launch.supervisorId === supervisorId &&
+      launch.supervisorProofId === expectedStartProofId &&
+      launch.writerIncarnationId === expectedWriterIncarnationId &&
+      result.outcome === "writer-launch-started" &&
+      result.resultVersion === 1 &&
+      resultEvidence.contractVersion === 1 &&
+      resultEvidence.launchAttemptId === launchAttemptId &&
+      resultEvidence.processIncarnationId === launch.processIncarnationId &&
+      resultEvidence.proofId === launch.supervisorProofId &&
+      resultEvidence.status === "started" &&
+      resultEvidence.supervisorId === supervisorId &&
+      resultEvidence.writerIncarnationId === launch.writerIncarnationId,
+    code,
+  );
+  const stopOperationId = assertOpaqueId(input.stopOperationId, code);
+  const signal = assertAbortSignal(input.signal, code);
+  const binding = frozenRecord({
+    attachment: typed.attachment,
+    containerId,
+    contractVersion: PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
+    launchAttemptId,
+    lease: typed.lease,
+    processIncarnationId: launch.processIncarnationId,
+    stateOwnerId,
+    supervisorId,
+    writerIncarnationId: launch.writerIncarnationId,
+  });
+  const expected = frozenRecord({
+    attachment: typed.attachment,
+    containerId,
+    containerName: containerName(supervisorId, launchAttemptId),
+    imageDigest: typed.image.platformImage.digest,
+    launchAttemptId,
+    lease: typed.lease,
+    processIncarnationId: binding.processIncarnationId,
+    requestSha256: digestOfRequest,
+    supervisorId,
+    writerIncarnationId: binding.writerIncarnationId,
+  });
+  return frozenRecord({
+    binding,
+    expected,
+    signal,
+    stopOperationId,
+  });
 }
 
 function normalizeStringRecord(value, allowedKeys, code) {
@@ -3274,7 +3456,9 @@ export function createPodmanWriterSupervisor(...args) {
     // A durable stopped tombstone is the authorization boundary for
     // retirement. Removal and both absence queries are replayable, so an
     // rm/response crash leaves the same stopped record available for a cold
-    // retry; no earlier state is allowed to remove a container.
+    // retry; no earlier state is allowed to remove a container. The anchored
+    // exact name and full 64-hex ID inventories cover both name reuse and a
+    // residual exact object after the idempotent removal.
     ensure(
       record.status === "stopped" && record.containerId !== null,
       "podman_writer_supervisor_outcome_uncertain",
@@ -3328,108 +3512,28 @@ export function createPodmanWriterSupervisor(...args) {
     }
   }
 
-  function makeStopWriter(expected) {
-    const stopWriter = frozenFunction(async function stopWriter(inputValue) {
-      ensure(arguments.length === 1, "invalid_podman_writer_supervisor_request");
-      const input = normalizeStopInput(inputValue, expected);
-      ensureNotAborted(input.signal);
-      let record = await readState(expected);
-      ensure(record !== null, "podman_writer_supervisor_outcome_uncertain");
-      if (record.status === "stopped") {
-        ensure(
-          record.stopOperationId === input.stopOperationId,
-          "podman_writer_state_conflict",
-        );
-        await proveNoStoppedContainer(record, expected, input.signal);
-        return frozenRecord({
-          contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-          status: "stopped",
-          terminalRecord: record,
-        });
-      }
-      if (record.status === "started") {
-        const stopping = newStateRecord({
-          containerName: expected.containerName,
-          launchAttemptId: expected.launchAttemptId,
-          requestSha256: expected.requestSha256,
-          override: {
-            containerId: record.containerId,
-            processIncarnationId: record.processIncarnationId,
-            proofId: record.proofId,
-            revision: 3,
-            status: "stopping",
-            stopOperationId: input.stopOperationId,
-            writerIncarnationId: record.writerIncarnationId,
-          },
-        });
-        record = validateRecord(
-          await transition(record, "started", stopping),
-          expected,
-        );
-      } else {
-        ensure(
-          record.status === "stopping" &&
-            record.stopOperationId === input.stopOperationId,
-          "podman_writer_state_conflict",
-        );
-      }
-      await runPodman(
-        [
-          "stop",
-          "--ignore",
-          "--time",
-          StringConstructor(stopTimeoutSeconds),
-          record.containerId,
-        ],
-        input.signal,
-      );
-      // Podman wait joins the container lifecycle, not merely its initial PID;
-      // the following inspect then requires the cgroup-visible container state
-      // to be non-running with no remaining container PID before persistence.
-      const waited = await runPodman(
-        ["wait", "--condition=stopped", record.containerId],
-        input.signal,
-      );
+  function exactIncarnationMatches(record, expected) {
+    return (
+      !objectHasOwnIntrinsic(expected, "containerId") ||
+      (record.containerId === expected.containerId &&
+        record.processIncarnationId === expected.processIncarnationId &&
+        record.writerIncarnationId === expected.writerIncarnationId)
+    );
+  }
+
+  async function stopExpectedWriter(expected, input, mode) {
+    ensureNotAborted(input.signal);
+    let record = await readState(expected);
+    if (record === null) {
+      if (mode === "reconcile") return null;
+      fail("podman_writer_supervisor_outcome_uncertain");
+    }
+    ensure(exactIncarnationMatches(record, expected), "podman_writer_state_conflict");
+    if (record.status === "stopped") {
+      if (mode === "fresh") fail("podman_writer_state_conflict");
       ensure(
-        regexpTest(/^[-]?[0-9]+\n?$/u, waited.stdout),
-        "podman_writer_output_invalid",
-      );
-      const inspected = await runPodman(
-        ["container", "inspect", "--format=json", record.containerId],
-        input.signal,
-      );
-      validateContainerInspection(
-        inspectObject(inspected.stdout, "podman_writer_output_invalid"),
-        {
-          attachmentRoot: expected.attachment.rootPath,
-          containerId: record.containerId,
-          containerName: expected.containerName,
-          imageDigest: expected.imageDigest,
-        },
-        false,
-      );
-      const stopped = newStateRecord({
-        containerName: expected.containerName,
-        launchAttemptId: expected.launchAttemptId,
-        requestSha256: expected.requestSha256,
-        override: {
-          containerId: record.containerId,
-          processIncarnationId: record.processIncarnationId,
-          proofId: record.proofId,
-          revision: 4,
-          status: "stopped",
-          stopOperationId: input.stopOperationId,
-          stopProofId: stoppedProofId(
-            expected.launchAttemptId,
-            expected.requestSha256,
-            record.containerId,
-          ),
-          writerIncarnationId: record.writerIncarnationId,
-        },
-      });
-      record = validateRecord(
-        await transition(record, "stopping", stopped),
-        expected,
+        record.stopOperationId === input.stopOperationId,
+        "podman_writer_state_conflict",
       );
       await proveNoStoppedContainer(record, expected, input.signal);
       return frozenRecord({
@@ -3437,6 +3541,115 @@ export function createPodmanWriterSupervisor(...args) {
         status: "stopped",
         terminalRecord: record,
       });
+    }
+    if (record.status === "started") {
+      if (mode === "reconcile") return null;
+      const stopping = newStateRecord({
+        containerName: expected.containerName,
+        launchAttemptId: expected.launchAttemptId,
+        requestSha256: expected.requestSha256,
+        override: {
+          containerId: record.containerId,
+          processIncarnationId: record.processIncarnationId,
+          proofId: record.proofId,
+          revision: 3,
+          status: "stopping",
+          stopOperationId: input.stopOperationId,
+          writerIncarnationId: record.writerIncarnationId,
+        },
+      });
+      record = validateRecord(
+        await transition(record, "started", stopping),
+        expected,
+      );
+      ensure(
+        exactIncarnationMatches(record, expected),
+        "podman_writer_state_conflict",
+      );
+    } else {
+      if (mode === "fresh") fail("podman_writer_state_conflict");
+      if (mode === "reconcile" && record.status !== "stopping") return null;
+      ensure(
+        record.status === "stopping" &&
+          record.stopOperationId === input.stopOperationId,
+        "podman_writer_state_conflict",
+      );
+    }
+    await runPodman(
+      [
+        "stop",
+        "--ignore",
+        "--time",
+        StringConstructor(stopTimeoutSeconds),
+        record.containerId,
+      ],
+      input.signal,
+    );
+    // Podman wait joins the container lifecycle, not merely its initial PID;
+    // the following inspect then requires the cgroup-visible container state
+    // to be non-running with no remaining container PID before persistence.
+    const waited = await runPodman(
+      ["wait", "--condition=stopped", record.containerId],
+      input.signal,
+    );
+    ensure(
+      regexpTest(/^[-]?[0-9]+\n?$/u, waited.stdout),
+      "podman_writer_output_invalid",
+    );
+    const inspected = await runPodman(
+      ["container", "inspect", "--format=json", record.containerId],
+      input.signal,
+    );
+    validateContainerInspection(
+      inspectObject(inspected.stdout, "podman_writer_output_invalid"),
+      {
+        attachmentRoot: expected.attachment.rootPath,
+        containerId: record.containerId,
+        containerName: expected.containerName,
+        imageDigest: expected.imageDigest,
+      },
+      false,
+    );
+    const stopped = newStateRecord({
+      containerName: expected.containerName,
+      launchAttemptId: expected.launchAttemptId,
+      requestSha256: expected.requestSha256,
+      override: {
+        containerId: record.containerId,
+        processIncarnationId: record.processIncarnationId,
+        proofId: record.proofId,
+        revision: 4,
+        status: "stopped",
+        stopOperationId: input.stopOperationId,
+        stopProofId: stoppedProofId(
+          expected.launchAttemptId,
+          expected.requestSha256,
+          record.containerId,
+        ),
+        writerIncarnationId: record.writerIncarnationId,
+      },
+    });
+    record = validateRecord(
+      await transition(record, "stopping", stopped),
+      expected,
+    );
+    ensure(
+      exactIncarnationMatches(record, expected),
+      "podman_writer_state_conflict",
+    );
+    await proveNoStoppedContainer(record, expected, input.signal);
+    return frozenRecord({
+      contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+      status: "stopped",
+      terminalRecord: record,
+    });
+  }
+
+  function makeStopWriter(expected) {
+    const stopWriter = frozenFunction(async function stopWriter(inputValue) {
+      ensure(arguments.length === 1, "invalid_podman_writer_supervisor_request");
+      const input = normalizeStopInput(inputValue, expected);
+      return await stopExpectedWriter(expected, input, "legacy");
     });
     return stopWriter;
   }
@@ -4016,13 +4229,93 @@ export function createPodmanWriterSupervisor(...args) {
     },
   );
 
-  return frozenRecord({
+  function verifiedStopInput(inputValue) {
+    const input = normalizeVerifiedStopFenceInput(
+      inputValue,
+      supervisorId,
+      stateOwnerId,
+    );
+    const stopInput = frozenRecord({
+      signal: input.signal,
+      stopOperationId: input.stopOperationId,
+    });
+    return frozenRecord({ ...input, stopInput });
+  }
+
+  const dispatchVerifiedStopFence = frozenFunction(
+    async function dispatchVerifiedStopFence(inputValue) {
+      ensure(arguments.length === 1, "invalid_podman_writer_supervisor_request");
+      const input = verifiedStopInput(inputValue);
+      const stopped = await stopExpectedWriter(
+        input.expected,
+        input.stopInput,
+        "fresh",
+      );
+      ensure(
+        stopped !== null &&
+          stopped.terminalRecord.status === "stopped" &&
+          stopped.terminalRecord.revision === 4 &&
+          stopped.terminalRecord.stopOperationId === input.stopOperationId &&
+          exactIncarnationMatches(stopped.terminalRecord, input.expected),
+        "podman_writer_supervisor_outcome_uncertain",
+      );
+      return frozenRecord({
+        contractVersion: PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
+        outcome: "stopped",
+        terminalRecord: stopped.terminalRecord,
+      });
+    },
+  );
+
+  const reconcileVerifiedStopFence = frozenFunction(
+    async function reconcileVerifiedStopFence(inputValue) {
+      ensure(arguments.length === 1, "invalid_podman_writer_supervisor_request");
+      const input = verifiedStopInput(inputValue);
+      const stopped = await stopExpectedWriter(
+        input.expected,
+        input.stopInput,
+        "reconcile",
+      );
+      if (stopped === null) {
+        return frozenRecord({
+          contractVersion: PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
+          outcome: "unknown",
+          terminalRecord: null,
+        });
+      }
+      ensure(
+        stopped.terminalRecord.status === "stopped" &&
+          stopped.terminalRecord.revision === 4 &&
+          stopped.terminalRecord.stopOperationId === input.stopOperationId &&
+          exactIncarnationMatches(stopped.terminalRecord, input.expected),
+        "podman_writer_supervisor_outcome_uncertain",
+      );
+      return frozenRecord({
+        contractVersion: PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
+        outcome: "stopped",
+        terminalRecord: stopped.terminalRecord,
+      });
+    },
+  );
+
+  const supervisor = frozenRecord({
     contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
     launchWriter,
     reconcileWriterLaunch,
     stateOwnerId,
     supervisorId,
   });
+  callIntrinsic(weakMapSetIntrinsic, markerBackedVerifiedStopFenceControllers, [
+    supervisor,
+    frozenRecord({
+      contractVersion: PODMAN_WRITER_VERIFIED_STOP_FENCE_CONTRACT_VERSION,
+      dispatchVerifiedStopFence,
+      reconcileVerifiedStopFence,
+      stateOwnerId,
+      supervisorId,
+    }),
+  ]);
+  return supervisor;
 }
 
 export function createPodmanWriterSupervisorBundle(...args) {
@@ -4143,6 +4436,22 @@ export function isPodmanWriterSupervisorBundlePair(...args) {
   );
 }
 
+export function getPodmanWriterVerifiedStopFenceController(...args) {
+  const code = "invalid_podman_writer_supervisor_options";
+  ensure(
+    args.length === 2 &&
+      isPodmanWriterSupervisorBundlePair(args[0], args[1]),
+    code,
+  );
+  const controller = callIntrinsic(
+    weakMapGetIntrinsic,
+    markerBackedVerifiedStopFenceControllers,
+    [args[0]],
+  );
+  ensure(controller !== undefined, code);
+  return controller;
+}
+
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorError.prototype]);
 callIntrinsic(objectFreezeIntrinsic, Object, [PodmanWriterSupervisorError]);
 callIntrinsic(objectFreezeIntrinsic, Object, [
@@ -4152,4 +4461,7 @@ callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisor]);
 callIntrinsic(objectFreezeIntrinsic, Object, [createPodmanWriterSupervisorBundle]);
 callIntrinsic(objectFreezeIntrinsic, Object, [
   isPodmanWriterSupervisorBundlePair,
+]);
+callIntrinsic(objectFreezeIntrinsic, Object, [
+  getPodmanWriterVerifiedStopFenceController,
 ]);

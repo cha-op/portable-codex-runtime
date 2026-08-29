@@ -22,8 +22,8 @@ failover:
 ```
 
 Only clean, stopped-writer checkpoint publication is supported. A database
-epoch, an expired lease, a process exit, or an inaccessible pathname is not a
-physical fence. The backend rejects automatic `forceFence()` and raw
+epoch, an expired lease, an unbound process exit, or an inaccessible pathname
+is not a physical fence. The backend rejects automatic `forceFence()` and raw
 `captureCheckpoint()` / `restoreCheckpoint()` calls; the assembled runtime
 continues to route checkpoint work through `StoppedDirectoryBackend` and
 `StoppedDirectoryPublication`.
@@ -82,6 +82,12 @@ The physical implementation remains split into small authorities:
   exact stopped revision 4 chain through the separately settled
   `supervisorStateCollector.collectTerminalState` leaf. It does not share the
   reconciler surface or infer mutation authority from local state.
+- A separate private verified-stop fence adapter may bind one exact
+  force-fence operation to that supervisor. It can stop and remove only the
+  corresponding durable writer incarnation and requires both its anchored
+  name and full container ID absent before returning proof. It is not part of
+  the assembled backend or public deployment and does not change the manual
+  capability tuple above.
 
 No one component is a grant authority. PostgreSQL continues to decide whether
 one physical mutator may run; these components only validate and execute the

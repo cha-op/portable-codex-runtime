@@ -39,6 +39,7 @@ export const CHECKPOINT_CAPTURE_RECONCILIATION_CONTRACT_VERSION = 1;
 export const PREPARED_CHECKPOINT_CAPTURE_CONTRACT_VERSION = 1;
 export const RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION = 1;
 export const RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION = 1;
+export const STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION = 1;
 export const SESSION_WORKER_ROOT = "/session";
 export const SESSION_WORKER_LAYOUT = deepFreeze({
   codexHome: "/session/codex-home",
@@ -1826,6 +1827,39 @@ export function assertCheckpointCaptureReconciliationBackend(value) {
 }
 
 /**
+ * Optional operator-plane extension for reconciling one exact force-fence
+ * attempt. This is not part of the base storage backend method set.
+ */
+export function assertStorageForceFenceReconciliationBackend(value) {
+  ensure(
+    !isProxyValue(value),
+    "invalid_storage_backend",
+    "storage backend must not be a proxy",
+  );
+  const backend = assertStorageBackend(value);
+  const version = plainDataDescriptor(
+    backend,
+    "forceFenceReconciliationContractVersion",
+    "invalid_storage_backend",
+    "storage force-fence reconciliation backend",
+  ).value;
+  const reconcile = plainDataDescriptor(
+    backend,
+    "reconcileForceFence",
+    "invalid_storage_backend",
+    "storage force-fence reconciliation backend",
+  ).value;
+  ensure(
+    version === STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION &&
+      typeof reconcile === "function" &&
+      !isProxyValue(reconcile),
+    "invalid_storage_backend",
+    "storage backend does not support force-fence reconciliation",
+  );
+  return backend;
+}
+
+/**
  * Optional operator-plane extension for resuming one exact checkpoint capture
  * that was durably prepared by the stop-to-capture handoff. This is not part
  * of the base storage backend method set.
@@ -2093,6 +2127,65 @@ export function assertStorageForceFenceResult(value, options) {
       "storage force-fence result",
     ),
   );
+}
+
+/**
+ * Source-free reconciliation can prove the exact committed force-fence result
+ * or remain unknown. Unknown is not physical fence evidence and never
+ * authorizes a replacement writer.
+ */
+export function assertStorageForceFenceReconciliationResult(value, options) {
+  const code = "invalid_storage_force_fence_reconciliation";
+  const { request } = assertOptionsObject(
+    options,
+    ["request"],
+    ["request"],
+    code,
+    "storage force-fence reconciliation result options",
+  );
+  let expected;
+  try {
+    expected = assertStorageForceFenceRequest(request);
+  } catch {
+    fail(code, "storage force-fence reconciliation request is invalid");
+  }
+  assertExactObject(
+    value,
+    ["contractVersion", "outcome", "result"],
+    code,
+    "storage force-fence reconciliation result",
+  );
+  ensure(
+    value.contractVersion ===
+      STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    code,
+    "storage force-fence reconciliation contract version is unsupported",
+  );
+  if (value.outcome === "committed") {
+    let result;
+    try {
+      result = assertStorageForceFenceResult(value.result, {
+        request: expected,
+      });
+    } catch {
+      fail(code, "storage force-fence reconciliation result is invalid");
+    }
+    return deepFreeze({
+      contractVersion: STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+      outcome: "committed",
+      result,
+    });
+  }
+  ensure(
+    value.outcome === "unknown" && value.result === null,
+    code,
+    "storage force-fence reconciliation outcome is unsupported",
+  );
+  return deepFreeze({
+    contractVersion: STORAGE_FORCE_FENCE_RECONCILIATION_CONTRACT_VERSION,
+    outcome: "unknown",
+    result: null,
+  });
 }
 
 function assertStorageMutationTarget(value, { operation, storageId }) {
