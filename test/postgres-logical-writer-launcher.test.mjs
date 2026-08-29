@@ -38,6 +38,7 @@ import {
   PostgresLvmAtomicCrashCaptureCompositionError,
   createPostgresLvmAtomicCrashCaptureComposition,
 } from "../src/postgres-atomic-crash-capture-composition.mjs";
+import * as postgresLogicalWriterLauncherModule from "../src/postgres-logical-writer-launcher.mjs";
 import {
   LOGICAL_WRITER_LAUNCH_CONTRACT_VERSION,
   LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION,
@@ -46,7 +47,6 @@ import {
   createPostgresLogicalWriterLauncher,
   derivePostgresLogicalWriterAtomicCrashCaptureStopOperationId,
   derivePostgresLogicalWriterStopOperationId,
-  getPostgresLogicalWriterAtomicCrashCaptureFacet,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
   createPostgresDurableStopCaptureComposition,
@@ -1893,9 +1893,12 @@ function assertWriterLaunchBlocked(coordinator) {
 function atomicCompositionCollaborators(
   request,
   {
+    captureGate = null,
+    captureThrows = false,
     commitAcknowledgementLoss = false,
     committed = false,
     committedReadVisible = true,
+    onCaptureStart = null,
   } = {},
 ) {
   const calls = {
@@ -1972,6 +1975,15 @@ function atomicCompositionCollaborators(
   const driver = exactRecord({
     async captureSnapshot(input) {
       calls.capture += 1;
+      if (onCaptureStart !== null) {
+        onCaptureStart();
+      }
+      if (captureThrows) {
+        throw new Error("snapshot failed after dispatch");
+      }
+      if (captureGate !== null) {
+        await captureGate;
+      }
       return atomicCrashCaptureResult(input.request);
     },
     contractVersion: LVM_ATOMIC_CRASH_CAPTURE_DRIVER_CONTRACT_VERSION,
@@ -4802,24 +4814,41 @@ test("stop operation identity binds every canonical capture tuple member", async
   );
 });
 
-test("exports one branded exact atomic crash-capture facet without widening the facade", async () => {
+test("keeps the raw atomic crash-capture facet private and exposes only the safe composition", async () => {
   const value = await fixture();
-  const facet = getPostgresLogicalWriterAtomicCrashCaptureFacet(value.facade);
+  const request = atomicCrashCaptureRequest(value);
+  const collaborators = atomicCompositionCollaborators(request);
+  const composition = createPostgresLvmAtomicCrashCaptureComposition({
+    baseBackend: collaborators.baseBackend,
+    catalogue: collaborators.catalogue,
+    driver: collaborators.driver,
+    launcher: value.facade,
+  });
 
-  assert.strictEqual(
-    getPostgresLogicalWriterAtomicCrashCaptureFacet(value.facade),
-    facet,
+  assert.equal(
+    Object.hasOwn(
+      postgresLogicalWriterLauncherModule,
+      "getPostgresLogicalWriterAtomicCrashCaptureFacet",
+    ),
+    false,
   );
-  assert.deepEqual(Reflect.ownKeys(facet).sort(), [
-    "completeStop",
-    "resolveCaptureAuthority",
-    "retireCompleteStop",
+  assert.equal(
+    Object.hasOwn(
+      postgresLogicalWriterLauncherModule,
+      "createPostgresLvmAtomicCrashCaptureCompositionInternal",
+    ),
+    false,
+  );
+  assert.strictEqual(
+    postgresLogicalWriterLauncherModule.createPostgresLvmAtomicCrashCaptureComposition,
+    createPostgresLvmAtomicCrashCaptureComposition,
+  );
+  assert.deepEqual(Reflect.ownKeys(composition).sort(), [
+    "reconcileCapture",
+    "runCapture",
   ]);
-  assert.equal(Object.getPrototypeOf(facet), null);
-  assert.equal(Object.isFrozen(facet), true);
-  for (const method of Reflect.ownKeys(facet)) {
-    assert.equal(Object.isFrozen(facet[method]), true);
-  }
+  assert.equal(Object.getPrototypeOf(composition), null);
+  assert.equal(Object.isFrozen(composition), true);
   assert.deepEqual(Reflect.ownKeys(value.facade).sort(), [
     "prepareLaunchIntent",
     "reconcileLaunchAttempt",
@@ -4831,21 +4860,6 @@ test("exports one branded exact atomic crash-capture facet without widening the 
     "stopWriterForCapture",
     "stopWriterForPreparedCapture",
   ]);
-
-  assert.throws(
-    () =>
-      getPostgresLogicalWriterAtomicCrashCaptureFacet({
-        ...value.facade,
-      }),
-    assertLauncherError("invalid_logical_writer_launch_request"),
-  );
-  assert.throws(
-    () =>
-      getPostgresLogicalWriterAtomicCrashCaptureFacet(
-        new Proxy(value.facade, {}),
-      ),
-    assertLauncherError("invalid_logical_writer_launch_request"),
-  );
 });
 
 test("atomic complete-stop identity uses its own domain and the full canonical request", async () => {
@@ -4910,13 +4924,22 @@ test("clean and atomic complete-stop routes reject cross-use in both directions"
   const prepared = await clean.facade.stopWriterForPreparedCapture(
     cleanCapture,
   );
-  const cleanFacet = getPostgresLogicalWriterAtomicCrashCaptureFacet(
-    clean.facade,
-  );
+  const cleanRequest = atomicCrashCaptureRequest(clean);
+  const cleanCollaborators = atomicCompositionCollaborators(cleanRequest);
+  const cleanComposition = createPostgresLvmAtomicCrashCaptureComposition({
+    baseBackend: cleanCollaborators.baseBackend,
+    catalogue: cleanCollaborators.catalogue,
+    driver: cleanCollaborators.driver,
+    launcher: clean.facade,
+  });
   await assert.rejects(
-    cleanFacet.completeStop(atomicCrashCaptureRequest(clean)),
-    assertLauncherError("invalid_logical_writer_launch_request"),
+    cleanComposition.runCapture(exactRecord({ request: cleanRequest })),
+    assertAtomicCompositionError(
+      "postgres_lvm_atomic_crash_capture_composition_outcome_uncertain",
+    ),
   );
+  assert.equal(cleanCollaborators.calls.capture, 0);
+  assert.equal(cleanCollaborators.calls.claim, 0);
   clean.facade.retirePreparedCapture({
     resolution: prepared.resolution,
     result: prepared.stop.operation.request.captureIntent.predeterminedResult,
@@ -4924,11 +4947,29 @@ test("clean and atomic complete-stop routes reject cross-use in both directions"
 
   const atomic = await fixture();
   await atomic.facade.runLaunch(runInput(atomic));
-  const atomicFacet = getPostgresLogicalWriterAtomicCrashCaptureFacet(
-    atomic.facade,
-  );
   const request = atomicCrashCaptureRequest(atomic);
-  const captureAuthority = await atomicFacet.completeStop(request);
+  let releaseCapture;
+  let signalCaptureStarted;
+  const captureStarted = new Promise((resolve) => {
+    signalCaptureStarted = resolve;
+  });
+  const captureGate = new Promise((resolve) => {
+    releaseCapture = resolve;
+  });
+  const atomicCollaborators = atomicCompositionCollaborators(request, {
+    captureGate,
+    onCaptureStart: signalCaptureStarted,
+  });
+  const atomicComposition = createPostgresLvmAtomicCrashCaptureComposition({
+    baseBackend: atomicCollaborators.baseBackend,
+    catalogue: atomicCollaborators.catalogue,
+    driver: atomicCollaborators.driver,
+    launcher: atomic.facade,
+  });
+  const pendingCapture = atomicComposition.runCapture(
+    exactRecord({ request }),
+  );
+  await captureStarted;
   assert.throws(
     () => atomic.facade.resolveStoppedWriter(resolverInput(atomic)),
     assertLauncherError("invalid_logical_writer_launch_request"),
@@ -4937,126 +4978,17 @@ test("clean and atomic complete-stop routes reject cross-use in both directions"
     atomic.facade.stopWriterForCapture(resolverInput(atomic)),
     assertLauncherError("invalid_logical_writer_launch_request"),
   );
-  assert.equal(
-    atomicFacet.retireCompleteStop({
-      captureAuthority,
-      request,
-      result: atomicCrashCaptureResult(request),
-    }),
-    undefined,
+  releaseCapture();
+  assert.deepEqual(
+    await pendingCapture,
+    atomicCrashCaptureResult(request),
   );
 });
 
-test("atomic facet consumes one exact authority and retires only its committed result", async () => {
-  const value = await fixture();
-  await value.facade.runLaunch(runInput(value));
-  const facet = getPostgresLogicalWriterAtomicCrashCaptureFacet(value.facade);
-  const request = atomicCrashCaptureRequest(value);
-  const result = objectFreeze(atomicCrashCaptureResult(request));
-  const pendingStop = facet.completeStop(request);
-  assertProtectedPromise(pendingStop);
-  const captureAuthority = await pendingStop;
-
-  assert.equal(Object.getPrototypeOf(captureAuthority), null);
-  assert.equal(Object.isFrozen(captureAuthority), true);
-  assert.deepEqual(Reflect.ownKeys(captureAuthority), []);
-  assertWriterLaunchBlocked(value.stoppedWriterCoordinator);
-
-  const mismatchedRequest = {
-    ...request,
-    sourceAttachment: {
-      ...request.sourceAttachment,
-      rootPath: "/var/lib/portable-codex/session-001-mismatch",
-    },
-  };
-  const rejected = facet.resolveCaptureAuthority(
-    { captureAuthority, request: mismatchedRequest },
-    objectFreeze(async function rejectedAtomicCapture() {
-      assert.fail("mismatched authority must not dispatch capture");
-    }),
-  );
-  assertProtectedPromise(rejected);
-  await assert.rejects(
-    rejected,
-    assertLauncherError("invalid_logical_writer_launch_request"),
-  );
-
-  let captureCalls = 0;
-  const runCapture = objectFreeze(async function runAtomicCapture() {
-    captureCalls += 1;
-    return result;
-  });
-  const pendingCapture = facet.resolveCaptureAuthority(
-    exactRecord({ captureAuthority, request }),
-    runCapture,
-  );
-  assertProtectedPromise(pendingCapture);
-  assert.strictEqual(await pendingCapture, result);
-  assert.equal(captureCalls, 1);
-  await assert.rejects(
-    facet.resolveCaptureAuthority(
-      { captureAuthority, request },
-      runCapture,
-    ),
-    assertLauncherError("invalid_logical_writer_launch_request"),
-  );
-  assertWriterLaunchBlocked(value.stoppedWriterCoordinator);
-
-  assert.throws(
-    () =>
-      facet.retireCompleteStop({
-        captureAuthority,
-        request,
-        result: atomicCrashCaptureResult(request, {
-          artifact: { contentSha256: "f".repeat(64) },
-        }),
-      }),
-    assertLauncherError("invalid_logical_writer_launch_request"),
-  );
-  assert.equal(
-    facet.retireCompleteStop({ captureAuthority, request, result }),
-    undefined,
-  );
-  assert.equal(
-    value.stoppedWriterCoordinator.assertWriterLaunchAvailable(
-      higherEpochWriterBinding(),
-    ),
-    undefined,
-  );
-  assert.throws(
-    () => facet.retireCompleteStop({ captureAuthority, request, result }),
-    assertLauncherError("invalid_logical_writer_launch_request"),
-  );
-});
-
-test("atomic committed replay retires an issued authority without consuming it", async () => {
-  const value = await fixture();
-  await value.facade.runLaunch(runInput(value));
-  const facet = getPostgresLogicalWriterAtomicCrashCaptureFacet(value.facade);
-  const request = atomicCrashCaptureRequest(value);
-  const captureAuthority = await facet.completeStop(request);
-
-  assertWriterLaunchBlocked(value.stoppedWriterCoordinator);
-  assert.equal(
-    facet.retireCompleteStop({
-      captureAuthority,
-      request,
-      result: atomicCrashCaptureResult(request),
-    }),
-    undefined,
-  );
-  assert.equal(
-    value.stoppedWriterCoordinator.assertWriterLaunchAvailable(
-      higherEpochWriterBinding(),
-    ),
-    undefined,
-  );
-});
-
-test("atomic facet uses captured coordinator intrinsics for consume and retirement", async (t) => {
+test("atomic composition uses captured coordinator intrinsics for fresh and replay retirement", async (t) => {
   for (const entry of [
-    { consume: true, name: "consumed authority" },
-    { consume: false, name: "issued replay authority" },
+    { committed: false, name: "consumed authority" },
+    { committed: true, name: "issued replay authority" },
   ]) {
     await t.test(entry.name, async () => {
       hostileRegisterWriterCalls = 0;
@@ -5069,28 +5001,19 @@ test("atomic facet uses captured coordinator intrinsics for consume and retireme
         stoppedWriterCoordinator: new HostileStoppedWriterCoordinator(),
       });
       await value.facade.runLaunch(runInput(value));
-      const facet = getPostgresLogicalWriterAtomicCrashCaptureFacet(
-        value.facade,
-      );
       const request = atomicCrashCaptureRequest(value);
-      const result = objectFreeze(atomicCrashCaptureResult(request));
-      const captureAuthority = await facet.completeStop(request);
-      if (entry.consume) {
-        const runCapture = objectFreeze(
-          async function runIntrinsicAtomicCapture(...args) {
-            assert.equal(args.length, 0);
-            return result;
-          },
-        );
-        assert.strictEqual(
-          await facet.resolveCaptureAuthority(
-            { captureAuthority, request },
-            runCapture,
-          ),
-          result,
-        );
-      }
-      facet.retireCompleteStop({ captureAuthority, request, result });
+      const collaborators = atomicCompositionCollaborators(request, entry);
+      const composition = createPostgresLvmAtomicCrashCaptureComposition({
+        baseBackend: collaborators.baseBackend,
+        catalogue: collaborators.catalogue,
+        driver: collaborators.driver,
+        launcher: value.facade,
+      });
+
+      assert.deepEqual(
+        await composition.runCapture(exactRecord({ request })),
+        atomicCrashCaptureResult(request),
+      );
 
       assert.equal(hostileLaunchAdmissionCalls, 0);
       assert.equal(hostileRegisterWriterCalls, 0);
@@ -5098,6 +5021,15 @@ test("atomic facet uses captured coordinator intrinsics for consume and retireme
       assert.equal(hostileConsumeCapabilityCalls, 0);
       assert.equal(hostileRevokeWriterCalls, 0);
       assert.equal(hostileRetireWriterCalls, 0);
+      assert.equal(
+        Reflect.apply(
+          StoppedWriterCapabilityCoordinator.prototype
+            .assertWriterLaunchAvailable,
+          value.stoppedWriterCoordinator,
+          [higherEpochWriterBinding()],
+        ),
+        undefined,
+      );
     });
   }
 });
@@ -5284,82 +5216,80 @@ test("atomic composition reconciles commit acknowledgement loss without redispat
 });
 
 test("atomic authority failure and concurrent reuse remain permanently closed", async (t) => {
-  await t.test("callback failure becomes uncertain", async () => {
+  const outcomeCode =
+    "postgres_lvm_atomic_crash_capture_composition_outcome_uncertain";
+
+  await t.test("capture failure becomes uncertain", async () => {
     const value = await fixture();
     await value.facade.runLaunch(runInput(value));
-    const facet = getPostgresLogicalWriterAtomicCrashCaptureFacet(
-      value.facade,
-    );
     const request = atomicCrashCaptureRequest(value);
-    const captureAuthority = await facet.completeStop(request);
-    const failedCapture = objectFreeze(async function failedAtomicCapture() {
-      throw new Error("snapshot failed after dispatch");
+    const collaborators = atomicCompositionCollaborators(request, {
+      captureThrows: true,
+      committedReadVisible: false,
+    });
+    const composition = createPostgresLvmAtomicCrashCaptureComposition({
+      baseBackend: collaborators.baseBackend,
+      catalogue: collaborators.catalogue,
+      driver: collaborators.driver,
+      launcher: value.facade,
     });
 
     await assert.rejects(
-      facet.resolveCaptureAuthority(
-        { captureAuthority, request },
-        failedCapture,
-      ),
-      assertLauncherError("logical_writer_launch_outcome_uncertain"),
+      composition.runCapture(exactRecord({ request })),
+      assertAtomicCompositionError(outcomeCode),
     );
     await assert.rejects(
-      facet.resolveCaptureAuthority(
-        { captureAuthority, request },
-        failedCapture,
-      ),
-      assertLauncherError("invalid_logical_writer_launch_request"),
+      composition.runCapture(exactRecord({ request })),
+      assertAtomicCompositionError(outcomeCode),
     );
-    assert.throws(
-      () =>
-        facet.retireCompleteStop({
-          captureAuthority,
-          request,
-          result: atomicCrashCaptureResult(request),
-        }),
-      assertLauncherError("invalid_logical_writer_launch_request"),
-    );
+    assert.equal(value.supervisorStopCalls, 1);
+    assert.equal(collaborators.calls.capture, 1);
+    assert.equal(collaborators.calls.commit, 0);
     assertWriterLaunchBlocked(value.stoppedWriterCoordinator);
   });
 
   await t.test("concurrent reuse cannot overtake the first consume", async () => {
     const value = await fixture();
     await value.facade.runLaunch(runInput(value));
-    const facet = getPostgresLogicalWriterAtomicCrashCaptureFacet(
-      value.facade,
-    );
     const request = atomicCrashCaptureRequest(value);
-    const result = objectFreeze(atomicCrashCaptureResult(request));
-    const captureAuthority = await facet.completeStop(request);
     let releaseCapture;
     let signalCaptureStarted;
     const captureStarted = new Promise((resolve) => {
       signalCaptureStarted = resolve;
     });
-    const heldCapture = new Promise((resolve) => {
+    const captureGate = new Promise((resolve) => {
       releaseCapture = resolve;
     });
-    const runCapture = objectFreeze(async function runHeldAtomicCapture() {
-      signalCaptureStarted();
-      return await heldCapture;
+    const collaborators = atomicCompositionCollaborators(request, {
+      captureGate,
+      onCaptureStart: signalCaptureStarted,
+    });
+    const composition = createPostgresLvmAtomicCrashCaptureComposition({
+      baseBackend: collaborators.baseBackend,
+      catalogue: collaborators.catalogue,
+      driver: collaborators.driver,
+      launcher: value.facade,
     });
 
-    const first = facet.resolveCaptureAuthority(
-      { captureAuthority, request },
-      runCapture,
+    const first = composition.runCapture(
+      exactRecord({ request }),
     );
     await captureStarted;
     await assert.rejects(
-      facet.resolveCaptureAuthority(
-        { captureAuthority, request },
-        runCapture,
-      ),
-      assertLauncherError("invalid_logical_writer_launch_request"),
+      composition.runCapture(exactRecord({ request })),
+      assertAtomicCompositionError(outcomeCode),
     );
-    releaseCapture(result);
-    assert.strictEqual(await first, result);
+    releaseCapture();
+    assert.deepEqual(
+      await first,
+      atomicCrashCaptureResult(request),
+    );
+    assert.equal(value.supervisorStopCalls, 1);
+    assert.equal(collaborators.calls.capture, 1);
     assert.equal(
-      facet.retireCompleteStop({ captureAuthority, request, result }),
+      value.stoppedWriterCoordinator.assertWriterLaunchAvailable(
+        higherEpochWriterBinding(),
+      ),
       undefined,
     );
   });

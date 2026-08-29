@@ -632,10 +632,12 @@ by LV UUID, visible length, full SHA-256, and read-only policy without reopening
 the source.
 
 A further completed private composition binds one exact PostgreSQL launcher
-complete-stop to that LVM provider. A separate branded facet leaves the clean
-launcher facade unchanged, consumes the stopped-writer capability only during
-one freshly claimed snapshot, revokes an unused capability after committed
-replay, and retires the local blocker only after an exact committed result.
+complete-stop to that LVM provider. A separate branded module-private facet
+leaves the clean launcher facade unchanged, consumes the stopped-writer
+capability only during one freshly claimed snapshot, revokes an unused
+capability after committed replay, and retires the local blocker only after an
+exact committed result. Its raw methods and accessor are not exported; only
+the safe two-method composition leaves the launcher module.
 Acknowledgement ambiguity can advance only through source-free committed
 verification; `unknown` remains blocking. The existing ext4 backend and public
 deployment still do not advertise or call this extension. Physical stale-writer

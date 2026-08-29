@@ -6,6 +6,10 @@ import {
   isPostgresDetachedRestoreImagePlanReservation,
 } from "./postgres-detached-restore-image-plan-binding.mjs";
 import {
+  PostgresLvmAtomicCrashCaptureCompositionError,
+  createPostgresLvmAtomicCrashCaptureCompositionInternal,
+} from "./postgres-atomic-crash-capture-composition-internal.mjs";
+import {
   PostgresOperationGuard,
   isPostgresOperationGuard,
 } from "./postgres-operation-guard.mjs";
@@ -5871,11 +5875,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
   return facade;
 }
 
-/**
- * Returns the launcher-owned private complete-stop facet. Only a facade
- * created by this module is accepted; structural substitutes are rejected.
- */
-export function getPostgresLogicalWriterAtomicCrashCaptureFacet(...args) {
+function resolvePostgresLogicalWriterAtomicCrashCaptureFacet(...args) {
   const code = "invalid_logical_writer_launch_request";
   ensure(args.length === 1, code);
   const launcher = args[0];
@@ -5889,6 +5889,26 @@ export function getPostgresLogicalWriterAtomicCrashCaptureFacet(...args) {
   ensure(facet !== undefined, code);
   return facet;
 }
+objectFreeze(resolvePostgresLogicalWriterAtomicCrashCaptureFacet);
+
+export { PostgresLvmAtomicCrashCaptureCompositionError };
+
+/**
+ * Assembles the only public complete-stop atomic crash-capture surface without
+ * exposing the launcher-owned authority facet or its retirement entrypoint.
+ */
+export function createPostgresLvmAtomicCrashCaptureComposition(...args) {
+  if (args.length !== 1) {
+    throw new PostgresLvmAtomicCrashCaptureCompositionError(
+      "invalid_postgres_lvm_atomic_crash_capture_composition_options",
+    );
+  }
+  return createPostgresLvmAtomicCrashCaptureCompositionInternal(
+    args[0],
+    resolvePostgresLogicalWriterAtomicCrashCaptureFacet,
+  );
+}
+objectFreeze(createPostgresLvmAtomicCrashCaptureComposition);
 
 objectFreeze(PostgresLogicalWriterLauncherError.prototype);
 objectFreeze(PostgresLogicalWriterLauncherError);

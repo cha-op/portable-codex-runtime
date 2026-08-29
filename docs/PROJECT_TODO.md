@@ -315,11 +315,13 @@
   access policy. Existing ext4/public capability declarations remain unchanged.
 - [done] Added a private PostgreSQL complete-stop composition for that LVM
   provider without widening the clean launcher facade. One separately branded
-  facet binds the full atomic request to a domain-separated durable stop,
-  consumes the exact stopped-writer capability only during fresh snapshot
-  dispatch, revokes it after committed replay, and retires the local blocker
-  only after exact committed evidence. Acknowledgement ambiguity uses only
-  source-free committed verification; `unknown` remains blocking.
+  module-private facet binds the full atomic request to a domain-separated
+  durable stop, consumes the exact stopped-writer capability only during fresh
+  snapshot dispatch, revokes it after committed replay, and retires the local
+  blocker only after exact committed evidence. Acknowledgement ambiguity uses only
+  source-free committed verification; `unknown` remains blocking. No raw facet
+  accessor is exported: launcher holders receive only the safe two-method
+  composition and cannot forge retirement with a structural result.
 - [pending] Extend beyond that evidence and the clean/manual-fencing production
   boundary only in separately scoped work: host, controller, and drive cache-
   loss evidence, the physical-fence branch and public crash-prefix recovery

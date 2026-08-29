@@ -14,9 +14,9 @@ superseded_by:
 
 ## Summary
 
-- Add a separately branded PostgreSQL launcher facet for one exact version 1
-  atomic crash-capture request without changing the existing clean launcher
-  facade or clean stop-operation identity.
+- Add a separately branded module-private PostgreSQL launcher facet for one
+  exact version 1 atomic crash-capture request without changing the existing
+  clean launcher facade or clean stop-operation identity.
 - Assemble that facet privately with the classic LVM provider so the opaque
   stopped-writer capability remains within the private assembler boundary and
   is consumed only while one freshly claimed snapshot runs.
@@ -34,6 +34,10 @@ superseded_by:
   attachment, canonical lease, process and writer incarnations, and stop
   operation. The composition and provider never receive the writer handle or
   clean stop resolution.
+- The launcher exports neither the raw facet nor an accessor to complete,
+  authority-consume, or retirement methods. Only the safe public composition
+  factory may resolve it inside the launcher module, preventing ordinary
+  facade holders from treating a caller-built result as committed proof.
 - A fresh provider claim consumes the capability exactly once around the LVM
   driver callback. A committed catalogue replay consumes no authority and
   instead revokes the unused capability before retirement.
@@ -65,7 +69,7 @@ superseded_by:
 
 - `node --check` passed for the launcher, private composition, and focused
   launcher test module.
-- All 174 launcher tests passed, including the real launcher/coordinator/LVM
+- All 172 launcher tests passed, including the real launcher/coordinator/LVM
   composition fixture. The related crash core, LVM provider, storage-contract,
   and stopped-writer coordinator suites passed all 264 tests.
 - The default catalogue/LVM integration invocation passed its catalogue path
@@ -75,10 +79,15 @@ superseded_by:
   watcher exhausted the host file-descriptor limit with `EMFILE`. The complete
   suite then exited zero with only that exact test name skipped.
 - Project-journal validation, syntax checks, and `git diff --check` passed.
+- The sole fresh-context local review identified the formerly exported raw
+  retirement surface; the fix made that facet module-private and added an
+  export-surface regression test before the same logical lane was rerun.
 
 ## Evidence
 
-- Launcher facet: `src/postgres-logical-writer-launcher.mjs`
-- Private assembler: `src/postgres-atomic-crash-capture-composition.mjs`
+- Launcher facet and safe factory: `src/postgres-logical-writer-launcher.mjs`
+- Public composition entrypoint:
+  `src/postgres-atomic-crash-capture-composition.mjs`
+- Private assembler: `src/postgres-atomic-crash-capture-composition-internal.mjs`
 - Provider: `src/lvm-atomic-crash-capture-provider.mjs`
 - Architecture: `docs/architecture/atomic-crash-capture-extension.md`

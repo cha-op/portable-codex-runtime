@@ -283,13 +283,18 @@ other metadata appears stable.
 
 ## Private Complete-Stop LVM Composition
 
-The PostgreSQL launcher now exposes a separately branded private facet for an
-exact version 1 atomic request. The existing nine-method clean launcher facade,
-its `clean` tuple admission, and its stop-operation identity remain unchanged.
+The PostgreSQL launcher now keeps a separately branded module-private facet for
+an exact version 1 atomic request. The existing nine-method clean launcher
+facade, its `clean` tuple admission, and its stop-operation identity remain unchanged.
 The private facet instead derives a domain-separated stop operation from the
 launch attempt and the complete atomic request, including the capture-attempt
 ID. It retains the opaque stopped-writer capability and its attachment, lease,
 holder, epoch, process, writer, and stop-operation bindings inside the launcher.
+Neither the raw facet nor an accessor for its complete, authority-consume, or
+retirement methods is exported. The public composition factory resolves the
+facet only inside the launcher module and returns solely `runCapture` and
+`reconcileCapture`; possession of the ordinary launcher facade therefore
+cannot turn a caller-constructed result into retirement evidence.
 
 The private PostgreSQL/LVM assembler constructs the LVM provider with that
 facet's authority consumer before any writer authority is presented. A fresh
