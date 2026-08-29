@@ -623,14 +623,24 @@ length and SHA-256, and read-only access policy independently, and permits
 source-free verification to return only exact `committed` evidence or
 non-authorizing `unknown`.
 
-The next dependent slice adds an independent PostgreSQL exact-result catalogue
-and a dormant classic LVM snapshot provider. Four separately unique opaque IDs,
-irreversible database-owned transition audit, and a one-use dispatch claim
-prevent existing or acknowledgement-ambiguous attempts from issuing a second
-`lvcreate`. The retained read-only snapshot LV is revalidated by LV UUID,
-visible length, full SHA-256, and read-only policy without reopening the source.
-The existing ext4 backend and public deployment still do not advertise or call
-this extension. Production stopped/fenced composition, physical stale-writer
+A completed dependent slice adds an independent PostgreSQL exact-result
+catalogue and a dormant classic LVM snapshot provider. Four separately unique
+opaque IDs, irreversible database-owned transition audit, and a one-use
+dispatch claim prevent existing or acknowledgement-ambiguous attempts from
+issuing a second `lvcreate`. The retained read-only snapshot LV is revalidated
+by LV UUID, visible length, full SHA-256, and read-only policy without reopening
+the source.
+
+A further completed private composition binds one exact PostgreSQL launcher
+complete-stop to that LVM provider. A separate branded module-private facet
+leaves the clean launcher facade unchanged, consumes the stopped-writer
+capability only during one freshly claimed snapshot, revokes an unused
+capability after committed replay, and retires the local blocker only after an
+exact committed result. Its raw methods and accessor are not exported; only
+the safe two-method composition leaves the launcher module.
+Acknowledgement ambiguity can advance only through source-free committed
+verification; `unknown` remains blocking. The existing ext4 backend and public
+deployment still do not advertise or call this extension. Physical stale-writer
 fencing, repair-gated restore, and higher-epoch writer admission remain later
 slices; see `atomic-crash-capture-extension.md`.
 

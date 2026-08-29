@@ -313,12 +313,21 @@
   regranting physical dispatch. The retained read-only snapshot LV is replayed
   and source-free verified by persistent LV UUID, visible length, SHA-256, and
   access policy. Existing ext4/public capability declarations remain unchanged.
+- [done] Added a private PostgreSQL complete-stop composition for that LVM
+  provider without widening the clean launcher facade. One separately branded
+  module-private facet binds the full atomic request to a domain-separated
+  durable stop, consumes the exact stopped-writer capability only during fresh
+  snapshot dispatch, revokes it after committed replay, and retires the local
+  blocker only after exact committed evidence. Acknowledgement ambiguity uses only
+  source-free committed verification; `unknown` remains blocking. No raw facet
+  accessor is exported: launcher holders receive only the safe two-method
+  composition and cannot forge retirement with a structural result.
 - [pending] Extend beyond that evidence and the clean/manual-fencing production
   boundary only in separately scoped work: host, controller, and drive cache-
-  loss evidence, fence-bound production crash-prefix composition, automatic
-  stale-writer fencing, repair-gated restore and higher-epoch launch,
-  differential export/compression, content-addressed distribution, encryption,
-  retention and periodic snapshots, registry publisher/signature trust, and
-  remote image transport.
+  loss evidence, the physical-fence branch and public crash-prefix recovery
+  wiring, automatic stale-writer fencing, repair-gated restore and higher-epoch
+  launch, differential export/compression, content-addressed distribution,
+  encryption, retention and periodic snapshots, registry publisher/signature
+  trust, and remote image transport.
 - [deferred] Add a read-only Git Summary for user context; it is not part of
   snapshot correctness or recovery.

@@ -659,6 +659,23 @@
   no physical stale-writer fence, tail-repair admission, restore path, or
   higher-epoch writer authority is added, and the ext4 backend remains
   `atomicPointInTimeCheckpoint: false` with manual fencing.
+- A private PostgreSQL/LVM atomic crash-capture composition now closes the
+  complete-stop branch without widening the clean launcher facade. A separately
+  branded module-private launcher facet binds the complete version 1 request
+  and a domain-separated stop operation to one exact attachment, lease,
+  holder, epoch, process and writer incarnation. Fresh provider dispatch
+  consumes the opaque stopped-writer capability exactly while the LVM snapshot runs;
+  committed replay instead revalidates the retained snapshot and revokes the
+  unused capability. The composition retires the local blocker only after an
+  exact committed result, and acknowledgement ambiguity can advance only
+  through source-free committed verification. `unknown` remains blocking.
+  The raw complete, authority-consume, and retirement methods have no public
+  accessor; the public module exposes only the two-method safe composition, so
+  a launcher-facade holder cannot submit a structural result as retirement
+  proof.
+  Physical stale-writer fencing, restart reconstruction of opaque capability,
+  public/ext4 wiring, tail repair, writable restore, and higher-epoch launch
+  remain unavailable.
 - Terminal local Podman supervisor state now has a bounded two-phase collector.
   It validates the exact stopped revision 4 terminal record and revisions 0
   through 3 or their admitted oldest-first missing retry prefix, removes the

@@ -281,23 +281,82 @@ access-policy change unless the corresponding selected signal also changes.
 Conversely, a mismatch in a selected signal must not be excused merely because
 other metadata appears stable.
 
+## Private Complete-Stop LVM Composition
+
+The PostgreSQL launcher now keeps a separately branded module-private facet for
+an exact version 1 atomic request. The existing nine-method clean launcher
+facade, its `clean` tuple admission, and its stop-operation identity remain unchanged.
+The private facet instead derives a domain-separated stop operation from the
+launch attempt and the complete atomic request, including the capture-attempt
+ID. It retains the opaque stopped-writer capability and its attachment, lease,
+holder, epoch, process, writer, and stop-operation bindings inside the launcher.
+Neither the raw facet nor an accessor for its complete, authority-consume, or
+retirement methods is exported. The ordinary launcher factory and detached
+runtime composition receive only the unchanged nine-method facade. A separate
+launcher-owner factory returns that facade together with one fresh, frozen,
+null-prototype, zero-own-key `atomicCrashCaptureAssembler` identity capability.
+The launcher module brands the capability in a private `WeakMap`; it is not an
+own property of the launcher and cannot be recovered from, cloned from, or
+structurally imitated by an ordinary facade holder.
+
+The public composition factory accepts only that owner-held assembler
+capability before binding the selected backend, catalogue, and driver. It
+resolves the matching facet only inside the launcher module and returns solely
+`runCapture` and `reconcileCapture`. The assembler is intentionally a
+transferable bearer capability and must remain with the authorized assembly
+root. Possession of the ordinary launcher facade, a cloned empty object, or an
+assembler for a different launcher cannot release this launcher's blocker with
+caller-constructed collaborators or results.
+
+The private PostgreSQL/LVM assembler constructs the LVM provider with that
+facet's authority consumer before any writer authority is presented. A fresh
+capture therefore preserves this order:
+
+1. validate and freeze the exact provider backend and atomic request;
+2. establish the matching durable complete-stop and issue one same-process
+   stopped-writer capability;
+3. let the catalogue grant a fresh provider dispatch;
+4. consume that exact capability while the driver performs one snapshot;
+5. commit and validate the exact version 1 result; and
+6. retire the local stopped-writer blocker only after committed evidence.
+
+A committed catalogue replay physically revalidates the retained snapshot
+without consuming authority. The facet then revokes the unused stopped-writer
+capability before retirement. If provider acknowledgement is ambiguous, the
+composition performs only source-free committed verification. `unknown`, a
+verification error, stop ambiguity, or authority-consumption ambiguity keeps
+the local blocker and cannot reopen preparation, stop, capability consumption,
+or physical dispatch. A later same-process reconciliation is admitted only for
+that retained exact request and repeats only committed verification.
+
+An exact `runCapture` retry after `completeStop` rejects is different: the
+composition retains the pre-provider attempt in `stop-uncertain` and re-enters
+the launcher's same durable stop operation. A transient failure before any
+physical stop can therefore recover, while a launcher record that reached an
+ambiguous or non-replayable state still rejects without admitting the provider
+or a second physical stop. After exact retirement, the composition replaces
+the mutable authority attempt with a frozen request/result terminal record.
+Exact `runCapture` or `reconcileCapture` response-loss retries return that same
+result without another stop, catalogue claim, authority consume, or snapshot;
+reuse of the capture-attempt ID with different request content remains closed.
+
 ## Deliberate Non-Capabilities
 
-This private provider slice still does not provide or select:
+This private complete-stop composition still does not provide or select:
 
-- physical writer fencing or fence verification; its only authority hook is
-  an injected stopped-writer consumer;
-- integration with the current clean checkpoint path, lifecycle facade, or
-  public deployment;
+- physical stale-writer fencing or fence verification; it accepts only a
+  conclusively joined complete stop for the current same-process writer;
+- integration with the current clean checkpoint path, lifecycle facade,
+  ext4 capability discovery, or public deployment;
 - crash-prefix tail repair;
 - restore or publication of a writable restore destination; or
 - admission of a new writer lease or fencing epoch.
 
-The provider and catalogue do not turn the structural request into physical
-authority. A future production composition must create the stopped or fenced
-authority, retain it through capture, and preserve the remaining recovery
-ordering below. Cloud, filesystem-native, thin-LVM, and other snapshot adapters
-also remain separate work.
+The private composition closes only the local complete-stop branch. A future
+production recovery path must add the separate physical-fence branch required
+for stale-writer takeover and preserve the remaining ordering below. Cloud,
+filesystem-native, thin-LVM, and other snapshot adapters also remain separate
+work.
 
 ## Required Future Ordering
 
@@ -307,8 +366,8 @@ capture; automatic stale-writer takeover requires the physical-fence branch:
 
 1. establish and authenticate either complete writer stop or a physical fence
    for the old writer;
-2. perform a fence-bound atomic capture through a concrete provider and commit
-   the exact version 1 result;
+2. perform a stop-or-fence-bound atomic capture through a concrete provider and
+   commit the exact version 1 result;
 3. repair the captured tail only on a separate writable generation, never on
    the committed read-only artifact; and
 4. admit a writer only for that repaired generation under a strictly higher
