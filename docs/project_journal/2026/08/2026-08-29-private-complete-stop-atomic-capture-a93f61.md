@@ -23,6 +23,8 @@ superseded_by:
 - Permit acknowledgement recovery only through source-free committed
   verification, and retire the local stopped-writer blocker only after the
   exact committed result is known.
+- Preserve same-composition retries across pre-stop transient failure and
+  post-retirement response loss without reopening provider dispatch.
 
 ## Protected Authority
 
@@ -57,6 +59,13 @@ superseded_by:
 - Later reconciliation is same-process and request-exact. It performs only
   committed verification and cannot reconstruct an opaque capability after
   restart.
+- An exact `runCapture` retry from `stop-uncertain` re-enters only the
+  launcher's retained durable complete-stop operation. If the launcher cannot
+  safely replay it, the blocker remains closed and no provider callback runs.
+- Successful retirement leaves a frozen terminal request/result record in the
+  composition. Exact `runCapture` and `reconcileCapture` retries return that
+  result without another stop, claim, capture, or verification; a different
+  request under the same capture-attempt ID is rejected.
 
 ## Safety Boundary
 
@@ -73,7 +82,7 @@ superseded_by:
 
 - `node --check` passed for the launcher, private composition, and focused
   launcher test module.
-- All 173 launcher tests passed, including the real launcher/coordinator/LVM
+- All 175 launcher tests passed, including the real launcher/coordinator/LVM
   composition fixture. The related crash core, LVM provider, storage-contract,
   and stopped-writer coordinator suites passed all 264 tests.
 - The default catalogue/LVM integration invocation passed its catalogue path
@@ -90,6 +99,9 @@ superseded_by:
   module-private and require a separately branded launcher-owner assembler
   capability, with export-shape, forgery, clone, proxy, foreign-launcher, and
   cross-composition concurrency regression coverage.
+- The first GitHub Codex pass identified missing retry paths before physical
+  stop and after successful response loss. The composition now retains those
+  exact states without weakening stop or capture single-dispatch.
 
 ## Evidence
 

@@ -5195,6 +5195,99 @@ test("atomic composition validates the exact provider request before writer stop
   });
 });
 
+test("atomic composition retries an exact request after pre-stop uncertainty", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const request = atomicCrashCaptureRequest(value);
+  const collaborators = atomicCompositionCollaborators(request);
+  const composition = createPostgresLvmAtomicCrashCaptureComposition({
+    atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
+    baseBackend: collaborators.baseBackend,
+    catalogue: collaborators.catalogue,
+    driver: collaborators.driver,
+  });
+  const outcomeCode =
+    "postgres_lvm_atomic_crash_capture_composition_outcome_uncertain";
+
+  value.authority.behaviour.readSessionThrows = true;
+  await assert.rejects(
+    composition.runCapture(exactRecord({ request })),
+    assertAtomicCompositionError(outcomeCode),
+  );
+  assert.equal(value.supervisorStopCalls, 0);
+  assert.deepEqual(collaborators.calls, {
+    capture: 0,
+    claim: 0,
+    commit: 0,
+    mark: 0,
+    read: 0,
+    resolve: 0,
+    verify: 0,
+  });
+
+  value.authority.behaviour.readSessionThrows = false;
+  assert.deepEqual(
+    await composition.runCapture(exactRecord({ request })),
+    atomicCrashCaptureResult(request),
+  );
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.equal(collaborators.calls.resolve, 1);
+  assert.equal(collaborators.calls.claim, 1);
+  assert.equal(collaborators.calls.capture, 1);
+  assert.equal(collaborators.calls.commit, 1);
+  assert.equal(collaborators.calls.read, 0);
+  assert.equal(collaborators.calls.verify, 0);
+});
+
+test("atomic composition replays its exact retired result without redispatch", async () => {
+  const value = await fixture();
+  await value.facade.runLaunch(runInput(value));
+  const request = atomicCrashCaptureRequest(value);
+  const collaborators = atomicCompositionCollaborators(request);
+  const composition = createPostgresLvmAtomicCrashCaptureComposition({
+    atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
+    baseBackend: collaborators.baseBackend,
+    catalogue: collaborators.catalogue,
+    driver: collaborators.driver,
+  });
+
+  const first = await composition.runCapture(exactRecord({ request }));
+  const repeated = await composition.runCapture(exactRecord({ request }));
+  const reconciled = await composition.reconcileCapture(
+    exactRecord({ request }),
+  );
+
+  assert.strictEqual(repeated, first);
+  assert.strictEqual(reconciled, first);
+  assert.equal(value.supervisorStopCalls, 1);
+  assert.deepEqual(collaborators.calls, {
+    capture: 1,
+    claim: 1,
+    commit: 1,
+    mark: 0,
+    read: 0,
+    resolve: 1,
+    verify: 0,
+  });
+
+  await assert.rejects(
+    composition.runCapture(
+      exactRecord({
+        request: {
+          ...request,
+          sourceAttachment: {
+            ...request.sourceAttachment,
+            rootPath: `${request.sourceAttachment.rootPath}-replacement`,
+          },
+        },
+      }),
+    ),
+    assertAtomicCompositionError(
+      "postgres_lvm_atomic_crash_capture_composition_outcome_uncertain",
+    ),
+  );
+});
+
 test("atomic composition reconciles commit acknowledgement loss without redispatch", async (t) => {
   const outcomeCode =
     "postgres_lvm_atomic_crash_capture_composition_outcome_uncertain";

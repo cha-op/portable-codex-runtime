@@ -329,6 +329,17 @@ the local blocker and cannot reopen preparation, stop, capability consumption,
 or physical dispatch. A later same-process reconciliation is admitted only for
 that retained exact request and repeats only committed verification.
 
+An exact `runCapture` retry after `completeStop` rejects is different: the
+composition retains the pre-provider attempt in `stop-uncertain` and re-enters
+the launcher's same durable stop operation. A transient failure before any
+physical stop can therefore recover, while a launcher record that reached an
+ambiguous or non-replayable state still rejects without admitting the provider
+or a second physical stop. After exact retirement, the composition replaces
+the mutable authority attempt with a frozen request/result terminal record.
+Exact `runCapture` or `reconcileCapture` response-loss retries return that same
+result without another stop, catalogue claim, authority consume, or snapshot;
+reuse of the capture-attempt ID with different request content remains closed.
+
 ## Deliberate Non-Capabilities
 
 This private complete-stop composition still does not provide or select:

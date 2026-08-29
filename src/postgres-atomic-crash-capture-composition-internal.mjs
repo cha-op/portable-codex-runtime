@@ -21,9 +21,7 @@ const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const arraySomeIntrinsic = Array.prototype.some;
 const MapConstructor = Map;
-const mapDeleteIntrinsic = Map.prototype.delete;
 const mapGetIntrinsic = Map.prototype.get;
-const mapHasIntrinsic = Map.prototype.has;
 const mapSetIntrinsic = Map.prototype.set;
 const objectAssign = Object.assign;
 const objectCreate = Object.create;
@@ -116,14 +114,6 @@ function arraySome(value, callback) {
 
 function mapGet(value, key) {
   return reflectApply(mapGetIntrinsic, value, [key]);
-}
-
-function mapDelete(value, key) {
-  return reflectApply(mapDeleteIntrinsic, value, [key]);
-}
-
-function mapHas(value, key) {
-  return reflectApply(mapHasIntrinsic, value, [key]);
 }
 
 function mapSet(value, key, entry) {
@@ -552,6 +542,7 @@ export function createPostgresLvmAtomicCrashCaptureCompositionInternal(
   function retireAttempt(attempt, value) {
     const result = normalizeResult(value, attempt.request, retirementCode);
     ensure(attempt.state === "committed", retirementCode);
+    const captureAuthority = attempt.captureAuthority;
     let retirement;
     try {
       retirement = reflectApply(retireCompleteStop, facet, [
@@ -577,20 +568,27 @@ export function createPostgresLvmAtomicCrashCaptureCompositionInternal(
       ) === attempt &&
         weakMapGet(
           attemptsByCaptureAuthority,
-          attempt.captureAuthority,
+          captureAuthority,
         ) === attempt,
       retirementCode,
     );
-    mapDelete(
-      attemptsByCaptureAttemptId,
-      attempt.request.captureAttemptId,
-    );
+    const terminalAttempt = exactFrozenRecord({
+      request: attempt.request,
+      result,
+      state: "retired",
+    });
     weakMapDelete(
       attemptsByCaptureAuthority,
-      attempt.captureAuthority,
+      captureAuthority,
     );
+    mapSet(
+      attemptsByCaptureAttemptId,
+      attempt.request.captureAttemptId,
+      terminalAttempt,
+    );
+    attempt.captureAuthority = null;
     attempt.state = "retired";
-    return result;
+    return terminalAttempt.result;
   }
 
   async function verifyAndRetire(attempt) {
@@ -630,20 +628,30 @@ export function createPostgresLvmAtomicCrashCaptureCompositionInternal(
       fail(requestCode);
     }
     const request = preparedCapture.request;
-    ensure(
-      !mapHas(attemptsByCaptureAttemptId, request.captureAttemptId),
-      outcomeCode,
-    );
-    const attempt = {
-      captureAuthority: null,
-      request,
-      state: "prepared",
-    };
-    mapSet(
+    let attempt = mapGet(
       attemptsByCaptureAttemptId,
       request.captureAttemptId,
-      attempt,
     );
+    if (attempt === undefined) {
+      attempt = {
+        captureAuthority: null,
+        request,
+        state: "prepared",
+      };
+      mapSet(
+        attemptsByCaptureAttemptId,
+        request.captureAttemptId,
+        attempt,
+      );
+    } else {
+      ensure(sameFrozenData(request, attempt.request), outcomeCode);
+      if (attempt.state === "retired") return attempt.result;
+      ensure(
+        attempt.state === "stop-uncertain" &&
+          attempt.captureAuthority === null,
+        outcomeCode,
+      );
+    }
 
     attempt.state = "stopping";
     let pendingStop;
@@ -713,10 +721,11 @@ export function createPostgresLvmAtomicCrashCaptureCompositionInternal(
     );
     ensure(
       attempt !== undefined &&
-        attempt.state === "capture-uncertain" &&
         sameFrozenData(request, attempt.request),
       outcomeCode,
     );
+    if (attempt.state === "retired") return attempt.result;
+    ensure(attempt.state === "capture-uncertain", outcomeCode);
     return verifyAndRetire(attempt);
   };
 
