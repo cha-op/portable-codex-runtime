@@ -9240,6 +9240,248 @@ test("writer force-fence V2 claim preclaims the exact capture ID before publishi
   clients[0].assertExhausted();
 });
 
+test("writer force-fence provider binding reader returns the exact durable starting or uncertain V2 binding", async () => {
+  for (const state of ["starting", "uncertain"]) {
+    const fixture = writerAcquiredFixture();
+    const options = writerForceFenceAtomicCaptureOptions(fixture);
+    const writerEpoch = (
+      BigInt(options.expectedSession.document.writerEpoch) + 1n
+    ).toString();
+    const updatedAt =
+      state === "starting" ? WRITER_DISPATCH_NOW : WRITER_UNCERTAIN_NOW;
+    const session = writerForceFencePhaseSessionRow(state, {
+      options,
+      writerEpoch,
+      updatedAt,
+    });
+    const { authority, clients } = authorityWithScripts({
+      steps: [
+        rows(
+          operationRow(state, {
+            createdAt: WRITER_PREPARED_NOW,
+            options,
+            updatedAt,
+          }),
+        ),
+        rows(session),
+        rows(
+          reservationRow(state, {
+            createdAt: WRITER_PREPARED_NOW,
+            options,
+            updatedAt,
+          }),
+        ),
+        rows(writerFenceAtomicCaptureIdClaimRow(options)),
+      ],
+    });
+
+    const binding = await authority.readWriterForceFenceProviderBinding({
+      operationId: options.operationId,
+    });
+
+    assert.deepEqual(Reflect.ownKeys(binding), [
+      "expectedSession",
+      "fenceRequest",
+      "operationId",
+      "writerEpoch",
+    ]);
+    assert.deepEqual(binding.expectedSession, options.expectedSession);
+    assert.deepEqual(
+      binding.fenceRequest,
+      writerForceFenceRequest(options, writerEpoch),
+    );
+    assert.equal(binding.operationId, options.operationId);
+    assert.equal(binding.writerEpoch, writerEpoch);
+    assert.equal(Object.isFrozen(binding), true);
+    clients[0].assertExhausted();
+  }
+});
+
+test("writer force-fence provider binding reader rejects non-dispatched and crossed operations without mutation", async () => {
+  const fixture = writerAcquiredFixture();
+  const atomicOptions = writerForceFenceAtomicCaptureOptions(fixture);
+  const preparedOperation = operationRow("prepared", {
+    options: atomicOptions,
+    createdAt: WRITER_PREPARED_NOW,
+    updatedAt: WRITER_PREPARED_NOW,
+  });
+  const legacyOptions = writerForceFenceOptions(fixture);
+  const legacyOperation = operationRow("starting", {
+    options: legacyOptions,
+  });
+  const handoff = writerForceFenceAtomicCaptureHandoffFixture(atomicOptions);
+
+  for (const operation of [preparedOperation, legacyOperation, handoff.fenceOperation]) {
+    const { authority, clients } = authorityWithScripts({
+      steps: [rows(operation)],
+    });
+    await assertAuthorityError(
+      authority.readWriterForceFenceProviderBinding({
+        operationId: operation.operation_id,
+      }),
+      { code: "operation_state_invalid" },
+    );
+    assert.equal(
+      authorityQueries(clients[0]).some((args) =>
+        /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+      ),
+      false,
+    );
+    clients[0].assertExhausted();
+  }
+
+  const writerEpoch = (
+    BigInt(atomicOptions.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options: atomicOptions,
+    writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const crossedClaim = writerFenceAtomicCaptureIdClaimRow(atomicOptions);
+  crossedClaim.claimant_operation_id = "crossed-force-fence-operation";
+  const { authority, clients } = authorityWithScripts({
+    steps: [
+      rows(
+        operationRow("starting", {
+          createdAt: WRITER_PREPARED_NOW,
+          options: atomicOptions,
+          updatedAt: WRITER_DISPATCH_NOW,
+        }),
+      ),
+      rows(startingSession),
+      rows(
+        reservationRow("starting", {
+          createdAt: WRITER_PREPARED_NOW,
+          options: atomicOptions,
+          updatedAt: WRITER_DISPATCH_NOW,
+        }),
+      ),
+      rows(crossedClaim),
+    ],
+  });
+  await assertAuthorityError(
+    authority.readWriterForceFenceProviderBinding({
+      operationId: atomicOptions.operationId,
+    }),
+    { code: "operation_state_invalid" },
+  );
+  assert.equal(
+    authorityQueries(clients[0]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer force-fence provider binding reader rejects corrupt current session state", async (t) => {
+  const scenarios = [
+    {
+      code: "session_state_invalid",
+      name: "lifecycle is not FENCING",
+      corrupt(session) {
+        session.document.lifecycle = "ATTACHED";
+      },
+    },
+    {
+      code: "session_state_invalid",
+      name: "writer epoch did not advance",
+      corrupt(session, options) {
+        session.document.writerEpoch =
+          options.expectedSession.document.writerEpoch;
+      },
+    },
+    {
+      code: "operation_state_invalid",
+      name: "lease drifted",
+      corrupt(session) {
+        session.document.lease.expiresAt = "2099-01-01T00:00:00.000Z";
+      },
+    },
+    {
+      code: "operation_state_invalid",
+      name: "attachment drifted",
+      corrupt(session) {
+        session.document.attachment.rootPath =
+          "/var/lib/portable-codex/crossed-session";
+      },
+    },
+    {
+      code: "operation_state_invalid",
+      name: "launch pointer was dropped",
+      corrupt(session) {
+        session.document.launch = null;
+      },
+    },
+  ];
+
+  for (const scenario of scenarios) {
+    await t.test(scenario.name, async () => {
+      const launch = writerLaunchFixture();
+      const expectedSession = snapshotFromSessionRow(
+        writerLaunchCommittedSessionRow(launch),
+      );
+      assert.notEqual(expectedSession.document.launch, null);
+      const options = writerForceFenceAtomicCaptureOptions({
+        expectedSession,
+        result: {
+          attachment: structuredClone(
+            expectedSession.document.attachment,
+          ),
+        },
+      });
+      const writerEpoch = (
+        BigInt(expectedSession.document.writerEpoch) + 1n
+      ).toString();
+      const session = writerForceFencePhaseSessionRow("starting", {
+        options,
+        writerEpoch,
+        updatedAt: WRITER_DISPATCH_NOW,
+      });
+      scenario.corrupt(session, options);
+      const steps = [
+        rows(
+          operationRow("starting", {
+            createdAt: WRITER_PREPARED_NOW,
+            options,
+            updatedAt: WRITER_DISPATCH_NOW,
+          }),
+        ),
+        rows(session),
+      ];
+      if (scenario.code === "operation_state_invalid") {
+        steps.push(
+          rows(
+            reservationRow("starting", {
+              createdAt: WRITER_PREPARED_NOW,
+              options,
+              updatedAt: WRITER_DISPATCH_NOW,
+            }),
+          ),
+        );
+      }
+      const { authority, clients } = authorityWithScripts({
+        steps,
+      });
+
+      await assertAuthorityError(
+        authority.readWriterForceFenceProviderBinding({
+          operationId: options.operationId,
+        }),
+        { code: scenario.code },
+      );
+      assert.equal(
+        authorityQueries(clients[0]).some((args) =>
+          /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+        ),
+        false,
+      );
+      clients[0].assertExhausted();
+    });
+  }
+});
+
 test("writer force-fence V2 reports a crossed capture ID without corrupting its prepared fence", async () => {
   const fixture = writerAcquiredFixture();
   const options = writerForceFenceAtomicCaptureOptions(fixture);

@@ -380,6 +380,24 @@ extension rather than a new required v1 storage method. A backend that exposes
 the base method set lets unrelated v1 backends remain valid while callers
 explicitly opt into the narrower recovery contract.
 
+Force-fence reconciliation is likewise an optional operator-plane extension,
+not a new required v1 storage method. A backend that exposes
+`forceFenceReconciliationContractVersion: 1` plus
+`reconcileForceFence()` can be validated with
+`assertStorageForceFenceReconciliationBackend()`. The method receives only the
+exact original force-fence request. Its result is either the exact committed
+`assertStorageForceFenceResult()` evidence or non-authorizing `unknown` with no
+result. Missing, unreadable, ambiguous, mismatched, or merely absent physical
+state must remain `unknown`; none permits another logical fence dispatch.
+
+This extension separates provider acknowledgement recovery from authority
+replay. A caller may use exact committed provider readback to finish the
+already-started database operation, but it cannot derive a fence from the
+database epoch, lease expiry, `FENCING`, `BLOCKED`, or `DETACHED`. The concrete
+provider must retain enough independently authenticated physical state to
+reconstruct the same proof after process loss. A durable provider claim alone
+is dispatch bookkeeping and is not exclusion evidence.
+
 The extension receives only the exact original `{ checkpoint, request }`.
 There is deliberately no current lease, attachment, clock, writer handle, or
 stopped-writer capability. The backend must authenticate durable attempt

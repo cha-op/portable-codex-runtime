@@ -572,6 +572,43 @@ provider reconciliation extension, choose a physical filesystem backend,
 automatically escalate release to force-fence, enable the detached-production
 fleet capability, or open `runRestore()`.
 
+## Implemented Private V2 Verified-Stop Fence Composition
+
+A separate private composition consumes the version 2 force-fence request and
+keeps its result shape distinct from the legacy writer-detach facade. It
+preserves the same generic reserve and typed dispatch ordering, then invokes
+only the exact force-fence request returned by the authority. Fresh dispatch
+is admitted only once. The concrete provider is the exact locally supervised
+Podman writer: successful evidence requires its bound container lifecycle to
+be joined, its revision-4 stopped tombstone to be durable, the container to be
+removed, and both anchored-name and full-ID inventories to be empty.
+
+The protected property is the loss of supervised `/session` write access by
+one exact container, process, and writer incarnation. It is not a claim about
+another host or Podman engine, an unsupervised process, loop or block-device
+isolation, or host/controller/drive cache loss. The complete provider proof is
+bound to the source attachment and lease, supervisor and state-owner identity,
+launch attempt and request digest, container/process/writer incarnation,
+force-fence operation, revoked epoch, and new epoch. Logical authority state
+and timing fields cannot replace those signals.
+
+An optional version 1 provider reconciliation extension distinguishes exact
+committed evidence from `unknown`. Authority `starting` or `uncertain` never
+authorizes a new physical dispatch. Reconciliation may continue only the same
+durably `stopping` operation or revalidate its terminal stopped-and-absent
+proof; a still-started, missing, mismatched, or unreadable record stays
+non-authorizing. Exact committed evidence is passed to
+`finalizeWriterForceFenceAtomicCaptureHandoff()`, and the complete returned
+relation is validated with
+`assertWriterForceFenceAtomicCaptureHandoffProof()`. Finalizer acknowledgement
+loss uses dedicated handoff readback and never repeats the provider.
+
+Success therefore ends at `DETACHED` with the predetermined atomic capture in
+`prepared` as the active reservation. This composition does not dispatch a
+snapshot, release that blocker, repair a tail, or admit a successor. The ext4
+backend and public deployment retain their manual-fencing capability; the
+private adapter does not alter their discovery or runtime surface.
+
 ## Implemented PostgreSQL Transaction Boundary
 
 The executor gives one callback a checked-out PostgreSQL client and one

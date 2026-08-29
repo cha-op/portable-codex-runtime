@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
+import { createHash } from "node:crypto";
 import { writeSync } from "node:fs";
 import { lstat, mkdir, readFile, rm } from "node:fs/promises";
 import { setTimeout as delay } from "node:timers/promises";
@@ -11,6 +12,7 @@ import {
   PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
   createPodmanWriterSupervisorBundle,
 } from "../src/podman-writer-supervisor.mjs";
+import { createPodmanExt4VerifiedStopFenceProvider } from "../src/podman-ext4-verified-stop-fence-provider.mjs";
 import {
   assertPodmanWriterSupervisorStateRecord,
   createPodmanWriterSupervisorStateBundle,
@@ -191,25 +193,6 @@ function launchInput(attachmentRoot) {
   });
 }
 
-function stopInput(input, receipt) {
-  return exact({
-    attachment: input.attempt.request.attachment,
-    contractVersion: PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
-    invocation: exact({}),
-    processIncarnationId: receipt.evidence.processIncarnationId,
-    signal: new AbortController().signal,
-    stopOperationId: "podman-stop-operation-001",
-    writerFence: exact({
-      contractVersion: 1,
-      fencingEpoch: input.attempt.request.lease.fencingEpoch,
-      holderId: input.attempt.request.lease.holderId,
-      leaseId: input.attempt.request.lease.leaseId,
-      sessionId: SESSION_ID,
-    }),
-    writerIncarnationId: receipt.evidence.writerIncarnationId,
-  });
-}
-
 function reconcileInput(input) {
   return exact({
     attempt: exact({ ...input.attempt, state: "uncertain" }),
@@ -221,6 +204,100 @@ function reconcileInput(input) {
     session: input.session,
     signal: new AbortController().signal,
   });
+}
+
+function jsonSha256(value) {
+  return createHash("sha256").update(JSON.stringify(value)).digest("hex");
+}
+
+function verifiedStopBinding(input, receipt, stateOwnerId) {
+  const request = input.attempt.request;
+  const evidence = exact({
+    contractVersion: 1,
+    launchAttemptId: receipt.evidence.launchAttemptId,
+    processIncarnationId: receipt.evidence.processIncarnationId,
+    proofId: receipt.evidence.proofId,
+    status: "started",
+    supervisorId: receipt.evidence.supervisorId,
+    writerIncarnationId: receipt.evidence.writerIncarnationId,
+  });
+  const result = exact({
+    evidence,
+    outcome: "writer-launch-started",
+    resultVersion: 1,
+  });
+  return exact({
+    contractVersion: 1,
+    launch: exact({
+      attachmentId: request.attachment.attachmentId,
+      attachmentSha256: jsonSha256(request.attachment),
+      contractVersion: 1,
+      fencingEpoch: request.fencingEpoch,
+      generation: request.generation,
+      launchAttemptId: receipt.evidence.launchAttemptId,
+      launchResultSha256: jsonSha256(result),
+      leaseId: request.lease.leaseId,
+      leaseSha256: jsonSha256(request.lease),
+      measuredImageSha256: jsonSha256(request.measuredImage),
+      processIncarnationId: receipt.evidence.processIncarnationId,
+      startedAt: "2026-08-14T10:00:02.000Z",
+      supervisorId: receipt.evidence.supervisorId,
+      supervisorProofId: receipt.evidence.proofId,
+      writerIncarnationId: receipt.evidence.writerIncarnationId,
+    }),
+    request,
+    result,
+    stateOwnerId,
+  });
+}
+
+function verifiedStopForceFenceRequest(input) {
+  const attachment = input.attempt.request.attachment;
+  const lease = input.attempt.request.lease;
+  return exact({
+    backendId: attachment.backendId,
+    contractVersion: 1,
+    fencingEpoch: "2",
+    operationId: "podman-force-fence-operation-001",
+    revokedFence: exact({
+      fencingEpoch: lease.fencingEpoch,
+      holderId: lease.holderId,
+      leaseId: lease.leaseId,
+    }),
+    sessionId: lease.sessionId,
+    storageId: attachment.storageId,
+    target: exact({
+      attachmentId: attachment.attachmentId,
+      kind: "attachment",
+    }),
+  });
+}
+
+function verifiedStopBaseBackend() {
+  const backend = {
+    backendId: "linux-ext4-physical-v1",
+    capabilities: exact({
+      atomicPointInTimeCheckpoint: false,
+      exclusiveWriterAttachment: true,
+      fencing: "manual",
+      normalDirectoryAttachment: true,
+    }),
+    contractVersion: 1,
+  };
+  for (const name of [
+    "captureCheckpoint",
+    "destroySession",
+    "detachAttachment",
+    "forceFence",
+    "prepareWritableAttachment",
+    "provisionSession",
+    "restoreCheckpoint",
+  ]) {
+    backend[name] = function unavailableBaseOperation() {
+      throw new Error(`unexpected base backend operation: ${name}`);
+    };
+  }
+  return Object.freeze(backend);
 }
 
 async function waitForReadyMarker(path) {
@@ -2361,23 +2438,33 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
     assert.equal(markerStat.uid, process.getuid());
     assert.equal(markerStat.gid, process.getgid());
     assert.equal(markerStat.mode & 0o7777, 0o600);
-    phase = "stop";
-    const stopRequest = stopInput(input, receipt);
-    const stopped = await receipt.stopWriter(stopRequest);
-    assert.deepEqual(Reflect.ownKeys(stopped), [
-      "contractVersion",
-      "status",
-      "terminalRecord",
-    ]);
-    assert.equal(Object.getPrototypeOf(stopped), null);
-    assert.equal(Object.isFrozen(stopped), true);
-    assert.equal(
-      stopped.contractVersion,
-      PODMAN_WRITER_SUPERVISOR_CONTRACT_VERSION,
+    phase = "verified-stop-fence";
+    const binding = verifiedStopBinding(
+      input,
+      receipt,
+      supervisor.stateOwnerId,
     );
-    assert.equal(stopped.status, "stopped");
+    const forceFenceRequest = verifiedStopForceFenceRequest(input);
+    const baseBackend = verifiedStopBaseBackend();
+    const provider = createPodmanExt4VerifiedStopFenceProvider(exact({
+      baseBackend,
+      async resolveFenceBinding() {
+        return exact({
+          binding,
+          signal: new AbortController().signal,
+        });
+      },
+      supervisor,
+      supervisorStateCollector,
+    }));
+    const fenceResult = await provider.forceFence(forceFenceRequest);
+    assert.equal(fenceResult.status, "fenced");
+    assert.equal(fenceResult.operationId, forceFenceRequest.operationId);
+    assert.match(fenceResult.proofId, /^podman-ext4-fence:[0-9a-f]{64}$/u);
     const terminalRecord = assertPodmanWriterSupervisorStateRecord(
-      stopped.terminalRecord,
+      await supervisorState.read(exact({
+        launchAttemptId: receipt.evidence.launchAttemptId,
+      })),
     );
     assert.equal(terminalRecord.status, "stopped");
     assert.equal(terminalRecord.revision, 4);
@@ -2385,7 +2472,10 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       terminalRecord.launchAttemptId,
       receipt.evidence.launchAttemptId,
     );
-    assert.equal(terminalRecord.stopOperationId, stopRequest.stopOperationId);
+    assert.equal(
+      terminalRecord.stopOperationId,
+      forceFenceRequest.operationId,
+    );
     assert.equal(
       terminalRecord.processIncarnationId,
       receipt.evidence.processIncarnationId,
@@ -2417,7 +2507,25 @@ test("rootless Podman launches, writes through the sole bind, stops, and reconci
       restartedComposition.supervisor.stateOwnerId,
     );
     const restarted = restartedComposition.supervisor;
-    phase = "reconcile";
+    const restartedProvider = createPodmanExt4VerifiedStopFenceProvider(exact({
+      baseBackend,
+      async resolveFenceBinding() {
+        return exact({
+          binding,
+          signal: new AbortController().signal,
+        });
+      },
+      supervisor: restarted,
+      supervisorStateCollector:
+        restartedComposition.supervisorStateCollector,
+    }));
+    phase = "verified-stop-reconcile";
+    const fenceReplay = await restartedProvider.reconcileForceFence(
+      forceFenceRequest,
+    );
+    assert.equal(fenceReplay.outcome, "committed");
+    assert.deepEqual(fenceReplay.result, fenceResult);
+    phase = "supervisor-reconcile";
     const reconciled = await restarted.reconcileWriterLaunch(reconcileInput(input));
     assert.equal(reconciled.evidence.status, "complete-stopped");
     assert.equal(

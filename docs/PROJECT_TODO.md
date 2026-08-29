@@ -328,9 +328,16 @@
   materializes the predetermined prepared capture as the active session
   blocker. Exact replay and restart readback preserve that blocker; this slice
   intentionally provides no capture dispatch or release path.
-- [pending] Add a concrete automatic stale-writer fence provider and compose
-  its authentic proof into force-fence V2 without treating lease expiry,
-  database epoch advancement, or logical lifecycle state as physical evidence.
+- [done] Added a private automatic verified-stop fence for the exact local
+  Podman writer incarnation. It durably transitions the matching supervisor
+  record through stop/join to a revision-4 tombstone, removes the exact
+  container, proves both anchored-name and full-ID inventories empty, and
+  composes that authenticated result into the force-fence V2 handoff. Exact
+  source-free reconciliation may resume only the same already-started stop or
+  replay its terminal proof; lease expiry, database epoch advancement, logical
+  lifecycle state, pathname absence, and an unbound process exit remain
+  non-evidence. The scope does not cover remote or unsupervised writers,
+  block-device isolation, or host/controller/drive cache loss.
 - [pending] Dispatch and reconcile the exact prepared physical-fence-bound
   atomic capture through a concrete provider, commit the artifact, and release
   the durable blocker only from exact committed evidence. Keep current ext4
