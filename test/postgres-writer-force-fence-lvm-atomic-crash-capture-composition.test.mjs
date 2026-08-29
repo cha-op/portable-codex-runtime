@@ -531,7 +531,8 @@ function createHarness(options = {}) {
     const captureResult = catalogue.result;
     assert.notEqual(captureResult, null);
     const result = deepFreeze({
-      captureResultSha256: sha256Json(captureResult),
+      captureResultSha256:
+        options.authorityCaptureResultSha256 ?? sha256Json(captureResult),
       outcome: "atomic-crash-captured",
       resultVersion: 1,
     });
@@ -868,6 +869,23 @@ test("committed authority replay remains source-free and physically verifies", a
   assert.equal(fixture.calls.finalize.length, 0);
   assert.equal(fixture.catalogue.calls.read.length, 1);
   assert.equal(fixture.driver.calls.verify.length, 1);
+});
+
+test("committed authority replay rejects a terminal digest crossed with the provider result", async () => {
+  const fixture = createHarness({
+    authorityCaptureResultSha256: "a".repeat(64),
+    authorityPhase: "committed",
+    catalogueOptions: { initialState: "committed" },
+  });
+
+  await assert.rejects(
+    fixture.composition.runPreparedCapture(fixture.input),
+    isOutcomeUncertain,
+  );
+
+  assert.equal(fixture.driver.calls.capture.length, 0);
+  assert.equal(fixture.driver.calls.verify.length, 0);
+  assert.equal(fixture.calls.finalize.length, 0);
 });
 
 test("failed physical verification never releases the prepared blocker", async () => {

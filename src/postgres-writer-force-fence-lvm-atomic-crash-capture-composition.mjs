@@ -1,3 +1,4 @@
+import { Hash, createHash } from "node:crypto";
 import { types as utilTypes } from "node:util";
 
 import { createLvmAtomicCrashCaptureProvider } from "./lvm-atomic-crash-capture-provider.mjs";
@@ -28,6 +29,9 @@ const arrayIncludesIntrinsic = Array.prototype.includes;
 const arrayIsArray = Array.isArray;
 const arrayPrototype = Array.prototype;
 const ArrayConstructor = Array;
+const createHashIntrinsic = createHash;
+const hashDigestIntrinsic = Hash.prototype.digest;
+const hashUpdateIntrinsic = Hash.prototype.update;
 const isGeneratorFunctionValue = utilTypes.isGeneratorFunction;
 const isGeneratorObjectValue = utilTypes.isGeneratorObject;
 const isPromiseValue = utilTypes.isPromise;
@@ -51,6 +55,8 @@ const promiseThenIntrinsic = Promise.prototype.then;
 const reflectApply = Reflect.apply;
 const reflectOwnKeys = Reflect.ownKeys;
 const regexpExecIntrinsic = RegExp.prototype.exec;
+const JsonObject = JSON;
+const jsonStringifyIntrinsic = JsonObject.stringify;
 const runExclusiveIntrinsic = PostgresOperationGuard.prototype.runExclusive;
 const TypeErrorConstructor = TypeError;
 const WeakMapConstructor = WeakMap;
@@ -883,6 +889,40 @@ function normalizeCaptureResult(value, request, code, previousResult = null) {
   }
 }
 
+function captureResultSha256(value, code) {
+  const artifact = value.artifact;
+  const canonical = exactFrozenRecord({
+    artifact: exactFrozenRecord({
+      byteLength: artifact.byteLength,
+      contentSha256: artifact.contentSha256,
+      objectId: artifact.objectId,
+      objectIdentityScheme: artifact.objectIdentityScheme,
+      readOnly: artifact.readOnly,
+    }),
+    artifactId: value.artifactId,
+    backendId: value.backendId,
+    captureAttemptId: value.captureAttemptId,
+    checkpointId: value.checkpointId,
+    contractVersion: value.contractVersion,
+    operationId: value.operationId,
+    proofId: value.proofId,
+    sessionId: value.sessionId,
+    sourceFencingEpoch: value.sourceFencingEpoch,
+    status: value.status,
+    storageId: value.storageId,
+  });
+  try {
+    const serialized = callIntrinsic(jsonStringifyIntrinsic, JsonObject, [
+      canonical,
+    ]);
+    const hash = callIntrinsic(createHashIntrinsic, undefined, ["sha256"]);
+    callIntrinsic(hashUpdateIntrinsic, hash, [serialized, "utf8"]);
+    return callIntrinsic(hashDigestIntrinsic, hash, ["hex"]);
+  } catch {
+    fail(code);
+  }
+}
+
 function normalizeAuthorityReceipt(value, input) {
   const code =
     "postgres_writer_force_fence_lvm_atomic_crash_capture_outcome_uncertain";
@@ -981,6 +1021,8 @@ function normalizeAuthorityReceipt(value, input) {
     ensure(
       operation.revision === "1" &&
         operation.result?.outcome === "atomic-crash-captured" &&
+        operation.result.captureResultSha256 ===
+          captureResultSha256(captureResult, code) &&
         reservation.state === "released" &&
         providerState === "committed" &&
         captureResult !== null &&
