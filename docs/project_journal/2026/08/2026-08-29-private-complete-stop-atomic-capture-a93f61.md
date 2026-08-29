@@ -35,9 +35,13 @@ superseded_by:
   operation. The composition and provider never receive the writer handle or
   clean stop resolution.
 - The launcher exports neither the raw facet nor an accessor to complete,
-  authority-consume, or retirement methods. Only the safe public composition
-  factory may resolve it inside the launcher module, preventing ordinary
-  facade holders from treating a caller-built result as committed proof.
+  authority-consume, or retirement methods. The ordinary factory still
+  returns only the nine-method launcher facade. A separate launcher-owner
+  factory additionally issues one branded, zero-key
+  `atomicCrashCaptureAssembler`; only that capability may ask the safe public
+  composition factory to bind its chosen backend, catalogue, and driver to the
+  matching private facet. Ordinary facade holders and structural clones cannot
+  treat caller-built collaborators or results as committed proof.
 - A fresh provider claim consumes the capability exactly once around the LVM
   driver callback. A committed catalogue replay consumes no authority and
   instead revokes the unused capability before retirement.
@@ -69,7 +73,7 @@ superseded_by:
 
 - `node --check` passed for the launcher, private composition, and focused
   launcher test module.
-- All 172 launcher tests passed, including the real launcher/coordinator/LVM
+- All 173 launcher tests passed, including the real launcher/coordinator/LVM
   composition fixture. The related crash core, LVM provider, storage-contract,
   and stopped-writer coordinator suites passed all 264 tests.
 - The default catalogue/LVM integration invocation passed its catalogue path
@@ -79,13 +83,18 @@ superseded_by:
   watcher exhausted the host file-descriptor limit with `EMFILE`. The complete
   suite then exited zero with only that exact test name skipped.
 - Project-journal validation, syntax checks, and `git diff --check` passed.
-- The sole fresh-context local review identified the formerly exported raw
-  retirement surface; the fix made that facet module-private and added an
-  export-surface regression test before the same logical lane was rerun.
+- The sole fresh-context local review first identified the formerly exported
+  raw retirement surface. Its same-lane rerun then found that accepting the
+  ordinary facade plus caller-selected collaborators still promoted those
+  collaborators to retirement authority. The fixes make the facet
+  module-private and require a separately branded launcher-owner assembler
+  capability, with export-shape, forgery, clone, proxy, foreign-launcher, and
+  cross-composition concurrency regression coverage.
 
 ## Evidence
 
-- Launcher facet and safe factory: `src/postgres-logical-writer-launcher.mjs`
+- Launcher facet, owner capability, and safe factory:
+  `src/postgres-logical-writer-launcher.mjs`
 - Public composition entrypoint:
   `src/postgres-atomic-crash-capture-composition.mjs`
 - Private assembler: `src/postgres-atomic-crash-capture-composition-internal.mjs`

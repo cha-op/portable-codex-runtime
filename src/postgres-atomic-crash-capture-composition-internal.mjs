@@ -63,10 +63,10 @@ const ERROR_MESSAGES = objectFreeze({
 });
 
 const COMPOSITION_OPTION_KEYS = objectFreeze([
+  "atomicCrashCaptureAssembler",
   "baseBackend",
   "catalogue",
   "driver",
-  "launcher",
 ]);
 const RUN_KEYS = objectFreeze(["request"]);
 const AUTHORITY_ADMISSION_KEYS = objectFreeze([
@@ -458,7 +458,9 @@ export function createPostgresLvmAtomicCrashCaptureCompositionInternal(
 
   let facet;
   try {
-    facet = reflectApply(resolveFacet, undefined, [normalized.launcher]);
+    facet = reflectApply(resolveFacet, undefined, [
+      normalized.atomicCrashCaptureAssembler,
+    ]);
   } catch {
     fail(optionCode);
   }

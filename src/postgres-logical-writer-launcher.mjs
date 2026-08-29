@@ -619,6 +619,7 @@ const ERROR_MESSAGES = objectFreeze({
     "Logical writer launch outcome is uncertain",
 });
 const INTERNAL_ERRORS = new WeakSetConstructor();
+const ATOMIC_CRASH_CAPTURE_ASSEMBLERS = new WeakMapConstructor();
 const ATOMIC_CRASH_CAPTURE_FACETS = new WeakMapConstructor();
 const promiseSpeciesHolder = objectFreeze(
   objectCreate(null, {
@@ -5875,21 +5876,55 @@ export function createPostgresLogicalWriterLauncher(...args) {
   return facade;
 }
 
-function resolvePostgresLogicalWriterAtomicCrashCaptureFacet(...args) {
+function resolvePostgresLogicalWriterAtomicCrashCaptureFacetForAssembler(
+  ...args
+) {
   const code = "invalid_logical_writer_launch_request";
   ensure(args.length === 1, code);
-  const launcher = args[0];
+  const atomicCrashCaptureAssembler = args[0];
   ensure(
-    launcher !== null &&
-      typeof launcher === "object" &&
-      !isProxyValue(launcher),
+    atomicCrashCaptureAssembler !== null &&
+      typeof atomicCrashCaptureAssembler === "object" &&
+      !isProxyValue(atomicCrashCaptureAssembler),
     code,
   );
-  const facet = weakMapGet(ATOMIC_CRASH_CAPTURE_FACETS, launcher);
-  ensure(facet !== undefined, code);
-  return facet;
+  const binding = weakMapGet(
+    ATOMIC_CRASH_CAPTURE_ASSEMBLERS,
+    atomicCrashCaptureAssembler,
+  );
+  ensure(
+    binding !== undefined &&
+      binding.atomicCrashCaptureAssembler ===
+        atomicCrashCaptureAssembler &&
+      weakMapGet(ATOMIC_CRASH_CAPTURE_FACETS, binding.launcher) ===
+        binding.facet,
+    code,
+  );
+  return binding.facet;
 }
-objectFreeze(resolvePostgresLogicalWriterAtomicCrashCaptureFacet);
+objectFreeze(resolvePostgresLogicalWriterAtomicCrashCaptureFacetForAssembler);
+
+/**
+ * Creates the launcher-owner surface that alone may bind trusted atomic
+ * crash-capture collaborators to the launcher's private authority facet.
+ */
+export function createPostgresLogicalWriterAtomicCrashCaptureOwner(...args) {
+  const launcher = createPostgresLogicalWriterLauncher(...args);
+  const facet = weakMapGet(ATOMIC_CRASH_CAPTURE_FACETS, launcher);
+  const atomicCrashCaptureAssembler = exactFrozenRecord({});
+  ensure(facet !== undefined, "invalid_logical_writer_launch_request");
+  weakMapSet(
+    ATOMIC_CRASH_CAPTURE_ASSEMBLERS,
+    atomicCrashCaptureAssembler,
+    exactFrozenRecord({
+      atomicCrashCaptureAssembler,
+      facet,
+      launcher,
+    }),
+  );
+  return exactFrozenRecord({ atomicCrashCaptureAssembler, launcher });
+}
+objectFreeze(createPostgresLogicalWriterAtomicCrashCaptureOwner);
 
 export { PostgresLvmAtomicCrashCaptureCompositionError };
 
@@ -5905,7 +5940,7 @@ export function createPostgresLvmAtomicCrashCaptureComposition(...args) {
   }
   return createPostgresLvmAtomicCrashCaptureCompositionInternal(
     args[0],
-    resolvePostgresLogicalWriterAtomicCrashCaptureFacet,
+    resolvePostgresLogicalWriterAtomicCrashCaptureFacetForAssembler,
   );
 }
 objectFreeze(createPostgresLvmAtomicCrashCaptureComposition);

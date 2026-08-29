@@ -291,10 +291,22 @@ launch attempt and the complete atomic request, including the capture-attempt
 ID. It retains the opaque stopped-writer capability and its attachment, lease,
 holder, epoch, process, writer, and stop-operation bindings inside the launcher.
 Neither the raw facet nor an accessor for its complete, authority-consume, or
-retirement methods is exported. The public composition factory resolves the
-facet only inside the launcher module and returns solely `runCapture` and
-`reconcileCapture`; possession of the ordinary launcher facade therefore
-cannot turn a caller-constructed result into retirement evidence.
+retirement methods is exported. The ordinary launcher factory and detached
+runtime composition receive only the unchanged nine-method facade. A separate
+launcher-owner factory returns that facade together with one fresh, frozen,
+null-prototype, zero-own-key `atomicCrashCaptureAssembler` identity capability.
+The launcher module brands the capability in a private `WeakMap`; it is not an
+own property of the launcher and cannot be recovered from, cloned from, or
+structurally imitated by an ordinary facade holder.
+
+The public composition factory accepts only that owner-held assembler
+capability before binding the selected backend, catalogue, and driver. It
+resolves the matching facet only inside the launcher module and returns solely
+`runCapture` and `reconcileCapture`. The assembler is intentionally a
+transferable bearer capability and must remain with the authorized assembly
+root. Possession of the ordinary launcher facade, a cloned empty object, or an
+assembler for a different launcher cannot release this launcher's blocker with
+caller-constructed collaborators or results.
 
 The private PostgreSQL/LVM assembler constructs the LVM provider with that
 facet's authority consumer before any writer authority is presented. A fresh

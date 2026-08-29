@@ -44,6 +44,7 @@ import {
   LOGICAL_WRITER_RECONCILE_RECEIPT_VERSION,
   LOGICAL_WRITER_SUPERVISOR_CONTRACT_VERSION,
   PostgresLogicalWriterLauncherError,
+  createPostgresLogicalWriterAtomicCrashCaptureOwner,
   createPostgresLogicalWriterLauncher,
   derivePostgresLogicalWriterAtomicCrashCaptureStopOperationId,
   derivePostgresLogicalWriterStopOperationId,
@@ -2194,14 +2195,19 @@ async function fixture({
     launchWriter,
     reconcileWriterLaunch,
   };
-  const facade = createPostgresLogicalWriterLauncher({
-    authority,
-    imagePlanBinding,
-    operationGuard,
-    stoppedWriterCoordinator,
-    supervisor,
-  });
+  const atomicCrashCaptureOwner =
+    createPostgresLogicalWriterAtomicCrashCaptureOwner({
+      authority,
+      imagePlanBinding,
+      operationGuard,
+      stoppedWriterCoordinator,
+      supervisor,
+    });
+  const facade = atomicCrashCaptureOwner.launcher;
   return {
+    atomicCrashCaptureAssembler:
+      atomicCrashCaptureOwner.atomicCrashCaptureAssembler,
+    atomicCrashCaptureOwner,
     authority,
     events,
     expectedSession,
@@ -4814,15 +4820,15 @@ test("stop operation identity binds every canonical capture tuple member", async
   );
 });
 
-test("keeps the raw atomic crash-capture facet private and exposes only the safe composition", async () => {
+test("keeps atomic assembly owner-only and exposes only the safe composition", async () => {
   const value = await fixture();
   const request = atomicCrashCaptureRequest(value);
   const collaborators = atomicCompositionCollaborators(request);
   const composition = createPostgresLvmAtomicCrashCaptureComposition({
+    atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
     baseBackend: collaborators.baseBackend,
     catalogue: collaborators.catalogue,
     driver: collaborators.driver,
-    launcher: value.facade,
   });
 
   assert.equal(
@@ -4843,12 +4849,28 @@ test("keeps the raw atomic crash-capture facet private and exposes only the safe
     postgresLogicalWriterLauncherModule.createPostgresLvmAtomicCrashCaptureComposition,
     createPostgresLvmAtomicCrashCaptureComposition,
   );
+  assert.deepEqual(
+    Reflect.ownKeys(value.atomicCrashCaptureOwner).sort(),
+    ["atomicCrashCaptureAssembler", "launcher"],
+  );
+  assert.equal(Object.getPrototypeOf(value.atomicCrashCaptureOwner), null);
+  assert.equal(Object.isFrozen(value.atomicCrashCaptureOwner), true);
+  assert.strictEqual(value.atomicCrashCaptureOwner.launcher, value.facade);
   assert.deepEqual(Reflect.ownKeys(composition).sort(), [
     "reconcileCapture",
     "runCapture",
   ]);
   assert.equal(Object.getPrototypeOf(composition), null);
   assert.equal(Object.isFrozen(composition), true);
+  assert.deepEqual(
+    Reflect.ownKeys(value.atomicCrashCaptureAssembler),
+    [],
+  );
+  assert.equal(
+    Object.getPrototypeOf(value.atomicCrashCaptureAssembler),
+    null,
+  );
+  assert.equal(Object.isFrozen(value.atomicCrashCaptureAssembler), true);
   assert.deepEqual(Reflect.ownKeys(value.facade).sort(), [
     "prepareLaunchIntent",
     "reconcileLaunchAttempt",
@@ -4860,6 +4882,68 @@ test("keeps the raw atomic crash-capture facet private and exposes only the safe
     "stopWriterForCapture",
     "stopWriterForPreparedCapture",
   ]);
+});
+
+test("rejects unbranded atomic assemblers before touching capture collaborators", async () => {
+  const value = await fixture();
+  const foreign = await fixture();
+  const request = atomicCrashCaptureRequest(value);
+  const collaborators = atomicCompositionCollaborators(request);
+  const clone = structuredClone(value.atomicCrashCaptureAssembler);
+  const liveProxy = new Proxy(value.atomicCrashCaptureAssembler, {});
+  const revoked = Proxy.revocable(
+    value.atomicCrashCaptureAssembler,
+    {},
+  );
+  revoked.revoke();
+
+  for (const atomicCrashCaptureAssembler of [
+    value.facade,
+    {},
+    exactRecord({}),
+    clone,
+    liveProxy,
+    revoked.proxy,
+  ]) {
+    assert.throws(
+      () =>
+        createPostgresLvmAtomicCrashCaptureComposition({
+          atomicCrashCaptureAssembler,
+          baseBackend: collaborators.baseBackend,
+          catalogue: collaborators.catalogue,
+          driver: collaborators.driver,
+        }),
+      assertAtomicCompositionError(
+        "invalid_postgres_lvm_atomic_crash_capture_composition_options",
+      ),
+    );
+  }
+
+  const foreignComposition =
+    createPostgresLvmAtomicCrashCaptureComposition({
+      atomicCrashCaptureAssembler:
+        foreign.atomicCrashCaptureAssembler,
+      baseBackend: collaborators.baseBackend,
+      catalogue: collaborators.catalogue,
+      driver: collaborators.driver,
+    });
+  await assert.rejects(
+    foreignComposition.runCapture(exactRecord({ request })),
+    assertAtomicCompositionError(
+      "postgres_lvm_atomic_crash_capture_composition_outcome_uncertain",
+    ),
+  );
+  assert.equal(value.supervisorStopCalls, 0);
+  assert.equal(foreign.supervisorStopCalls, 0);
+  assert.deepEqual(collaborators.calls, {
+    capture: 0,
+    claim: 0,
+    commit: 0,
+    mark: 0,
+    read: 0,
+    resolve: 0,
+    verify: 0,
+  });
 });
 
 test("atomic complete-stop identity uses its own domain and the full canonical request", async () => {
@@ -4927,10 +5011,10 @@ test("clean and atomic complete-stop routes reject cross-use in both directions"
   const cleanRequest = atomicCrashCaptureRequest(clean);
   const cleanCollaborators = atomicCompositionCollaborators(cleanRequest);
   const cleanComposition = createPostgresLvmAtomicCrashCaptureComposition({
+    atomicCrashCaptureAssembler: clean.atomicCrashCaptureAssembler,
     baseBackend: cleanCollaborators.baseBackend,
     catalogue: cleanCollaborators.catalogue,
     driver: cleanCollaborators.driver,
-    launcher: clean.facade,
   });
   await assert.rejects(
     cleanComposition.runCapture(exactRecord({ request: cleanRequest })),
@@ -4961,10 +5045,10 @@ test("clean and atomic complete-stop routes reject cross-use in both directions"
     onCaptureStart: signalCaptureStarted,
   });
   const atomicComposition = createPostgresLvmAtomicCrashCaptureComposition({
+    atomicCrashCaptureAssembler: atomic.atomicCrashCaptureAssembler,
     baseBackend: atomicCollaborators.baseBackend,
     catalogue: atomicCollaborators.catalogue,
     driver: atomicCollaborators.driver,
-    launcher: atomic.facade,
   });
   const pendingCapture = atomicComposition.runCapture(
     exactRecord({ request }),
@@ -5004,10 +5088,10 @@ test("atomic composition uses captured coordinator intrinsics for fresh and repl
       const request = atomicCrashCaptureRequest(value);
       const collaborators = atomicCompositionCollaborators(request, entry);
       const composition = createPostgresLvmAtomicCrashCaptureComposition({
+        atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
         baseBackend: collaborators.baseBackend,
         catalogue: collaborators.catalogue,
         driver: collaborators.driver,
-        launcher: value.facade,
       });
 
       assert.deepEqual(
@@ -5045,10 +5129,10 @@ test("real LVM atomic composition retires fresh and committed-replay complete st
       const request = atomicCrashCaptureRequest(value);
       const collaborators = atomicCompositionCollaborators(request, entry);
       const composition = createPostgresLvmAtomicCrashCaptureComposition({
+        atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
         baseBackend: collaborators.baseBackend,
         catalogue: collaborators.catalogue,
         driver: collaborators.driver,
-        launcher: value.facade,
       });
 
       const result = await composition.runCapture(exactRecord({ request }));
@@ -5077,10 +5161,10 @@ test("atomic composition validates the exact provider request before writer stop
   const request = atomicCrashCaptureRequest(value);
   const collaborators = atomicCompositionCollaborators(request);
   const composition = createPostgresLvmAtomicCrashCaptureComposition({
+    atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
     baseBackend: collaborators.baseBackend,
     catalogue: collaborators.catalogue,
     driver: collaborators.driver,
-    launcher: value.facade,
   });
 
   await assert.rejects(
@@ -5124,14 +5208,26 @@ test("atomic composition reconciles commit acknowledgement loss without redispat
       committedReadVisible: false,
     });
     const composition = createPostgresLvmAtomicCrashCaptureComposition({
+      atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
       baseBackend: collaborators.baseBackend,
       catalogue: collaborators.catalogue,
       driver: collaborators.driver,
-      launcher: value.facade,
     });
+    const siblingComposition =
+      createPostgresLvmAtomicCrashCaptureComposition({
+        atomicCrashCaptureAssembler:
+          value.atomicCrashCaptureAssembler,
+        baseBackend: collaborators.baseBackend,
+        catalogue: collaborators.catalogue,
+        driver: collaborators.driver,
+      });
 
     await assert.rejects(
       composition.runCapture(exactRecord({ request })),
+      assertAtomicCompositionError(outcomeCode),
+    );
+    await assert.rejects(
+      siblingComposition.runCapture(exactRecord({ request })),
       assertAtomicCompositionError(outcomeCode),
     );
     assert.equal(value.supervisorStopCalls, 1);
@@ -5190,10 +5286,10 @@ test("atomic composition reconciles commit acknowledgement loss without redispat
       committedReadVisible: true,
     });
     const composition = createPostgresLvmAtomicCrashCaptureComposition({
+      atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
       baseBackend: collaborators.baseBackend,
       catalogue: collaborators.catalogue,
       driver: collaborators.driver,
-      launcher: value.facade,
     });
 
     const result = await composition.runCapture(exactRecord({ request }));
@@ -5228,10 +5324,10 @@ test("atomic authority failure and concurrent reuse remain permanently closed", 
       committedReadVisible: false,
     });
     const composition = createPostgresLvmAtomicCrashCaptureComposition({
+      atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
       baseBackend: collaborators.baseBackend,
       catalogue: collaborators.catalogue,
       driver: collaborators.driver,
-      launcher: value.facade,
     });
 
     await assert.rejects(
@@ -5265,11 +5361,19 @@ test("atomic authority failure and concurrent reuse remain permanently closed", 
       onCaptureStart: signalCaptureStarted,
     });
     const composition = createPostgresLvmAtomicCrashCaptureComposition({
+      atomicCrashCaptureAssembler: value.atomicCrashCaptureAssembler,
       baseBackend: collaborators.baseBackend,
       catalogue: collaborators.catalogue,
       driver: collaborators.driver,
-      launcher: value.facade,
     });
+    const siblingComposition =
+      createPostgresLvmAtomicCrashCaptureComposition({
+        atomicCrashCaptureAssembler:
+          value.atomicCrashCaptureAssembler,
+        baseBackend: collaborators.baseBackend,
+        catalogue: collaborators.catalogue,
+        driver: collaborators.driver,
+      });
 
     const first = composition.runCapture(
       exactRecord({ request }),
@@ -5277,6 +5381,10 @@ test("atomic authority failure and concurrent reuse remain permanently closed", 
     await captureStarted;
     await assert.rejects(
       composition.runCapture(exactRecord({ request })),
+      assertAtomicCompositionError(outcomeCode),
+    );
+    await assert.rejects(
+      siblingComposition.runCapture(exactRecord({ request })),
       assertAtomicCompositionError(outcomeCode),
     );
     releaseCapture();
