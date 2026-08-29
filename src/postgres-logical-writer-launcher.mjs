@@ -29,6 +29,8 @@ import {
   assertPodmanWriterSupervisorStateRecord,
 } from "./podman-writer-supervisor-state.mjs";
 import {
+  assertAtomicCrashCaptureRequest,
+  assertAtomicCrashCaptureResult,
   assertCheckpointDescriptor,
   assertLeaseGrant,
   assertSessionAttachment,
@@ -87,6 +89,8 @@ const stoppedAssertWriterLaunchAvailableIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.assertWriterLaunchAvailable;
 const stoppedRegisterWriterIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.registerWriter;
+const stoppedConsumeCapabilityIntrinsic =
+  StoppedWriterCapabilityCoordinator.prototype.consumeCapability;
 const stoppedRevokeWriterIntrinsic =
   StoppedWriterCapabilityCoordinator.prototype.revokeWriter;
 const stoppedRetireWriterIntrinsic =
@@ -183,10 +187,25 @@ const STOP_OPERATION_ID_INPUT_KEYS = objectFreeze([
   "launchAttemptId",
   "request",
 ]);
+const ATOMIC_CRASH_STOP_OPERATION_ID_INPUT_KEYS = objectFreeze([
+  "launchAttemptId",
+  "request",
+]);
+const ATOMIC_CRASH_CAPTURE_ADMISSION_KEYS = objectFreeze([
+  "captureAuthority",
+  "request",
+]);
+const ATOMIC_CRASH_CAPTURE_RETIREMENT_KEYS = objectFreeze([
+  "captureAuthority",
+  "request",
+  "result",
+]);
 const STOP_FINALIZATION_MAX_ATTEMPTS = 3;
 const STOP_RESERVATION_MAX_ATTEMPTS = 3;
 const WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION = 2;
 const WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION = 3;
+const CLEAN_CAPTURE_ROUTE = "clean-capture-v1";
+const ATOMIC_CRASH_CAPTURE_ROUTE = "atomic-crash-capture-v1";
 const STOP_RESOLUTION_KEYS = objectFreeze([
   "canonicalLeaseAtRegistration",
   "processIncarnationId",
@@ -596,6 +615,7 @@ const ERROR_MESSAGES = objectFreeze({
     "Logical writer launch outcome is uncertain",
 });
 const INTERNAL_ERRORS = new WeakSetConstructor();
+const ATOMIC_CRASH_CAPTURE_FACETS = new WeakMapConstructor();
 const promiseSpeciesHolder = objectFreeze(
   objectCreate(null, {
     [promiseSpeciesSymbol]: {
@@ -2910,6 +2930,30 @@ function stopOperationId(capture, launchAttemptId, code) {
   return `writer-stop:${digest}`;
 }
 
+function atomicCrashCaptureStopOperationId(request, launchAttemptId, code) {
+  let serializedRequest;
+  try {
+    serializedRequest = reflectApply(jsonStringifyIntrinsic, JsonObject, [
+      canonicalJsonDataTree(snapshotData(request, code)),
+    ]);
+  } catch (error) {
+    if (isInternalError(error)) throw error;
+    fail(code);
+  }
+  ensure(typeof serializedRequest === "string", code);
+  const digest = sha256Parts(
+    [
+      "portable-codex-runtime:writer-stop-atomic-crash-capture:v1",
+      "\0",
+      launchAttemptId,
+      "\0",
+      serializedRequest,
+    ],
+    code,
+  );
+  return `writer-stop:${digest}`;
+}
+
 /**
  * Derives the durable writer-stop operation identity from the complete
  * canonical capture tuple and the launch attempt it will retire.
@@ -2933,6 +2977,33 @@ export function derivePostgresLogicalWriterStopOperationId(...args) {
     );
     return stopOperationId(
       capture,
+      assertOpaqueId(input.launchAttemptId, code),
+      code,
+    );
+  } catch (error) {
+    if (isInternalError(error, code)) throw error;
+    fail(code);
+  }
+}
+
+/**
+ * Derives the durable complete-stop identity from the full canonical atomic
+ * crash-capture request and the launch attempt it will retire.
+ */
+export function derivePostgresLogicalWriterAtomicCrashCaptureStopOperationId(
+  ...args
+) {
+  const code = "invalid_logical_writer_launch_request";
+  ensure(args.length === 1, code);
+  try {
+    const input = exactDataObject(
+      args[0],
+      ATOMIC_CRASH_STOP_OPERATION_ID_INPUT_KEYS,
+      code,
+    );
+    const request = normalizeAtomicCrashCaptureRequest(input.request, code);
+    return atomicCrashCaptureStopOperationId(
+      request,
       assertOpaqueId(input.launchAttemptId, code),
       code,
     );
@@ -3236,6 +3307,22 @@ function normalizeCaptureTuple(value, code) {
   return exactFrozenRecord({ attachment, checkpoint, request });
 }
 
+function normalizeAtomicCrashCaptureRequest(value, code) {
+  try {
+    return assertAtomicCrashCaptureRequest(value);
+  } catch {
+    fail(code);
+  }
+}
+
+function captureTupleForAtomicCrashRequest(request) {
+  return exactFrozenRecord({
+    attachment: request.sourceAttachment,
+    checkpoint: request.checkpoint,
+    request: request.mutationRequest,
+  });
+}
+
 /**
  * Composes durable launch/stop admission with one-use image and in-process
  * writer capabilities. Production restore remains disabled until the wider
@@ -3307,6 +3394,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
     optionCode,
   );
   const stoppedWriterCoordinator = options.stoppedWriterCoordinator;
+  const atomicCrashCaptureAuthorities = new WeakMapConstructor();
   const recordsByAttempt = new MapConstructor();
   const recordsByAttachmentId = new MapConstructor();
   const recordsByWriter = new WeakMapConstructor();
@@ -3639,6 +3727,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
     );
     const record = {
       attachment: claim.attempt.request.attachment,
+      authorizedAtomicCrashRequest: null,
       authorizedCapture: null,
       authorizedCaptureAttemptId: null,
       authorizedStopOperationId: null,
@@ -3661,6 +3750,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       stopClaimAttemptedFor: null,
       stopClaimToken: null,
       stopContractVersion: null,
+      stopRoute: null,
       stopEvidence: null,
       stopReceipt: null,
       stopWriter: callbackReceipt.stopWriter,
@@ -4390,6 +4480,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
     states,
     code,
     stopContractVersion = WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+    stopRoute = CLEAN_CAPTURE_ROUTE,
+    atomicCrashRequest = null,
   ) {
     const record = mapGet(
       recordsByAttachmentId,
@@ -4405,20 +4497,70 @@ export function createPostgresLogicalWriterLauncher(...args) {
       code,
     );
     ensure(
-      record.authorizedCapture === null ||
-        sameContent(record.authorizedCapture, capture, code),
-      code,
-    );
-    ensure(
       stopContractVersion === WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION ||
         stopContractVersion ===
           WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
       code,
     );
+    ensure(
+      stopRoute === CLEAN_CAPTURE_ROUTE ||
+        (stopRoute === ATOMIC_CRASH_CAPTURE_ROUTE &&
+          stopContractVersion ===
+            WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION),
+      code,
+    );
+    ensure(
+      record.stopContractVersion === null ||
+        record.stopContractVersion === stopContractVersion,
+      code,
+    );
+    ensure(record.stopRoute === null || record.stopRoute === stopRoute, code);
+    let derivedStopOperationId;
+    if (stopRoute === CLEAN_CAPTURE_ROUTE) {
+      ensure(
+        atomicCrashRequest === null &&
+          record.authorizedAtomicCrashRequest === null &&
+          (record.authorizedCapture === null ||
+            sameContent(record.authorizedCapture, capture, code)),
+        code,
+      );
+      derivedStopOperationId = stopOperationId(
+        capture,
+        record.launchAttemptId,
+        code,
+      );
+    } else {
+      ensure(
+        record.authorizedCapture === null &&
+          atomicCrashRequest !== null &&
+          sameContent(
+            capture,
+            captureTupleForAtomicCrashRequest(atomicCrashRequest),
+            code,
+          ) &&
+          (record.authorizedAtomicCrashRequest === null ||
+            sameContent(
+              record.authorizedAtomicCrashRequest,
+              atomicCrashRequest,
+              code,
+            )),
+        code,
+      );
+      derivedStopOperationId = atomicCrashCaptureStopOperationId(
+        atomicCrashRequest,
+        record.launchAttemptId,
+        code,
+      );
+    }
+    ensure(
+      record.authorizedStopOperationId === null ||
+        record.authorizedStopOperationId === derivedStopOperationId,
+      code,
+    );
     if (record.stopContractVersion === null) {
       record.stopContractVersion = stopContractVersion;
     }
-    ensure(record.stopContractVersion === stopContractVersion, code);
+    if (record.stopRoute === null) record.stopRoute = stopRoute;
     if (
       stopContractVersion ===
         WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION &&
@@ -4426,16 +4568,6 @@ export function createPostgresLogicalWriterLauncher(...args) {
     ) {
       record.authorizedCaptureAttemptId = createStopClaimToken(code);
     }
-    const derivedStopOperationId = stopOperationId(
-      capture,
-      record.launchAttemptId,
-      code,
-    );
-    ensure(
-      record.authorizedStopOperationId === null ||
-        record.authorizedStopOperationId === derivedStopOperationId,
-      code,
-    );
     if (record.authorizedStopOperationId === null) {
       // The raw bearer never enters the durable operation or public
       // resolution; only its domain-separated digest is persisted.
@@ -4446,7 +4578,11 @@ export function createPostgresLogicalWriterLauncher(...args) {
         regexpTest(UUID_PATTERN, record.stopClaimToken),
       code,
     );
-    record.authorizedCapture = capture;
+    if (stopRoute === CLEAN_CAPTURE_ROUTE) {
+      record.authorizedCapture = capture;
+    } else {
+      record.authorizedAtomicCrashRequest = atomicCrashRequest;
+    }
     record.authorizedStopOperationId = derivedStopOperationId;
     return record;
   }
@@ -4464,6 +4600,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
   function validatePreparedCaptureHandoffState(record, capture) {
     ensure(
       record.state === "stopped" &&
+        record.stopRoute === CLEAN_CAPTURE_ROUTE &&
         record.stopContractVersion ===
           WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION &&
         record.authorizedCapture !== null &&
@@ -4987,10 +5124,22 @@ export function createPostgresLogicalWriterLauncher(...args) {
 
   async function stopWriterForCaptureInternal(
     stopContractVersion,
+    stopRoute,
     ...stopArgs
   ) {
     ensure(stopArgs.length === 1, optionCode);
-    const capture = normalizeCaptureTuple(stopArgs[0], optionCode);
+    let atomicCrashRequest = null;
+    let capture;
+    if (stopRoute === CLEAN_CAPTURE_ROUTE) {
+      capture = normalizeCaptureTuple(stopArgs[0], optionCode);
+    } else {
+      ensure(stopRoute === ATOMIC_CRASH_CAPTURE_ROUTE, optionCode);
+      atomicCrashRequest = normalizeAtomicCrashCaptureRequest(
+        stopArgs[0],
+        optionCode,
+      );
+      capture = captureTupleForAtomicCrashRequest(atomicCrashRequest);
+    }
     const acceptedRecordStates =
       stopContractVersion ===
       WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION
@@ -5001,6 +5150,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
       acceptedRecordStates,
       optionCode,
       stopContractVersion,
+      stopRoute,
+      atomicCrashRequest,
     );
     const stopOperation = initialRecord.authorizedStopOperationId;
     const claimToken = initialRecord.stopClaimToken;
@@ -5023,6 +5174,8 @@ export function createPostgresLogicalWriterLauncher(...args) {
               acceptedRecordStates,
               optionCode,
               stopContractVersion,
+              stopRoute,
+              atomicCrashRequest,
             );
             ensure(record === initialRecord, optionCode);
             await assertGuardHeld(probe, outcomeCode);
@@ -5323,6 +5476,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
       record !== undefined &&
         record.state === "stopped" &&
         record.stopReceipt !== null &&
+        record.stopRoute === CLEAN_CAPTURE_ROUTE &&
         record.stopContractVersion === expectedContractVersion &&
         resolution.processIncarnationId === record.processIncarnationId &&
         resolution.writerIncarnationId === record.writerIncarnationId &&
@@ -5397,6 +5551,246 @@ export function createPostgresLogicalWriterLauncher(...args) {
     return result;
   }
 
+  function atomicAuthorityRecordFor(
+    captureAuthority,
+    request,
+    states,
+    code,
+  ) {
+    const authority = assertOpaqueWriterHandle(captureAuthority, code);
+    const authorityRecord = weakMapGet(
+      atomicCrashCaptureAuthorities,
+      authority,
+    );
+    ensure(
+      authorityRecord !== undefined &&
+        authorityRecord.captureAuthority === authority &&
+        arrayIncludes(states, authorityRecord.state) &&
+        sameContent(authorityRecord.request, request, code),
+      code,
+    );
+    const record = authorityRecord.record;
+    ensure(
+      record.state === "stopped" &&
+        record.stopReceipt !== null &&
+        record.stopRoute === ATOMIC_CRASH_CAPTURE_ROUTE &&
+        record.stopContractVersion ===
+          WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION &&
+        record.authorizedCapture === null &&
+        record.authorizedAtomicCrashRequest !== null &&
+        sameContent(record.authorizedAtomicCrashRequest, request, code) &&
+        record.authorizedStopOperationId ===
+          atomicCrashCaptureStopOperationId(
+            request,
+            record.launchAttemptId,
+            code,
+          ) &&
+        mapGet(recordsByAttempt, record.launchAttemptId) === record &&
+        mapGet(
+          recordsByAttachmentId,
+          record.attachment.attachmentId,
+        ) === record &&
+        weakMapGet(recordsByWriter, record.writer) === record,
+      code,
+    );
+    return authorityRecord;
+  }
+
+  async function completeAtomicCrashStopInternal(...completeStopArgs) {
+    ensure(completeStopArgs.length === 1, optionCode);
+    const request = normalizeAtomicCrashCaptureRequest(
+      completeStopArgs[0],
+      optionCode,
+    );
+    const stopped = await stopWriterForCaptureInternal(
+      WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+      ATOMIC_CRASH_CAPTURE_ROUTE,
+      request,
+    );
+    const captureAuthority = assertOpaqueWriterHandle(
+      stopped.capability,
+      outcomeCode,
+    );
+    const record = weakMapGet(recordsByWriter, stopped.resolution.writer);
+    ensure(
+      record !== undefined &&
+        record.state === "stopped" &&
+        record.stopRoute === ATOMIC_CRASH_CAPTURE_ROUTE &&
+        record.authorizedAtomicCrashRequest !== null &&
+        sameContent(
+          record.authorizedAtomicCrashRequest,
+          request,
+          outcomeCode,
+        ) &&
+        weakMapGet(
+          atomicCrashCaptureAuthorities,
+          captureAuthority,
+        ) === undefined,
+      outcomeCode,
+    );
+    weakMapSet(atomicCrashCaptureAuthorities, captureAuthority, {
+      captureAuthority,
+      consumedResult: null,
+      record,
+      request: record.authorizedAtomicCrashRequest,
+      state: "issued",
+    });
+    return captureAuthority;
+  }
+
+  async function resolveAtomicCrashCaptureAuthorityInternal(
+    ...resolveArgs
+  ) {
+    ensure(resolveArgs.length === 2, optionCode);
+    const admission = exactDataObject(
+      resolveArgs[0],
+      ATOMIC_CRASH_CAPTURE_ADMISSION_KEYS,
+      optionCode,
+    );
+    const request = normalizeAtomicCrashCaptureRequest(
+      admission.request,
+      optionCode,
+    );
+    const runCapture = assertSourceBackedFunction(resolveArgs[1], {
+      asynchronous: true,
+      code: optionCode,
+    });
+    ensure(objectIsFrozen(runCapture), optionCode);
+    const authorityRecord = atomicAuthorityRecordFor(
+      admission.captureAuthority,
+      request,
+      ["issued"],
+      optionCode,
+    );
+    const record = authorityRecord.record;
+    authorityRecord.state = "resolving";
+    let callbackCalls = 0;
+    const runSnapshot = async function runAtomicCrashCaptureSnapshot(
+      ...callbackArgs
+    ) {
+      callbackCalls += 1;
+      ensure(callbackArgs.length === 1 && callbackCalls === 1, outcomeCode);
+      const binding = exactDataObject(
+        callbackArgs[0],
+        STOP_BINDING_KEYS,
+        outcomeCode,
+      );
+      const writerFence = exactDataObject(
+        binding.writerFence,
+        WRITER_FENCE_KEYS,
+        outcomeCode,
+      );
+      ensure(
+        sameContent(
+          binding.attachment,
+          request.sourceAttachment,
+          outcomeCode,
+        ) &&
+          binding.processIncarnationId === record.processIncarnationId &&
+          binding.stopOperationId === record.authorizedStopOperationId &&
+          binding.writerIncarnationId === record.writerIncarnationId &&
+          writerFence.contractVersion ===
+            record.canonicalLease.contractVersion &&
+          writerFence.fencingEpoch === record.canonicalLease.fencingEpoch &&
+          writerFence.holderId === record.canonicalLease.holderId &&
+          writerFence.leaseId === record.canonicalLease.leaseId &&
+          writerFence.sessionId === record.canonicalLease.sessionId,
+        outcomeCode,
+      );
+      return await callIntrinsic(runCapture, undefined, []);
+    };
+    objectFreeze(runSnapshot);
+    try {
+      const result = await invokeStoppedCoordinator(
+        stoppedWriterCoordinator,
+        stoppedConsumeCapabilityIntrinsic,
+        exactFrozenRecord({
+          attachment: request.sourceAttachment,
+          canonicalLease: record.canonicalLease,
+          capability: authorityRecord.captureAuthority,
+          processIncarnationId: record.processIncarnationId,
+          runSnapshot,
+          stopOperationId: record.authorizedStopOperationId,
+          writer: record.writer,
+          writerIncarnationId: record.writerIncarnationId,
+        }),
+        outcomeCode,
+      );
+      ensure(callbackCalls === 1, outcomeCode);
+      try {
+        authorityRecord.consumedResult = assertAtomicCrashCaptureResult(
+          result,
+          { request },
+        );
+      } catch {
+        fail(outcomeCode);
+      }
+      authorityRecord.state = "consumed";
+      return result;
+    } catch {
+      authorityRecord.state = "uncertain";
+      fail(outcomeCode);
+    }
+  }
+
+  function retireCompleteAtomicCrashStop(...retireArgs) {
+    ensure(retireArgs.length === 1, optionCode);
+    let input;
+    let request;
+    let result;
+    try {
+      input = exactDataObject(
+        retireArgs[0],
+        ATOMIC_CRASH_CAPTURE_RETIREMENT_KEYS,
+        optionCode,
+      );
+      request = normalizeAtomicCrashCaptureRequest(input.request, optionCode);
+      result = assertAtomicCrashCaptureResult(input.result, { request });
+    } catch (error) {
+      if (isInternalError(error, optionCode)) throw error;
+      fail(optionCode);
+    }
+    const authorityRecord = atomicAuthorityRecordFor(
+      input.captureAuthority,
+      request,
+      ["issued", "consumed"],
+      optionCode,
+    );
+    const record = authorityRecord.record;
+    ensure(
+      authorityRecord.state === "issued"
+        ? authorityRecord.consumedResult === null
+        : authorityRecord.consumedResult !== null &&
+            sameContent(
+              authorityRecord.consumedResult,
+              result,
+              optionCode,
+            ),
+      optionCode,
+    );
+    const needsRevocation = authorityRecord.state === "issued";
+    authorityRecord.state = "retiring";
+    try {
+      if (needsRevocation) {
+        invokeStoppedCoordinatorSync(
+          stoppedWriterCoordinator,
+          stoppedRevokeWriterIntrinsic,
+          exactFrozenRecord({
+            processIncarnationId: record.processIncarnationId,
+            writer: record.writer,
+            writerIncarnationId: record.writerIncarnationId,
+          }),
+          outcomeCode,
+        );
+      }
+      retireRecord(record);
+      authorityRecord.state = "retired";
+    } catch {
+      authorityRecord.state = "uncertain";
+      fail(outcomeCode);
+    }
+  }
+
   const prepareLaunchIntent = function prepareLaunchIntent(...prepareArgs) {
     return protectPromise(prepareLaunchIntentInternal(...prepareArgs));
   };
@@ -5415,6 +5809,7 @@ export function createPostgresLogicalWriterLauncher(...args) {
     return protectPromise(
       stopWriterForCaptureInternal(
         WRITER_LAUNCH_STOP_CLAIM_CONTRACT_VERSION,
+        CLEAN_CAPTURE_ROUTE,
         ...stopArgs,
       ),
     );
@@ -5424,12 +5819,31 @@ export function createPostgresLogicalWriterLauncher(...args) {
       return protectPromise(
         stopWriterForCaptureInternal(
           WRITER_LAUNCH_STOP_CAPTURE_HANDOFF_CONTRACT_VERSION,
+          CLEAN_CAPTURE_ROUTE,
           ...stopArgs,
         ),
       );
+    };
+  const completeStop = function completeStop(...completeStopArgs) {
+    return protectPromise(
+      completeAtomicCrashStopInternal(...completeStopArgs),
+    );
   };
+  const resolveCaptureAuthority = function resolveCaptureAuthority(
+    ...resolveArgs
+  ) {
+    return protectPromise(
+      resolveAtomicCrashCaptureAuthorityInternal(...resolveArgs),
+    );
+  };
+  const retireCompleteStop = function retireCompleteStop(...retireArgs) {
+    return retireCompleteAtomicCrashStop(...retireArgs);
+  };
+  objectFreeze(completeStop);
   objectFreeze(prepareLaunchIntent);
   objectFreeze(reconcileLaunchAttempt);
+  objectFreeze(resolveCaptureAuthority);
+  objectFreeze(retireCompleteStop);
   objectFreeze(retirePreparedCapture);
   objectFreeze(retireStoppedWriter);
   objectFreeze(resolveStoppedWriter);
@@ -5437,7 +5851,12 @@ export function createPostgresLogicalWriterLauncher(...args) {
   objectFreeze(runPreparedLaunch);
   objectFreeze(stopWriterForCapture);
   objectFreeze(stopWriterForPreparedCapture);
-  return exactFrozenRecord({
+  const atomicCrashCaptureFacet = exactFrozenRecord({
+    completeStop,
+    resolveCaptureAuthority,
+    retireCompleteStop,
+  });
+  const facade = exactFrozenRecord({
     prepareLaunchIntent,
     reconcileLaunchAttempt,
     retirePreparedCapture,
@@ -5448,6 +5867,27 @@ export function createPostgresLogicalWriterLauncher(...args) {
     stopWriterForCapture,
     stopWriterForPreparedCapture,
   });
+  weakMapSet(ATOMIC_CRASH_CAPTURE_FACETS, facade, atomicCrashCaptureFacet);
+  return facade;
+}
+
+/**
+ * Returns the launcher-owned private complete-stop facet. Only a facade
+ * created by this module is accepted; structural substitutes are rejected.
+ */
+export function getPostgresLogicalWriterAtomicCrashCaptureFacet(...args) {
+  const code = "invalid_logical_writer_launch_request";
+  ensure(args.length === 1, code);
+  const launcher = args[0];
+  ensure(
+    launcher !== null &&
+      typeof launcher === "object" &&
+      !isProxyValue(launcher),
+    code,
+  );
+  const facet = weakMapGet(ATOMIC_CRASH_CAPTURE_FACETS, launcher);
+  ensure(facet !== undefined, code);
+  return facet;
 }
 
 objectFreeze(PostgresLogicalWriterLauncherError.prototype);
