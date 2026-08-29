@@ -702,7 +702,7 @@ BEGIN
                       pg_catalog.sha256(
                         pg_catalog.convert_to(
                           '{"captureResultSha256":"' ||
-                          capture.result #>> '{captureResultSha256}' ||
+                          (capture.result #>> '{captureResultSha256}') ||
                           '","outcome":"atomic-crash-captured",' ||
                           '"resultVersion":1}',
                           'UTF8'

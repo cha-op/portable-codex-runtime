@@ -4247,6 +4247,10 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     captureFinalizationMigration.sql,
+    /'\{"captureResultSha256":"' \|\|\s*\(capture\.result #>> '\{captureResultSha256\}'\) \|\|/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
     /provider\.request_json =[\s\S]+capture\.request #> '\{payload,request\}'[\s\S]+provider\.result_sha256 =[\s\S]+capture\.result #>> '\{captureResultSha256\}'/u,
   );
   assert.match(
