@@ -487,23 +487,71 @@ test(
       });
     };
 
-    firstCatalogue = await openCatalogue(cataloguePath);
-    const firstProvider = createLvmAtomicCrashCaptureProvider({
-      authorityConsumer,
-      baseBackend: baseBackend(backendId),
-      catalogue: firstCatalogue.catalogue,
-      driver,
-    });
-    const prepared = prepareAtomicCrashCapture({
-      backend: firstProvider,
-      request,
-    });
-    let captured;
     try {
-      captured = await capturePreparedAtomicCrashCheckpoint({
+      firstCatalogue = await openCatalogue(cataloguePath);
+      const firstProvider = createLvmAtomicCrashCaptureProvider({
+        authorityConsumer,
+        baseBackend: baseBackend(backendId),
+        catalogue: firstCatalogue.catalogue,
+        driver,
+      });
+      const prepared = prepareAtomicCrashCapture({
+        backend: firstProvider,
+        request,
+      });
+      const captured = await capturePreparedAtomicCrashCheckpoint({
         captureAuthority: stoppedCapability,
         preparedCapture: prepared,
       });
+      assert.equal(captured.artifact.objectIdentityScheme, "lvm-lv-uuid-v1");
+      assert.equal(captured.artifact.readOnly, true);
+      assert.equal(captured.artifact.byteLength, String(ORIGIN_SIZE_BYTES));
+      assert.notEqual(
+        captured.artifact.byteLength,
+        String(SNAPSHOT_COW_BYTES),
+      );
+      assert.equal(snapshotLvcreateCalls, 1);
+      assert.equal(authorityCalls, 1);
+      assert.equal(resolveCalls, 1);
+
+      await firstCatalogue.close();
+      firstCatalogue = null;
+      await rm(sourceRoot, { force: true, recursive: true });
+      await assert.rejects(open(sourceRoot, "r"), { code: "ENOENT" });
+
+      restartedCatalogue = await openCatalogue(cataloguePath);
+      const restartedProvider = createLvmAtomicCrashCaptureProvider({
+        authorityConsumer: async () => {
+          throw new Error("committed replay must not consume authority");
+        },
+        baseBackend: baseBackend(backendId),
+        catalogue: restartedCatalogue.catalogue,
+        driver,
+      });
+      const verification = await verifyCommittedAtomicCrashCapture({
+        backend: restartedProvider,
+        request,
+      });
+      assert.equal(verification.outcome, "committed");
+      assert.deepEqual(verification.result, captured);
+      assert.equal(resolveCalls, 1);
+      assert.equal(authorityCalls, 1);
+      assert.equal(snapshotLvcreateCalls, 1);
+
+      const replayPrepared = prepareAtomicCrashCapture({
+        backend: restartedProvider,
+        request,
+      });
+      const replayed = await capturePreparedAtomicCrashCheckpoint({
+        captureAuthority: exact({ unusableAfterRestart: true }),
+        preparedCapture: replayPrepared,
+      });
+      assert.deepEqual(replayed, captured);
+      assert.equal(resolveCalls, 2);
+      assert.equal(authorityCalls, 1);
+      assert.equal(snapshotLvcreateCalls, 1);
+      assert.equal(firstCatalogue?.kind ?? restartedCatalogue.kind,
+        DATABASE_URL === null ? "file" : "postgres");
     } catch (error) {
       t.diagnostic(JSON.stringify({
         authorityCalls,
@@ -513,54 +561,5 @@ test(
       }));
       throw error;
     }
-    assert.equal(captured.artifact.objectIdentityScheme, "lvm-lv-uuid-v1");
-    assert.equal(captured.artifact.readOnly, true);
-    assert.equal(captured.artifact.byteLength, String(ORIGIN_SIZE_BYTES));
-    assert.notEqual(
-      captured.artifact.byteLength,
-      String(SNAPSHOT_COW_BYTES),
-    );
-    assert.equal(snapshotLvcreateCalls, 1);
-    assert.equal(authorityCalls, 1);
-    assert.equal(resolveCalls, 1);
-
-    await firstCatalogue.close();
-    firstCatalogue = null;
-    await rm(sourceRoot, { force: true, recursive: true });
-    await assert.rejects(open(sourceRoot, "r"), { code: "ENOENT" });
-
-    restartedCatalogue = await openCatalogue(cataloguePath);
-    const restartedProvider = createLvmAtomicCrashCaptureProvider({
-      authorityConsumer: async () => {
-        throw new Error("committed replay must not consume authority");
-      },
-      baseBackend: baseBackend(backendId),
-      catalogue: restartedCatalogue.catalogue,
-      driver,
-    });
-    const verification = await verifyCommittedAtomicCrashCapture({
-      backend: restartedProvider,
-      request,
-    });
-    assert.equal(verification.outcome, "committed");
-    assert.deepEqual(verification.result, captured);
-    assert.equal(resolveCalls, 1);
-    assert.equal(authorityCalls, 1);
-    assert.equal(snapshotLvcreateCalls, 1);
-
-    const replayPrepared = prepareAtomicCrashCapture({
-      backend: restartedProvider,
-      request,
-    });
-    const replayed = await capturePreparedAtomicCrashCheckpoint({
-      captureAuthority: exact({ unusableAfterRestart: true }),
-      preparedCapture: replayPrepared,
-    });
-    assert.deepEqual(replayed, captured);
-    assert.equal(resolveCalls, 2);
-    assert.equal(authorityCalls, 1);
-    assert.equal(snapshotLvcreateCalls, 1);
-    assert.equal(firstCatalogue?.kind ?? restartedCatalogue.kind,
-      DATABASE_URL === null ? "file" : "postgres");
   },
 );
