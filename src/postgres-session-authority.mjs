@@ -4626,6 +4626,11 @@ function writerForceFenceOperationRequest(
       code,
     );
     const atomicRequest = atomicCapture.request;
+    canonicalCheckpointDescriptorForSession(
+      atomicRequest.checkpoint,
+      input.expectedSession,
+      code,
+    );
     ensure(
       document.lifecycle === "ATTACHED" &&
         document.attachment !== null &&
@@ -9068,6 +9073,19 @@ function inputForOperation(operation) {
 
 function validateActiveBusinessState(session, operation) {
   const expectedDocument = operation.expectedSession.document;
+  if (operation.kind === ATOMIC_CRASH_CAPTURE_OPERATION_KIND) {
+    ensure(
+      operation.state === "prepared" &&
+        canonicalSerialize(session.document) ===
+          canonicalSerialize(
+            documentWithAuthorityState(expectedDocument, {
+              activeOperation: session.document.activeOperation,
+            }),
+          ),
+      "operation_state_invalid",
+    );
+    return;
+  }
   if (
     operation.kind === RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
     operation.state !== "prepared"

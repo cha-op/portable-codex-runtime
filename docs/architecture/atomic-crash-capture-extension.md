@@ -349,9 +349,11 @@ Writer force-fence request version 2 adds one complete
 `atomic-crash-capture-v1` operation. The
 `writer-fence-atomic-capture-intent-v2` claim permanently preclaims that
 capture operation ID before force-fence dispatch. It binds the exact session
-and immutable atomic request independently of the force-fence operation ID, so
-another operation kind, session, request, or capture attempt cannot adopt the
-identity after an external fence effect.
+and immutable atomic request independently of the force-fence operation ID.
+Admission also binds the checkpoint's Codex session, root thread, and image
+digest to the session manifest. Another operation kind, session, manifest,
+request, or capture attempt therefore cannot adopt the identity after an
+external fence effect.
 
 `finalizeWriterForceFenceAtomicCaptureHandoff()` accepts only the exact trusted
 provider result for the dispatched version 2 request. In one serializable
@@ -373,6 +375,11 @@ revalidate the relation after claim, reservation, or session changes. A direct
 SQL writer subject to these triggers therefore cannot later hide the fence or
 release or detach its blocker. Blocked or pre-dispatch-cancelled fences leave
 the preclaim unmaterialized and do not create a capture blocker.
+
+Readback reconstructs the exact fence terminal document and substitutes only
+the prepared capture active pointer. The current document version and complete
+fence `lastOperation` pointer must still match, preventing a structurally valid
+but older or crossed session document from being accepted as the handoff.
 
 The `DETACHED` lifecycle therefore does not mean that a successor writer is
 admissible. The active prepared capture remains a database-authoritative,

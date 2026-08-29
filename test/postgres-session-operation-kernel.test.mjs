@@ -9029,6 +9029,19 @@ test("writer force-fence V2 freezes one exact atomic crash-capture intent and re
   wrongLeaseTuple.mutationRequest.holderId = "crossed-holder";
   invalidAtomicRequests.push(wrongLeaseTuple);
 
+  const wrongManifest = atomicCrashCaptureRequestForFence(
+    fixture.expectedSession,
+  );
+  wrongManifest.checkpoint.codexSessionId = OTHER_SESSION_ID;
+  wrongManifest.checkpoint.codexThreadId = OTHER_SESSION_ID;
+  invalidAtomicRequests.push(wrongManifest);
+
+  const wrongImage = atomicCrashCaptureRequestForFence(
+    fixture.expectedSession,
+  );
+  wrongImage.checkpoint.imageDigest = `sha256:${"b".repeat(64)}`;
+  invalidAtomicRequests.push(wrongImage);
+
   for (const atomicRequest of invalidAtomicRequests) {
     assert.throws(
       () =>
@@ -9408,6 +9421,46 @@ test("writer force-fence V2 atomically commits the exact fence and installs one 
   ).toString();
   assert.throws(
     () => assertWriterForceFenceAtomicCaptureHandoffProof(wrongRevision),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "operation_state_invalid",
+  );
+  const wrongLastOperation = structuredClone({
+    before: options.expectedSession,
+    capture: receipt.capture,
+    fence: {
+      operation: receipt.fence.operation,
+      reservation: receipt.fence.reservation,
+    },
+    session: receipt.session,
+  });
+  wrongLastOperation.session.document.lastOperation.operationId =
+    "crossed-fence-operation";
+  assert.throws(
+    () =>
+      assertWriterForceFenceAtomicCaptureHandoffProof(
+        wrongLastOperation,
+      ),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "operation_state_invalid",
+  );
+  const wrongDocumentVersion = structuredClone({
+    before: options.expectedSession,
+    capture: receipt.capture,
+    fence: {
+      operation: receipt.fence.operation,
+      reservation: receipt.fence.reservation,
+    },
+    session: receipt.session,
+  });
+  wrongDocumentVersion.session.document.documentVersion =
+    SESSION_AUTHORITY_DOCUMENT_VERSION - 1;
+  assert.throws(
+    () =>
+      assertWriterForceFenceAtomicCaptureHandoffProof(
+        wrongDocumentVersion,
+      ),
     (error) =>
       error instanceof PostgresSessionAuthorityError &&
       error.code === "operation_state_invalid",

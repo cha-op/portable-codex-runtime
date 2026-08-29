@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-29
 updated: 2026-08-29
 branch: wip/atomic-crash-capture-physical-fence
-pr:
+pr: 63
 supersedes: []
 superseded_by:
 ---
@@ -111,6 +111,16 @@ superseded_by:
   scenarios. Production constraints remain unchanged; the current-head
   PostgreSQL rerun supplies final execution evidence for the migration and
   fixture corrections.
+- GitHub Codex then identified three frozen-range gaps: the atomic checkpoint
+  descriptor was not bound to the session manifest, active handoff validation
+  omitted the document version and fence `lastOperation`, and the deferred
+  reverse checker lacked a session-keyed path through retired successful V2
+  fences. Admission now validates the checkpoint's Codex IDs and image digest,
+  shared active-state validation reconstructs the exact terminal document with
+  only the capture pointer installed, and migration 013 adds the targeted
+  partial index with loader and PostgreSQL catalogue assertions. Focused local
+  tests and the new current-head PostgreSQL and GitHub Codex runs provide the
+  final evidence for these corrections.
 
 ## Evidence
 

@@ -479,7 +479,9 @@ one epoch advance and never grants the provider a second fence call.
 
 Version 2 starts only from the exact `ATTACHED` writer because the atomic
 request must carry that live source attachment and match its storage, lease,
-holder, epoch, and target. The legacy request remains the explicit
+holder, epoch, and target. Its checkpoint descriptor must also bind the
+manifest's Codex session, root thread, and image digest. The legacy request
+remains the explicit
 `ATTACHED`/`BLOCKED` force-fence recovery path; a `BLOCKED` row cannot
 manufacture a new atomic source binding.
 
@@ -507,7 +509,9 @@ reservation. The blocker is database durable and therefore survives process
 loss, finalization acknowledgement loss, and restart. Exact finalizer replay
 and `reconcileWriterForceFenceAtomicCaptureHandoff()` return the same committed
 fence terminal and prepared capture without another provider call or capture
-creation.
+creation. Readback derives the exact fence terminal document and changes only
+its active pointer to the prepared capture; the document version and complete
+fence `lastOperation` history cannot be substituted independently.
 
 This foundation does not authorize physical capture. It exposes no snapshot
 dispatch, source-free capture reconciliation, capture finalization, or release
@@ -1181,6 +1185,9 @@ are immutable in this foundation. Deferred reverse checks also run when the
 claim, either reservation, or session row changes, so a later direct SQL write
 cannot hide the fence identity or remove, release, or detach the blocker while
 leaving the successful fence committed.
+The reverse checker uses a session-keyed partial index over successful V2
+fences, so claim, reservation, and session mutations do not scan unrelated
+retired operation history.
 Blocked or pre-dispatch-cancelled fences do not materialize that blocker. Thus
 even an old or direct SQL writer that remains subject to the schema triggers
 cannot commit or retain the successful fence without the complete successor

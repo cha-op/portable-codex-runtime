@@ -22,6 +22,13 @@ BEGIN
 END
 $writer_fence_atomic_capture_handoff_migration$;
 
+CREATE INDEX operation_claims_writer_fence_v2_terminal_session_idx
+  ON session_authority.operation_claims (session_id)
+  WHERE kind = 'writer-force-fence-v1'
+    AND request #>> '{payload,contractVersion}' = '2'
+    AND state = 'committed'
+    AND result #>> '{outcome}' = 'writer-fenced';
+
 ALTER TABLE session_authority.operation_id_registry
   DROP CONSTRAINT operation_id_registry_claim_type_allowed;
 

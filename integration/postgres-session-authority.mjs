@@ -9578,6 +9578,45 @@ test(
       activeIndexes.rows[1].indexdef,
       /CREATE UNIQUE INDEX[\s\S]+\(session_id\)[\s\S]+released_at IS NULL/u,
     );
+    const terminalFenceIndex = await store.runSerializable(
+      (transaction) =>
+        transaction.query(
+          [
+            "SELECT i.indisunique,",
+            "i.indnkeyatts::integer AS key_column_count,",
+            "pg_catalog.pg_get_indexdef(i.indexrelid, 1, true) AS key_column,",
+            "pg_catalog.pg_get_expr(i.indpred, i.indrelid, true) AS predicate",
+            "FROM pg_catalog.pg_index AS i",
+            "WHERE i.indexrelid =",
+            "'session_authority.operation_claims_writer_fence_v2_terminal_session_idx'::pg_catalog.regclass",
+          ].join(" "),
+        ),
+    );
+    assert.equal(terminalFenceIndex.rows.length, 1);
+    assert.deepEqual(
+      {
+        indisunique: terminalFenceIndex.rows[0].indisunique,
+        keyColumn: terminalFenceIndex.rows[0].key_column,
+        keyColumnCount: terminalFenceIndex.rows[0].key_column_count,
+      },
+      {
+        indisunique: false,
+        keyColumn: "session_id",
+        keyColumnCount: 1,
+      },
+    );
+    for (const fragment of [
+      "writer-force-fence-v1",
+      "{payload,contractVersion}",
+      "committed",
+      "{outcome}",
+      "writer-fenced",
+    ]) {
+      assert.match(
+        terminalFenceIndex.rows[0].predicate,
+        new RegExp(fragment.replaceAll(/[{}]/gu, "\\$&"), "u"),
+      );
+    }
     await assert.rejects(
       store.runSerializable((transaction) => transaction.query("COMMIT")),
       (error) => {

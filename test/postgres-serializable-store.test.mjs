@@ -4187,6 +4187,10 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     physicalFenceMigration.sql,
     /operation_claims_atomic_crash_capture_immutable/u,
   );
+  assert.match(
+    physicalFenceMigration.sql,
+    /CREATE INDEX operation_claims_writer_fence_v2_terminal_session_idx[\s\S]+ON session_authority\.operation_claims \(session_id\)[\s\S]+WHERE kind = 'writer-force-fence-v1'[\s\S]+request #>> '\{payload,contractVersion\}' = '2'[\s\S]+state = 'committed'[\s\S]+result #>> '\{outcome\}' = 'writer-fenced'/u,
+  );
   for (const relation of [
     "operation_claims",
     "operation_id_registry",
