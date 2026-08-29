@@ -176,7 +176,10 @@ create no provider catalogue entry by themselves. The process-local brands are
 not a global registration of the underlying implementation, and independently
 creating a new facade or token is not a durable deduplication mechanism. The
 private LVM provider therefore obtains its dispatch decision from the durable
-catalogue before it presents stopped-writer authority or calls LVM.
+catalogue before it presents stopped-writer authority or makes any
+state-changing LVM call. Before the claim, it permits only the bounded,
+read-only LVM observations described below to resolve and canonicalize the
+provider binding.
 
 ## Durable Catalogue and Classic LVM Provider
 
