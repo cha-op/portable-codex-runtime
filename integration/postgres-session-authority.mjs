@@ -22,6 +22,10 @@ import {
 } from "./postgres-atomic-crash-capture-catalogue.mjs";
 
 import {
+  createPostgresAtomicCrashCaptureCatalogue,
+} from "../src/postgres-atomic-crash-capture-catalogue.mjs";
+
+import {
   FilesystemOperationJournal,
   operationJournalBindingSha256,
 } from "../src/filesystem-operation-journal.mjs";
@@ -258,6 +262,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
       import.meta.url,
     ),
     version: 13,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/014-atomic-crash-capture-finalization.sql",
+      import.meta.url,
+    ),
+    version: 14,
   }),
 ]);
 
@@ -1272,7 +1283,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 13,
+    version: 14,
   });
   const forgedLifecycleAnchorIds = [];
   for (const retiredExpression of ["NULL", "pg_current_xact_id()"]) {
@@ -5381,7 +5392,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 13,
+    version: 14,
   });
   const registry = await pool.query(
     [
@@ -5735,7 +5746,7 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 13,
+    version: 14,
   });
   const legacyTerminal = await pool.query(
     [
@@ -8162,6 +8173,40 @@ function writerForceFenceAtomicCaptureInput(
   };
 }
 
+function atomicCrashCaptureProviderBinding(request) {
+  return {
+    bindingKind: "lvm-classic-snapshot-v1",
+    contractVersion: 1,
+    originLvUuid: `origin-${request.storageRef.storageId}`,
+    snapshotName: `codex-${request.captureAttemptId}`,
+    snapshotSizeBytes: "1073741824",
+    snapshotTag: `portable-codex.${request.captureAttemptId}`,
+  };
+}
+
+function atomicCrashCaptureResult(request) {
+  return {
+    artifact: {
+      byteLength: "9007199254740993",
+      contentSha256: "f".repeat(64),
+      objectId: `snapshot-${request.checkpoint.artifactId}`,
+      objectIdentityScheme: "lvm-lv-uuid-v1",
+      readOnly: true,
+    },
+    artifactId: request.checkpoint.artifactId,
+    backendId: request.storageRef.backendId,
+    captureAttemptId: request.captureAttemptId,
+    checkpointId: request.checkpoint.checkpointId,
+    contractVersion: 1,
+    operationId: request.mutationRequest.operationId,
+    proofId: `proof-${request.captureAttemptId}`,
+    sessionId: request.storageRef.sessionId,
+    sourceFencingEpoch: request.checkpoint.sourceFencingEpoch,
+    status: "committed",
+    storageId: request.storageRef.storageId,
+  };
+}
+
 function writerDetachCompositionRequest(
   expectedSession,
   {
@@ -9345,10 +9390,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 13);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 14);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
     );
 
     await pool.query(
@@ -9358,7 +9403,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 13,
+      version: 14,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -9371,7 +9416,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 13,
+      version: 14,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -9386,7 +9431,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 13,
+      version: 14,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -9398,7 +9443,7 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 13,
+      version: 14,
     });
     await assertFilesystemImageProviderHeadAnchorSchemaAndStore(pool, store);
     await assertFilesystemImageProviderStateAuthoritySchemaAndStore(
@@ -9921,6 +9966,7 @@ test(
     });
     await store.migrate();
     const authority = new PostgresSessionAuthority({
+      atomicCrashCaptureV1FleetCompatible: true,
       restoreAttachmentActivationV2FleetCompatible: true,
       restoreAttachmentActivationV2GenerationPredecessorFleetCompatible:
         true,
@@ -11987,6 +12033,314 @@ test(
           ],
         );
         assert.equal(captureCatalogue.rows[0].row_count, 0);
+
+        const captureReadRequest = {
+          operationId: handoff.atomicCaptureOperationId,
+          request: handoff.atomicRequest,
+        };
+        const absentCapture = await authority.readAtomicCrashCapture(
+          structuredClone(captureReadRequest),
+        );
+        assertOperationReceipt(absentCapture, "prepared");
+        assert.equal(absentCapture.providerState, "absent");
+        assert.equal(absentCapture.captureResult, null);
+
+        const crossedProviderRequest = structuredClone(
+          handoff.atomicRequest,
+        );
+        crossedProviderRequest.mutationRequest.operationId =
+          `crossed-atomic-mutation-${randomUUID()}`;
+        const crossedProviderBinding =
+          atomicCrashCaptureProviderBinding(crossedProviderRequest);
+        const crossedProviderRequestJson =
+          canonicalJsonForPodmanFixture(crossedProviderRequest);
+        const crossedProviderBindingJson =
+          canonicalJsonForPodmanFixture(crossedProviderBinding);
+        await assertDeferredBlockerTamperRejected(
+          [
+            "INSERT INTO session_authority.atomic_crash_captures",
+            "(capture_attempt_id, operation_id, checkpoint_id, artifact_id,",
+            "contract_version, backend_id, session_id, storage_id,",
+            "source_fencing_epoch, request_json, request_sha256,",
+            "provider_binding, provider_binding_json,",
+            "provider_binding_sha256, state, result_json, result_sha256)",
+            "VALUES ($1, $2, $3, $4, 1, $5, $6, $7,",
+            "$8::pg_catalog.numeric, $9::pg_catalog.jsonb, $10,",
+            "$11::pg_catalog.jsonb, $12, $13, 'starting', NULL, NULL)",
+          ].join(" "),
+          [
+            crossedProviderRequest.captureAttemptId,
+            crossedProviderRequest.mutationRequest.operationId,
+            crossedProviderRequest.checkpoint.checkpointId,
+            crossedProviderRequest.checkpoint.artifactId,
+            crossedProviderRequest.storageRef.backendId,
+            crossedProviderRequest.storageRef.sessionId,
+            crossedProviderRequest.storageRef.storageId,
+            crossedProviderRequest.checkpoint.sourceFencingEpoch,
+            crossedProviderRequestJson,
+            sha256Text(crossedProviderRequestJson),
+            crossedProviderBindingJson,
+            crossedProviderBindingJson,
+            sha256Text(crossedProviderBindingJson),
+          ],
+        );
+        assert.deepEqual(
+          await authority.readAtomicCrashCapture(
+            structuredClone(captureReadRequest),
+          ),
+          absentCapture,
+        );
+
+        const catalogue = createPostgresAtomicCrashCaptureCatalogue({
+          store,
+        });
+        const providerBinding = atomicCrashCaptureProviderBinding(
+          handoff.atomicRequest,
+        );
+        const providerClaim = await catalogue.claimStarting({
+          providerBinding,
+          request: handoff.atomicRequest,
+        });
+        assert.equal(providerClaim.outcome, "dispatch");
+        const startingCapture = await authority.readAtomicCrashCapture(
+          structuredClone(captureReadRequest),
+        );
+        assertOperationReceipt(startingCapture, "prepared");
+        assert.equal(startingCapture.providerState, "starting");
+        assert.equal(startingCapture.captureResult, null);
+        assert.deepEqual(startingCapture.operation, handedOff.capture.operation);
+        assert.deepEqual(
+          startingCapture.reservation,
+          handedOff.capture.reservation,
+        );
+        assert.deepEqual(startingCapture.session, handedOff.session);
+
+        const captureResult = atomicCrashCaptureResult(
+          handoff.atomicRequest,
+        );
+        const committedProvider = await catalogue.commitResult({
+          dispatchClaim: providerClaim.dispatchClaim,
+          result: captureResult,
+        });
+        assert.equal(committedProvider.outcome, "committed");
+        assert.deepEqual(committedProvider.result, captureResult);
+        const committedProviderCapture =
+          await authority.readAtomicCrashCapture(
+            structuredClone(captureReadRequest),
+          );
+        assertOperationReceipt(committedProviderCapture, "prepared");
+        assert.equal(committedProviderCapture.providerState, "committed");
+        assert.deepEqual(
+          committedProviderCapture.captureResult,
+          captureResult,
+        );
+
+        const captureTransition = {
+          captureResult,
+          expectedOperationRevision: "0",
+          expectedSession: handedOff.capture.operation.expectedSession,
+          kind: ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
+          operationId: handoff.atomicCaptureOperationId,
+          request: handedOff.capture.operation.request,
+        };
+        const gatedAuthority = new PostgresSessionAuthority({
+          store,
+          writerForceFenceV2FleetCompatible: true,
+        });
+        await assert.rejects(
+          gatedAuthority.finalizeAtomicCrashCapture(
+            structuredClone(captureTransition),
+          ),
+          assertAuthorityCode(
+            "atomic_crash_capture_v1_fleet_capability_required",
+          ),
+        );
+
+        const crossedCaptureResult = structuredClone(captureResult);
+        crossedCaptureResult.artifact.contentSha256 = "e".repeat(64);
+        await assert.rejects(
+          authority.finalizeAtomicCrashCapture({
+            ...structuredClone(captureTransition),
+            captureResult: crossedCaptureResult,
+          }),
+          assertAuthorityCode("operation_result_conflict"),
+        );
+        await assert.rejects(
+          pool.query(
+            [
+              "UPDATE session_authority.operation_claims",
+              "SET state = 'committed', revision = 1,",
+              "result = $2::pg_catalog.jsonb,",
+              "updated_at = pg_catalog.transaction_timestamp(),",
+              "retired_at = pg_catalog.transaction_timestamp()",
+              "WHERE operation_id = $1 AND state = 'prepared'",
+            ].join(" "),
+            [
+              handoff.atomicCaptureOperationId,
+              JSON.stringify({
+                captureResultSha256: "0".repeat(64),
+                outcome: "atomic-crash-captured",
+                resultVersion: 1,
+              }),
+            ],
+          ),
+          (error) => {
+            assert.equal(error.code, "55000");
+            assert.equal(
+              error.constraint,
+              "operation_claims_atomic_crash_capture_immutable",
+            );
+            return true;
+          },
+        );
+        assert.deepEqual(
+          await authority.readAtomicCrashCapture(
+            structuredClone(captureReadRequest),
+          ),
+          committedProviderCapture,
+        );
+
+        const finalizedCapture = await authority.finalizeAtomicCrashCapture(
+          structuredClone(captureTransition),
+        );
+        assertOperationReceipt(finalizedCapture, "committed");
+        assert.equal(finalizedCapture.finalized, true);
+        assert.equal(finalizedCapture.providerState, "committed");
+        assert.deepEqual(finalizedCapture.captureResult, captureResult);
+        assert.equal(finalizedCapture.operation.revision, "1");
+        assert.equal(
+          finalizedCapture.operation.result.outcome,
+          "atomic-crash-captured",
+        );
+        assert.equal(
+          finalizedCapture.operation.result.captureResultSha256,
+          sha256Text(canonicalJsonForPodmanFixture(captureResult)),
+        );
+        assert.equal(finalizedCapture.reservation.state, "released");
+        assert.equal(
+          finalizedCapture.reservation.releasedAt,
+          finalizedCapture.operation.updatedAt,
+        );
+        assert.equal(
+          finalizedCapture.session.document.lifecycle,
+          "RECOVERY_REQUIRED",
+        );
+        assert.equal(finalizedCapture.session.document.activeOperation, null);
+        assert.equal(finalizedCapture.session.document.attachment, null);
+        assert.equal(finalizedCapture.session.document.lease, null);
+        assert.equal(finalizedCapture.session.document.launch, null);
+        assert.deepEqual(finalizedCapture.session.document.lastOperation, {
+          conflictClass: finalizedCapture.operation.conflictClass,
+          expectedSessionRevision:
+            finalizedCapture.operation.expectedSession.revision,
+          kind: finalizedCapture.operation.kind,
+          operationId: finalizedCapture.operation.operationId,
+          operationRevision: finalizedCapture.operation.revision,
+          requestSha256: finalizedCapture.operation.requestSha256,
+          reservationId: finalizedCapture.reservation.reservationId,
+          resultSha256: sha256Text(
+            canonicalJsonForPodmanFixture(finalizedCapture.operation.result),
+          ),
+          state: "committed",
+        });
+        await assertDeferredBlockerTamperRejected(
+          [
+            "UPDATE session_authority.sessions",
+            "SET document = pg_catalog.jsonb_set(",
+            "document, '{lastOperation,resultSha256}',",
+            "pg_catalog.to_jsonb($2::pg_catalog.text), false",
+            ") WHERE session_id = $1",
+          ].join(" "),
+          [sessionId, "0".repeat(64)],
+        );
+        const afterDigestTamper =
+          await authority.readAtomicCrashCapture(
+            structuredClone(captureReadRequest),
+          );
+        assert.deepEqual(
+          afterDigestTamper.operation,
+          finalizedCapture.operation,
+        );
+        assert.deepEqual(
+          afterDigestTamper.reservation,
+          finalizedCapture.reservation,
+        );
+        assert.deepEqual(afterDigestTamper.session, finalizedCapture.session);
+
+        const terminalAuthority = new PostgresSessionAuthority({
+          atomicCrashCaptureV1FleetCompatible: true,
+          store,
+          writerForceFenceV2FleetCompatible: true,
+        });
+        const terminalRead = await terminalAuthority.readAtomicCrashCapture(
+          structuredClone(captureReadRequest),
+        );
+        assertOperationReceipt(terminalRead, "committed");
+        assert.deepEqual(terminalRead.captureResult, captureResult);
+        assert.equal(terminalRead.providerState, "committed");
+        assert.deepEqual(terminalRead.operation, finalizedCapture.operation);
+        assert.deepEqual(
+          terminalRead.reservation,
+          finalizedCapture.reservation,
+        );
+        assert.deepEqual(terminalRead.session, finalizedCapture.session);
+
+        const finalizationReplay =
+          await terminalAuthority.finalizeAtomicCrashCapture(
+            structuredClone(captureTransition),
+          );
+        assert.equal(finalizationReplay.finalized, false);
+        assert.deepEqual(
+          finalizationReplay.operation,
+          finalizedCapture.operation,
+        );
+        assert.deepEqual(
+          finalizationReplay.reservation,
+          finalizedCapture.reservation,
+        );
+        assert.deepEqual(finalizationReplay.session, finalizedCapture.session);
+        const terminalFence =
+          await terminalAuthority.reconcileWriterForceFenceAtomicCaptureHandoff(
+            structuredClone(handoff.input),
+          );
+        assert.equal(terminalFence.status, "committed");
+        assert.equal(terminalFence.fence.finalized, false);
+        assert.deepEqual(
+          terminalFence.capture.operation,
+          finalizedCapture.operation,
+        );
+        assert.deepEqual(
+          terminalFence.capture.reservation,
+          finalizedCapture.reservation,
+        );
+        assert.deepEqual(terminalFence.session, finalizedCapture.session);
+
+        const terminalSuccessorOperationId =
+          `terminal-successor-${randomUUID()}`;
+        const terminalSuccessorInput = writerAttachmentInput(
+          finalizedCapture.session,
+          { operationId: terminalSuccessorOperationId },
+        );
+        await assert.rejects(
+          terminalAuthority.reserveOperation(terminalSuccessorInput),
+          assertAuthorityCode("invalid_operation_request"),
+        );
+        const absentTerminalSuccessor = await pool.query(
+          [
+            "SELECT count(*)::integer AS row_count FROM (",
+            "SELECT operation_id FROM session_authority.operation_claims",
+            "WHERE operation_id = $1",
+            "UNION ALL SELECT operation_id",
+            "FROM session_authority.operation_id_registry",
+            "WHERE operation_id = $1",
+            "UNION ALL SELECT operation_id",
+            "FROM session_authority.reservations",
+            "WHERE operation_id = $1",
+            ") AS matched",
+          ].join(" "),
+          [terminalSuccessorOperationId],
+        );
+        assert.equal(absentTerminalSuccessor.rows[0].row_count, 0);
 
         const incompleteRegistered = await authority.registerSession(
           registrationInput(incompleteSessionId),
@@ -16763,7 +17117,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
         );
 
         const input = writerLaunchAttemptInput(

@@ -7,9 +7,11 @@ capturing one `crash-prefix` checkpoint at an atomic storage boundary. The
 extension gives a future authority a closed request, result, and committed
 verification vocabulary. A separate durable PostgreSQL catalogue and classic
 LVM snapshot provider implement that private boundary. The session authority
-also has a durable force-fence-to-capture handoff foundation, but it stops at a
-prepared capture blocker: no currently assembled runtime or public deployment
-can take the checkpoint through that branch.
+now joins the durable force-fence handoff to that provider through a private
+composition. Exact committed and physically reverified evidence releases the
+prepared capture reservation only into `RECOVERY_REQUIRED`; no public
+deployment, tail-repair path, or successor-writer admission consumes that
+terminal yet.
 
 The extension is separate from the base storage backend contract. A backend
 opts in through `captureAtomicCrashCheckpoint()` and
@@ -398,11 +400,56 @@ handoff. Conversely, that proof does not prove that an atomic snapshot exists:
 the separately prepared capture must still be dispatched through a concrete
 provider and committed before any later repair or writer admission.
 
-This slice deliberately exposes no release path for the prepared blocker. It
-does not dispatch the LVM provider, reconcile a snapshot, repair a tail,
-restore a writable generation, or admit a higher-epoch writer. Until those
-later transitions exist, an exact committed handoff remains fail-closed and
-the session stays blocked from successor admission.
+Migration 14 and the dedicated capture authority now permit one additional
+terminal relation. The session operation remains `prepared@0` while the
+independent provider catalogue is absent, `starting`, `uncertain`, or
+`committed`; catalogue state never substitutes for session-authority state.
+Only an exact committed provider row and matching result digest may atomically
+move the capture operation to `committed@1`, release its reservation, clear the
+active pointer, and enter `RECOVERY_REQUIRED`. Generic operation reservation,
+dispatch, uncertainty, cancellation, and reconciliation remain unavailable for
+this operation kind.
+
+`RECOVERY_REQUIRED` is a terminal non-writer state, not ordinary `DETACHED`.
+Its lease, attachment, launch, and active operation are all null, and its exact
+last-operation pointer names the committed capture. Writer-acquire request
+validation rejects this lifecycle, so releasing the capture reservation does
+not create a gap before the separately reviewed writable-copy repair.
+
+## Private Physical-Fence LVM Capture Composition
+
+`createPostgresWriterForceFenceLvmAtomicCrashCaptureComposition()` consumes
+only the outer session capture operation ID and its exact version 1 atomic
+request. It exposes `runPreparedCapture()` and `reconcileCapture()` through a
+branded frozen facade. One `PostgresOperationGuard` serializes same-process
+attempts for that outer operation ID, while the request continues to bind the
+separate provider-catalogue operation ID and all four unique catalogue
+identities.
+
+The fresh path is admitted only when the session authority reports the capture
+as `prepared@0` and the provider catalogue as absent. Provider preparation may
+perform only its bounded read-only binding observations. The provider then
+claims its catalogue row. Before `lvcreate`, a private authority callback
+rereads the session authority and requires the same capture still prepared and
+the exact provider row now `starting`. Only that callback can consume the
+provider's one-use dispatch capability.
+
+If the provider catalogue is already `starting`, `uncertain`, or `committed`,
+both entry points use source-free committed verification only. They do not
+resolve the source attachment, reclaim provider dispatch, or call `lvcreate`.
+Missing, unreadable, writable, replaced, or content-mismatched evidence stays
+`unknown` and leaves the prepared blocker intact. `reconcileCapture()` also
+uses this source-free path when the catalogue is absent, so it can never become
+a fresh dispatcher.
+
+After exact physical verification, the composition invokes only the dedicated
+`finalizeAtomicCrashCapture()` transition. Finalizer acknowledgement loss is
+resolved by exact authority readback; a committed replay is physically
+reverified again and never redispatched. The session terminal stores only the
+SHA-256 of the exact provider result, while the independent immutable catalogue
+retains the full result. Migration 14 checks the exact request, all four
+provider identities, result digest, force-fence provenance, reservation, and
+session access-policy relation at transaction commit.
 
 ## Private Podman Verified-Stop Fence
 
@@ -434,12 +481,13 @@ composition uses committed provider readback only to finish the dedicated
 atomic handoff finalizer; committed authority replay performs no provider
 work.
 
-The composition stops at the existing `DETACHED` session with the predetermined
-atomic capture still active in `prepared`. It does not call the capture
-catalogue or LVM provider, create an artifact, release the blocker, repair a
-tail, or admit a successor writer. The assembled ext4 backend and public
-deployment remain `fencing: "manual"`; this private opt-in path therefore does
-not widen production capability discovery.
+The verified-stop fence composition itself still stops at `DETACHED` with the
+predetermined atomic capture active in `prepared`. The separate private LVM
+capture composition may consume that exact handoff and finish at
+`RECOVERY_REQUIRED`; neither composition repairs a tail or admits a successor
+writer. The assembled ext4 backend and public deployment remain
+`fencing: "manual"`; these private opt-in paths therefore do not widen
+production capability discovery.
 
 ## Deliberate Non-Capabilities
 
@@ -448,8 +496,6 @@ provider still do not provide or select:
 
 - fencing for a remote, partitioned, administrator-created, or otherwise
   unsupervised writer, or storage-native epoch enforcement;
-- dispatch or reconciliation of the prepared physical-fence-bound capture, or
-  release of that durable blocker;
 - integration with the current clean checkpoint path, lifecycle facade,
   ext4 capability discovery, or public deployment;
 - crash-prefix tail repair;
@@ -457,12 +503,13 @@ provider still do not provide or select:
 - admission of a new writer lease or fencing epoch.
 
 The private provider closes only the exact locally supervised Podman-writer
-branch. The durable version 2 handoff now consumes that authenticated physical
-stop and installs the prepared atomic capture, but it does not dispatch the
-capture. A future production recovery path must finish that exact capture,
-repair, and successor-admission sequence before stale-writer takeover is
-usable. Remote-host, cloud, filesystem-native, storage-epoch, thin-LVM, and
-other fence or snapshot adapters remain separate work.
+branch. The durable version 2 handoff installs the prepared atomic capture, and
+the separate private classic-LVM composition can now dispatch or reconcile
+that exact capture and close it into `RECOVERY_REQUIRED`. A future production
+recovery path must still repair a separate writable generation and explicitly
+admit its successor writer before stale-writer takeover is usable. Remote-host,
+cloud, filesystem-native, storage-epoch, thin-LVM, and other fence or snapshot
+adapters remain separate work.
 
 ## Required Future Ordering
 

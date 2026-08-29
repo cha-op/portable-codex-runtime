@@ -73,6 +73,7 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../migrations/authority/011-filesystem-image-provider-state-v3-adoption.sql", import.meta.url),
   new URL("../migrations/authority/012-atomic-crash-capture-catalogue.sql", import.meta.url),
   new URL("../migrations/authority/013-writer-fence-atomic-capture-handoff.sql", import.meta.url),
+  new URL("../migrations/authority/014-atomic-crash-capture-finalization.sql", import.meta.url),
 ]);
 const LANES = Object.freeze([
   "generation",

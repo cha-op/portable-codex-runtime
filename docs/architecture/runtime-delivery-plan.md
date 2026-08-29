@@ -640,9 +640,20 @@ exact committed result. Its raw methods and accessor are not exported; only
 the safe two-method composition leaves the launcher module.
 Acknowledgement ambiguity can advance only through source-free committed
 verification; `unknown` remains blocking. The existing ext4 backend and public
-deployment still do not advertise or call this extension. Physical stale-writer
-fencing, repair-gated restore, and higher-epoch writer admission remain later
-slices; see `atomic-crash-capture-extension.md`.
+deployment still do not advertise or call this extension.
+
+The next completed private slice joins a prepared force-fence V2 capture to
+the same catalogue and classic-LVM provider. The session operation deliberately
+stays `prepared@0` while provider state is absent, `starting`, `uncertain`, or
+`committed`; only exact committed catalogue evidence plus source-free physical
+verification may finalize it directly to `committed@1`. That transaction
+releases the capture reservation only into `RECOVERY_REQUIRED`, a non-writer
+terminal with no lease, attachment, launch, or active operation. Finalizer
+acknowledgement loss uses exact readback, and every existing or ambiguous
+provider attempt remains source-free and cannot issue another snapshot.
+Repair-gated writable-copy restore, public recovery wiring, and higher-epoch
+writer admission remain later slices; see
+`atomic-crash-capture-extension.md`.
 
 Later pull requests may be split further when an experiment reveals a narrower
 stable boundary. They must not be combined in a way that hides an experimental
