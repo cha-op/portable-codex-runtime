@@ -4231,6 +4231,10 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     captureFinalizationMigration.sql,
+    /ADD CONSTRAINT atomic_crash_captures_result_sha256_exact[\s\S]+result_json - ARRAY\[[\s\S]+'artifact'[\s\S]+'storageId'[\s\S]+\(result_json -> 'artifact'\) - ARRAY\[[\s\S]+'byteLength'[\s\S]+'readOnly'[\s\S]+result_sha256 = pg_catalog\.encode\([\s\S]+pg_catalog\.sha256\([\s\S]+pg_catalog\.convert_to\(/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
     /provider\.request_json = OLD\.request #> '\{payload,request\}'[\s\S]+provider\.state = 'committed'[\s\S]+provider\.result_sha256 =[\s\S]+NEW\.result #>> '\{captureResultSha256\}'/u,
   );
   assert.match(

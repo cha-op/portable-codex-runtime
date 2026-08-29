@@ -14,6 +14,125 @@ LOCK TABLE session_authority.atomic_crash_captures IN ACCESS EXCLUSIVE MODE;
 -- request content, plus the reservation/session access-policy blocker. A
 -- provider timestamp is only an ordering signal after the exact provider row,
 -- request, result digest, fence, and preclaim identities all agree.
+ALTER TABLE session_authority.atomic_crash_captures
+ADD CONSTRAINT atomic_crash_captures_result_sha256_exact
+CHECK ((
+  state <> 'committed'
+  OR (
+    pg_catalog.jsonb_typeof(result_json) = 'object'
+    AND (
+      result_json - ARRAY[
+        'artifact',
+        'artifactId',
+        'backendId',
+        'captureAttemptId',
+        'checkpointId',
+        'contractVersion',
+        'operationId',
+        'proofId',
+        'sessionId',
+        'sourceFencingEpoch',
+        'status',
+        'storageId'
+      ]
+    ) = '{}'::pg_catalog.jsonb
+    AND pg_catalog.jsonb_typeof(result_json -> 'artifact') = 'object'
+    AND (
+      (result_json -> 'artifact') - ARRAY[
+        'byteLength',
+        'contentSha256',
+        'objectId',
+        'objectIdentityScheme',
+        'readOnly'
+      ]
+    ) = '{}'::pg_catalog.jsonb
+    AND pg_catalog.jsonb_typeof(
+      result_json #> '{artifact,byteLength}'
+    ) = 'string'
+    AND result_json #>> '{artifact,byteLength}' ~
+      '^[1-9][0-9]{0,19}$'
+    AND (
+      result_json #>> '{artifact,byteLength}'
+    )::pg_catalog.numeric <= 18446744073709551615::pg_catalog.numeric
+    AND pg_catalog.jsonb_typeof(
+      result_json #> '{artifact,contentSha256}'
+    ) = 'string'
+    AND pg_catalog.octet_length(
+      result_json #>> '{artifact,contentSha256}'
+    ) = 64
+    AND result_json #>> '{artifact,contentSha256}' !~ '[^0-9a-f]'
+    AND pg_catalog.jsonb_typeof(
+      result_json #> '{artifact,objectId}'
+    ) = 'string'
+    AND result_json #>> '{artifact,objectId}' ~
+      '^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$'
+    AND pg_catalog.jsonb_typeof(
+      result_json #> '{artifact,objectIdentityScheme}'
+    ) = 'string'
+    AND result_json #>> '{artifact,objectIdentityScheme}' ~
+      '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    AND result_json #> '{artifact,readOnly}' = 'true'::pg_catalog.jsonb
+    AND pg_catalog.jsonb_typeof(result_json -> 'artifactId') = 'string'
+    AND pg_catalog.jsonb_typeof(result_json -> 'backendId') = 'string'
+    AND pg_catalog.jsonb_typeof(result_json -> 'captureAttemptId') = 'string'
+    AND pg_catalog.jsonb_typeof(result_json -> 'checkpointId') = 'string'
+    AND result_json -> 'contractVersion' = '1'::pg_catalog.jsonb
+    AND pg_catalog.jsonb_typeof(result_json -> 'operationId') = 'string'
+    AND pg_catalog.jsonb_typeof(result_json -> 'proofId') = 'string'
+    AND result_json #>> '{proofId}' ~
+      '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+    AND pg_catalog.jsonb_typeof(result_json -> 'sessionId') = 'string'
+    AND pg_catalog.jsonb_typeof(
+      result_json -> 'sourceFencingEpoch'
+    ) = 'string'
+    AND result_json -> 'status' = '"committed"'::pg_catalog.jsonb
+    AND pg_catalog.jsonb_typeof(result_json -> 'storageId') = 'string'
+    AND result_sha256 = pg_catalog.encode(
+      pg_catalog.sha256(
+        pg_catalog.convert_to(
+          '{"artifact":{"byteLength":' ||
+            (result_json #> '{artifact,byteLength}')::pg_catalog.text ||
+            ',"contentSha256":' ||
+            (result_json #> '{artifact,contentSha256}')::pg_catalog.text ||
+            ',"objectId":' ||
+            (result_json #> '{artifact,objectId}')::pg_catalog.text ||
+            ',"objectIdentityScheme":' ||
+            (
+              result_json #> '{artifact,objectIdentityScheme}'
+            )::pg_catalog.text ||
+            ',"readOnly":' ||
+            (result_json #> '{artifact,readOnly}')::pg_catalog.text ||
+            '},"artifactId":' ||
+            (result_json -> 'artifactId')::pg_catalog.text ||
+            ',"backendId":' ||
+            (result_json -> 'backendId')::pg_catalog.text ||
+            ',"captureAttemptId":' ||
+            (result_json -> 'captureAttemptId')::pg_catalog.text ||
+            ',"checkpointId":' ||
+            (result_json -> 'checkpointId')::pg_catalog.text ||
+            ',"contractVersion":' ||
+            (result_json -> 'contractVersion')::pg_catalog.text ||
+            ',"operationId":' ||
+            (result_json -> 'operationId')::pg_catalog.text ||
+            ',"proofId":' ||
+            (result_json -> 'proofId')::pg_catalog.text ||
+            ',"sessionId":' ||
+            (result_json -> 'sessionId')::pg_catalog.text ||
+            ',"sourceFencingEpoch":' ||
+            (result_json -> 'sourceFencingEpoch')::pg_catalog.text ||
+            ',"status":' ||
+            (result_json -> 'status')::pg_catalog.text ||
+            ',"storageId":' ||
+            (result_json -> 'storageId')::pg_catalog.text ||
+            '}',
+          'UTF8'
+        )
+      ),
+      'hex'
+    )
+  )
+) IS TRUE);
+
 CREATE OR REPLACE FUNCTION session_authority.enforce_writer_fence_atomic_capture_materialization()
 RETURNS trigger
 LANGUAGE plpgsql

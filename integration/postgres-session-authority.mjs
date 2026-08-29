@@ -12091,12 +12091,78 @@ test(
           absentCapture,
         );
 
-        const catalogue = createPostgresAtomicCrashCaptureCatalogue({
-          store,
-        });
         const providerBinding = atomicCrashCaptureProviderBinding(
           handoff.atomicRequest,
         );
+        const providerBindingJson =
+          canonicalJsonForPodmanFixture(providerBinding);
+        const providerRequestJson =
+          canonicalJsonForPodmanFixture(handoff.atomicRequest);
+        const captureResult = atomicCrashCaptureResult(
+          handoff.atomicRequest,
+        );
+        const digestTamperClient = await pool.connect();
+        try {
+          await digestTamperClient.query("BEGIN");
+          await digestTamperClient.query(
+            [
+              "INSERT INTO session_authority.atomic_crash_captures",
+              "(capture_attempt_id, operation_id, checkpoint_id, artifact_id,",
+              "contract_version, backend_id, session_id, storage_id,",
+              "source_fencing_epoch, request_json, request_sha256,",
+              "provider_binding, provider_binding_json,",
+              "provider_binding_sha256, state, result_json, result_sha256)",
+              "VALUES ($1, $2, $3, $4, 1, $5, $6, $7,",
+              "$8::pg_catalog.numeric, $9::pg_catalog.jsonb, $10,",
+              "$11::pg_catalog.jsonb, $12, $13, 'starting', NULL, NULL)",
+            ].join(" "),
+            [
+              handoff.atomicRequest.captureAttemptId,
+              handoff.atomicRequest.mutationRequest.operationId,
+              handoff.atomicRequest.checkpoint.checkpointId,
+              handoff.atomicRequest.checkpoint.artifactId,
+              handoff.atomicRequest.storageRef.backendId,
+              handoff.atomicRequest.storageRef.sessionId,
+              handoff.atomicRequest.storageRef.storageId,
+              handoff.atomicRequest.checkpoint.sourceFencingEpoch,
+              providerRequestJson,
+              sha256Text(providerRequestJson),
+              providerBindingJson,
+              providerBindingJson,
+              sha256Text(providerBindingJson),
+            ],
+          );
+          await assert.rejects(
+            digestTamperClient.query(
+              [
+                "UPDATE session_authority.atomic_crash_captures",
+                "SET state = 'committed',",
+                "result_json = $2::pg_catalog.jsonb, result_sha256 = $3",
+                "WHERE capture_attempt_id = $1",
+              ].join(" "),
+              [
+                handoff.atomicRequest.captureAttemptId,
+                JSON.stringify(captureResult),
+                "0".repeat(64),
+              ],
+            ),
+            (error) => {
+              assert.equal(error.code, "23514");
+              assert.equal(
+                error.constraint,
+                "atomic_crash_captures_result_sha256_exact",
+              );
+              return true;
+            },
+          );
+        } finally {
+          await digestTamperClient.query("ROLLBACK");
+          digestTamperClient.release();
+        }
+
+        const catalogue = createPostgresAtomicCrashCaptureCatalogue({
+          store,
+        });
         const providerClaim = await catalogue.claimStarting({
           providerBinding,
           request: handoff.atomicRequest,
@@ -12115,9 +12181,6 @@ test(
         );
         assert.deepEqual(startingCapture.session, handedOff.session);
 
-        const captureResult = atomicCrashCaptureResult(
-          handoff.atomicRequest,
-        );
         const committedProvider = await catalogue.commitResult({
           dispatchClaim: providerClaim.dispatchClaim,
           result: captureResult,
