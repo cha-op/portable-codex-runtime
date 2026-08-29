@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { createHash, randomUUID } from "node:crypto";
 
 import {
@@ -121,6 +122,19 @@ function providerBinding(prefix) {
   };
 }
 
+function jsonbOverheadProviderBinding() {
+  const binding = {
+    entries: new Array(8_189).fill(0),
+    padding: "",
+  };
+  const remaining =
+    65_536 - Buffer.byteLength(canonicalJson(binding), "utf8");
+  assert.ok(remaining > 0);
+  binding.padding = "x".repeat(remaining);
+  assert.equal(Buffer.byteLength(canonicalJson(binding), "utf8"), 65_536);
+  return binding;
+}
+
 function acknowledgementLossPool(pool, matches) {
   let armed = false;
   let acknowledgementLost = false;
@@ -173,7 +187,8 @@ async function catalogueRow(pool, captureAttemptId) {
     [
       "SELECT capture_attempt_id, operation_id, checkpoint_id, artifact_id,",
       "state, request_json, request_sha256, provider_binding,",
-      "provider_binding_sha256, result_json, result_sha256,",
+      "provider_binding_json, provider_binding_sha256, result_json,",
+      "result_sha256,",
       "claimed_at, uncertain_at, committed_at",
       "FROM session_authority.atomic_crash_captures",
       "WHERE capture_attempt_id = $1",
@@ -193,6 +208,32 @@ export async function assertPostgresAtomicCrashCaptureCatalogueIntegration(
   store,
 ) {
   const catalogue = createPostgresAtomicCrashCaptureCatalogue({ store });
+  const overheadPrefix = `jsonb-overhead-${randomUUID()}`;
+  const overheadRequest = captureRequest(overheadPrefix);
+  const overheadBinding = jsonbOverheadProviderBinding();
+  const overheadJson = canonicalJson(overheadBinding);
+  const overheadSizes = await pool.query(
+    [
+      "SELECT pg_catalog.octet_length(pg_catalog.convert_to($1, 'UTF8'))",
+      "AS canonical_bytes, pg_catalog.pg_column_size($1::pg_catalog.jsonb)",
+      "AS jsonb_bytes",
+    ].join(" "),
+    [overheadJson],
+  );
+  assert.equal(overheadSizes.rows.length, 1);
+  assert.ok(overheadSizes.rows[0].canonical_bytes <= 65_536);
+  assert.ok(overheadSizes.rows[0].jsonb_bytes > 65_536);
+  assert.equal(
+    (await claim(catalogue, overheadRequest, overheadBinding)).outcome,
+    "dispatch",
+  );
+  const overheadRow = await catalogueRow(
+    pool,
+    overheadRequest.captureAttemptId,
+  );
+  assert.deepEqual(overheadRow.provider_binding, overheadBinding);
+  assert.equal(overheadRow.provider_binding_json, overheadJson);
+
   const concurrentPrefix = `concurrent-${randomUUID()}`;
   const concurrentRequest = captureRequest(concurrentPrefix);
   const concurrentBinding = providerBinding(concurrentPrefix);

@@ -30,7 +30,11 @@ superseded_by:
 - Migration 12 creates `atomic_crash_captures` without lifecycle foreign keys
   or UUID aliases. Capture-attempt, operation, checkpoint, and artifact IDs are
   independently unique. Canonical request and provider-binding JSON are stored
-  with SHA-256, while the committed result remains nullable until success.
+  with SHA-256, while the committed result remains nullable until success. The
+  provider binding also retains its exact canonical JSON text so application
+  validation and PostgreSQL both enforce the same 65,536-byte UTF-8 limit;
+  binary `jsonb` storage overhead cannot reject an otherwise admitted binding.
+  NUL and unpaired-surrogate strings or keys fail before database access.
 - The only row transitions are `starting -> uncertain`,
   `starting -> committed`, and `uncertain -> committed`. Database triggers own
   the claim, uncertainty, and commit timestamps and reject caller-owned time,
@@ -100,11 +104,13 @@ superseded_by:
 
 - `node --check` passed for the new catalogue, provider/driver, and integration
   modules and their focused tests.
-- Catalogue and LVM focused tests passed: 57 passed and the one privileged LVM
+- Catalogue and LVM focused tests passed: 59 passed and the one privileged LVM
   integration case skipped by default on macOS. The LVM-only unit suite passed
   all 41 tests after also exercising VG-extent-normalized COW allocation and
   overflow rejection, captured `BigInt` intrinsics, distinct COW-allocation and
   visible sizes, whitespace-padded LVM reports, and `dmsetup --columns` fields.
+  The 18 catalogue tests include exact ASCII, multibyte, and high-JSONB-overhead
+  canonical bindings at the 65,536-byte UTF-8 admission boundary.
 - The changed serializable-store and runtime-controller suites passed 176
   tests, and the detached deployment suite passed 35 tests.
 - The unfiltered repository suite ran 3,534 tests: 3,497 passed, 36 skipped,

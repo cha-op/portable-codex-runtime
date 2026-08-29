@@ -202,6 +202,14 @@ provider binding and result. The dispatch claim is consumed before either
 `uncertain` or `committed` is written, so a malformed result, database error, or
 acknowledgement loss cannot reopen physical dispatch.
 
+Provider-binding admission measures the exact canonical JSON text that the
+application hashes and persists, encoded as UTF-8, rather than PostgreSQL's
+version-dependent binary `jsonb` representation. The database bounds that same
+text at 65,536 bytes, requires its parsed JSONB value to match the retained
+binding, and keeps both forms immutable across every state transition. The
+application rejects NUL and unpaired-surrogate strings or keys before database
+access because PostgreSQL JSONB cannot represent that input domain.
+
 The dormant LVM wrapper delegates all seven base lifecycle methods and changes
 only its private capability snapshot to
 `atomicPointInTimeCheckpoint: true`. Before claiming, its injected origin

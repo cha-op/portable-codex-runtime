@@ -20,6 +20,7 @@ const MAX_RESULT_JSON_BYTES = 131_072;
 const MAX_JSON_DEPTH = 24;
 const MAX_JSON_NODES = 8_192;
 const MAX_JSON_OBJECT_KEYS = 1_024;
+const JSONB_INCOMPATIBLE_STRING_PATTERN = /\u0000|[\uD800-\uDFFF]/u;
 const SHA256_PATTERN = /^[0-9a-f]{64}$/u;
 const UINT64_PATTERN = /^(?:[1-9][0-9]{0,19})$/u;
 const UINT64_MAX = 18_446_744_073_709_551_615n;
@@ -39,6 +40,7 @@ const ROW_KEYS = Object.freeze([
   "contract_version",
   "operation_id",
   "provider_binding",
+  "provider_binding_json",
   "provider_binding_sha256",
   "request_json",
   "request_sha256",
@@ -64,6 +66,7 @@ const COLUMNS = [
   "request_json",
   "request_sha256",
   "provider_binding",
+  "provider_binding_json",
   "provider_binding_sha256",
   "state",
   "result_json",
@@ -78,9 +81,10 @@ const INSERT_QUERY = [
   "(capture_attempt_id, operation_id, checkpoint_id, artifact_id,",
   "contract_version, backend_id, session_id, storage_id,",
   "source_fencing_epoch, request_json, request_sha256, provider_binding,",
-  "provider_binding_sha256, state, result_json, result_sha256)",
+  "provider_binding_json, provider_binding_sha256, state, result_json,",
+  "result_sha256)",
   "VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::pg_catalog.numeric,",
-  "$10::pg_catalog.jsonb, $11, $12::pg_catalog.jsonb, $13,",
+  "$10::pg_catalog.jsonb, $11, $12::pg_catalog.jsonb, $12, $13,",
   "'starting', NULL, NULL)",
   "ON CONFLICT DO NOTHING",
   "RETURNING capture_attempt_id",
@@ -309,6 +313,7 @@ function canonicalJsonValue(value, code, state, depth) {
     );
     if (typeof value === "string") {
       ensure(
+        !regexpTest(JSONB_INCOMPATIBLE_STRING_PATTERN, value) &&
         callIntrinsic(bufferByteLengthIntrinsic, Buffer, [value, "utf8"]) <=
           state.maxBytes,
         code,
@@ -374,6 +379,7 @@ function canonicalJsonValue(value, code, state, depth) {
     for (let index = 0; index < keys.length; index += 1) {
       const key = keys[index];
       ensure(
+        !regexpTest(JSONB_INCOMPATIBLE_STRING_PATTERN, key) &&
         callIntrinsic(bufferByteLengthIntrinsic, Buffer, [key, "utf8"]) <=
           state.maxBytes,
         code,
@@ -583,6 +589,7 @@ function normalizedRow(value, code) {
       typeof row.storage_id === "string" &&
       typeof row.request_sha256 === "string" &&
       regexpTest(SHA256_PATTERN, row.request_sha256) &&
+      typeof row.provider_binding_json === "string" &&
       typeof row.provider_binding_sha256 === "string" &&
       regexpTest(SHA256_PATTERN, row.provider_binding_sha256),
     code,
@@ -605,6 +612,7 @@ function normalizedRow(value, code) {
       request.storageId === row.storage_id &&
       request.sourceFencingEpoch === sourceFencingEpoch &&
       request.requestSha256 === row.request_sha256 &&
+      binding.providerBindingJson === row.provider_binding_json &&
       binding.providerBindingSha256 === row.provider_binding_sha256,
     code,
   );

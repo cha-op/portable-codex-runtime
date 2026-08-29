@@ -14,6 +14,7 @@ CREATE TABLE session_authority.atomic_crash_captures (
   request_json jsonb NOT NULL,
   request_sha256 character varying(64) COLLATE pg_catalog."C" NOT NULL,
   provider_binding jsonb NOT NULL,
+  provider_binding_json text COLLATE pg_catalog."C" NOT NULL,
   provider_binding_sha256 character varying(64) COLLATE pg_catalog."C" NOT NULL,
   state character varying(10) COLLATE pg_catalog."C" NOT NULL,
   result_json jsonb,
@@ -83,7 +84,10 @@ CREATE TABLE session_authority.atomic_crash_captures (
   ) IS TRUE),
   CONSTRAINT atomic_crash_captures_provider_binding_shape CHECK ((
     pg_catalog.jsonb_typeof(provider_binding) = 'object'
-    AND pg_catalog.pg_column_size(provider_binding) BETWEEN 2 AND 65536
+    AND pg_catalog.octet_length(
+      pg_catalog.convert_to(provider_binding_json, 'UTF8')
+    ) BETWEEN 2 AND 65536
+    AND provider_binding_json::pg_catalog.jsonb = provider_binding
   ) IS TRUE),
   CONSTRAINT atomic_crash_captures_provider_sha256 CHECK ((
     octet_length(provider_binding_sha256) = 64
@@ -193,6 +197,7 @@ BEGIN
     AND NEW.request_json IS NOT DISTINCT FROM OLD.request_json
     AND NEW.request_sha256 IS NOT DISTINCT FROM OLD.request_sha256
     AND NEW.provider_binding IS NOT DISTINCT FROM OLD.provider_binding
+    AND NEW.provider_binding_json IS NOT DISTINCT FROM OLD.provider_binding_json
     AND NEW.provider_binding_sha256 IS NOT DISTINCT FROM OLD.provider_binding_sha256
     AND NEW.claimed_at IS NOT DISTINCT FROM OLD.claimed_at
     AND NEW.uncertain_at IS NOT DISTINCT FROM OLD.uncertain_at

@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { Buffer } from "node:buffer";
 import { createHash } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
@@ -238,6 +239,7 @@ function createHarness() {
           contract_version: values[4],
           operation_id: values[1],
           provider_binding: JSON.parse(values[11]),
+          provider_binding_json: values[11],
           provider_binding_sha256: values[12],
           request_json: JSON.parse(values[9]),
           request_sha256: values[10],
@@ -550,7 +552,7 @@ test("mismatched committed result is rejected instead of replayed", async () => 
   );
 });
 
-test("provider bindings reject proxies, accessors, cycles, and byte overflow", async () => {
+test("provider bindings reject unsafe shapes and incompatible JSON", async () => {
   const cases = [
     new Proxy(providerBinding(), {}),
     Object.defineProperty(providerBinding(), "snapshotName", {
@@ -565,6 +567,9 @@ test("provider bindings reject proxies, accessors, cycles, and byte overflow", a
       return value;
     })(),
     providerBinding({ snapshotTag: "x".repeat(70_000) }),
+    providerBinding({ snapshotTag: "\u0000" }),
+    providerBinding({ snapshotTag: "\ud800" }),
+    { ["\udc00"]: "invalid-key" },
   ];
   for (const binding of cases) {
     const fixture = createFixture();
@@ -576,6 +581,37 @@ test("provider bindings reject proxies, accessors, cycles, and byte overflow", a
     );
     assert.equal(fixture.harness.trace.length, 0);
   }
+});
+
+test("provider-binding admission uses the exact canonical UTF-8 boundary", async () => {
+  const highOverhead = {
+    entries: new Array(8_189).fill(0),
+    padding: "",
+  };
+  highOverhead.padding = "x".repeat(
+    65_536 - Buffer.byteLength(canonicalJson(highOverhead), "utf8"),
+  );
+  for (const binding of [
+    { payload: "x".repeat(65_522) },
+    { payload: "é".repeat(32_761) },
+    highOverhead,
+  ]) {
+    const fixture = createFixture();
+    assert.equal((await claim(fixture, captureRequest(), binding)).outcome, "dispatch");
+    assert.equal(
+      Buffer.byteLength(fixture.harness.trace[0].values[11], "utf8"),
+      65_536,
+    );
+  }
+
+  const fixture = createFixture();
+  await assert.rejects(
+    claim(fixture, captureRequest(), { payload: "x".repeat(65_523) }),
+    catalogueError(
+      "invalid_postgres_atomic_crash_capture_catalogue_request",
+    ),
+  );
+  assert.equal(fixture.harness.trace.length, 0);
 });
 
 test("dispatch claims reject proxies and forgeries before PostgreSQL", async () => {
@@ -591,6 +627,28 @@ test("dispatch claims reject proxies and forgeries before PostgreSQL", async () 
     );
   }
   assert.equal(fixture.harness.trace.length, before);
+});
+
+test("catalogue persists exact canonical provider-binding JSON", async () => {
+  const fixture = createFixture();
+  const request = captureRequest();
+  const binding = { z: 0, a: ["é", true] };
+
+  assert.equal((await claim(fixture, request, binding)).outcome, "dispatch");
+  const canonical = '{"a":["é",true],"z":0}';
+  assert.equal(fixture.harness.trace[0].values[11], canonical);
+  assert.equal(
+    fixture.harness.rows.get(request.captureAttemptId).provider_binding_json,
+    canonical,
+  );
+  fixture.harness.rows.get(request.captureAttemptId).provider_binding_json =
+    `{ ${canonical.slice(1)}`;
+  await assert.rejects(
+    claim(fixture, request, binding),
+    catalogueError(
+      "postgres_atomic_crash_capture_catalogue_state_invalid",
+    ),
+  );
 });
 
 test("tampered database rows are rejected as invalid durable state", async () => {
@@ -630,6 +688,19 @@ test("migration defines immutable transition audit and permanent rows", async ()
   assert.match(sql, /atomic_crash_captures_update_guard/u);
   assert.match(sql, /atomic_crash_captures_delete_guard/u);
   assert.match(sql, /atomic_crash_captures_truncate_guard/u);
+  assert.match(
+    sql,
+    /provider_binding_json text COLLATE pg_catalog\."C" NOT NULL/u,
+  );
+  assert.match(
+    sql,
+    /octet_length\(\s*pg_catalog\.convert_to\(provider_binding_json, 'UTF8'\)\s*\) BETWEEN 2 AND 65536/u,
+  );
+  assert.match(
+    sql,
+    /provider_binding_json::pg_catalog\.jsonb = provider_binding/u,
+  );
+  assert.doesNotMatch(sql, /pg_column_size\(provider_binding\)/u);
   assert.match(sql, /NEW\.claimed_at := pg_catalog\.transaction_timestamp\(\)/u);
   assert.match(sql, /NEW\.uncertain_at := pg_catalog\.transaction_timestamp\(\)/u);
   assert.match(sql, /NEW\.committed_at := pg_catalog\.transaction_timestamp\(\)/u);
