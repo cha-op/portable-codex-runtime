@@ -9,7 +9,8 @@ The implemented authority provides:
 - bounded, provenance-aware serialization and deadlock retry;
 - an ordered, checksum-bound authority migration chain;
 - a permanent global operation-ID registry shared by direct operations,
-  restore-bound launch intents, and V3 writer-stop capture intents;
+  restore-bound launch intents, V3 writer-stop capture intents, and V2
+  force-fence capture intents;
 - permanent relational and typed state-machine authority for restore
   destination generations;
 - real-PostgreSQL migration and concurrency tests;
@@ -20,6 +21,9 @@ The implemented authority provides:
 - typed database-clock writer attachment dispatch, exact attachment
   finalization, exact lease renewal, exact-owner release, and force-fence
   reconciliation;
+- a version 2 force-fence intent that preclaims an independent atomic-capture
+  operation before dispatch and atomically hands exact physical-fence proof to
+  one prepared, session-blocking capture;
 - production clean-checkpoint capture admission, durable attempt claims, and
   exact checkpoint-catalogue finalization;
 - one fresh-only prepared-capture dispatch path plus committed-only,
@@ -66,6 +70,12 @@ clean-capture admission. V3 instead embeds the complete capture intent in the
 stop request, preclaims its operation ID before physical stop, and atomically
 turns a committed stop into the prepared capture that holds the session active
 pointer. Both paths retain local writer exclusion until exact capture success.
+Force-fence request V2 applies the same durable-handoff principle to a
+different authority source: it preclaims the independent atomic-capture
+operation before external fence dispatch, then one exact-proof finalization
+both detaches the old writer and materializes that capture as the session's
+active prepared blocker. This slice has no capture dispatch or blocker-release
+path, so the committed handoff remains fail-closed across restart.
 Detached-destination activation can now materialize an executable prepared
 launch from a clean detached intent, and bounded no-relaunch recovery is
 implemented under the database-global shared/exclusive lifecycle guard and
@@ -156,9 +166,14 @@ one opaque same-process capability for the exact prepared tuple. V3 crosses
 instead into the exact durably prepared capture intent whose operation ID was
 claimed before stop; its local writer exclusion remains until the fixed
 committed capture result is returned. Ambiguity retains both durable and local
-blockers. The ext4 cross-host flow begins only after a clean detach; automatic
-exclusion of a partitioned or stale writer remains an operator/provider fencing
-responsibility.
+blockers. Force-fence V2 preserves the same durable admission property without
+treating it as physical proof: only the exact trusted fence result may commit
+the old writer's detach and materialize the separately preclaimed atomic
+capture in one transaction. The resulting active reservation, not the
+`DETACHED` label or newer database epoch, blocks a successor across process
+exit and restart. The ext4 cross-host flow begins only after a clean detach;
+automatic exclusion of a partitioned or stale writer remains an
+operator/provider fencing responsibility.
 
 ## Implemented Canonical Session Registry
 
@@ -448,6 +463,66 @@ typed blocked finalization enters `BLOCKED` and retains the already advanced
 epoch, revoked lease, known attachment, and target. Recovery from `BLOCKED`
 requires a new explicit force-fence reservation and dispatch; its dispatch
 advances the epoch again before re-entering `FENCING`.
+
+## Implemented Durable Force-Fence-to-Capture Handoff
+
+Force-fence request version 2 embeds one complete
+`atomicCapture: { operationId, request }` intent for an
+`atomic-crash-capture-v1` operation. Generic reservation remains the first
+authority write. Before typed force-fence dispatch can be granted, that same
+serializable transaction creates the
+`writer-fence-atomic-capture-intent-v2` preclaim for the independent capture
+operation ID, the same session, the complete atomic intent, and claimant
+force-fence operation. A conflicting session, operation kind, claimant,
+capture identity, or request cannot reuse it. Exact dispatch replay preserves
+one epoch advance and never grants the provider a second fence call.
+
+Version 2 starts only from the exact `ATTACHED` writer because the atomic
+request must carry that live source attachment and match its storage, lease,
+holder, epoch, and target. Its checkpoint descriptor must also bind the
+manifest's Codex session, root thread, and image digest. The legacy request
+remains the explicit
+`ATTACHED`/`BLOCKED` force-fence recovery path; a `BLOCKED` row cannot
+manufacture a new atomic source binding.
+
+The external provider boundary is unchanged: it receives the exact
+force-fence request outside every database transaction, and its opaque
+`status: "fenced"` proof must validate against the revoked attachment, lease,
+holder, old epoch, target, storage, and force-fence operation. Database
+availability, lease expiry, the advanced epoch, or lifecycle state cannot
+substitute for that result.
+
+For version 2, `finalizeWriterForceFenceAtomicCaptureHandoff()` performs the
+detach-to-capture handoff atomically. It locks and validates the force-fence
+operation, its permanent capture preclaim, and the exact session snapshot;
+accepts only the matching provider proof; commits the fence; clears the old
+launch, lease, and attachment; enters `DETACHED`; materializes one `prepared`
+`atomic-crash-capture-v1` operation and reservation from the preclaim; and
+makes that capture the session's active pointer. There is no committed state in
+which the physical fence has been accepted while a successor is unblocked but
+the predetermined capture is absent.
+
+The lifecycle label and admission blocker deliberately remain separate. A
+version 2 handoff session is `DETACHED` because the old physical attachment is
+fenced, yet its active prepared capture conflicts with every successor writer
+reservation. The blocker is database durable and therefore survives process
+loss, finalization acknowledgement loss, and restart. Exact finalizer replay
+and `reconcileWriterForceFenceAtomicCaptureHandoff()` return the same committed
+fence terminal and prepared capture without another provider call or capture
+creation. Readback derives the exact fence terminal document and changes only
+its active pointer to the prepared capture; the document version and complete
+fence `lastOperation` history cannot be substituted independently.
+
+This foundation does not authorize physical capture. It exposes no snapshot
+dispatch, source-free capture reconciliation, capture finalization, or release
+of the prepared blocker. It also adds no tail repair, writable restore,
+higher-epoch writer launch, provider selection, or public deployment wiring.
+Generic reserve, reconciliation, uncertainty, and pre-dispatch cancellation
+also reject the materialized atomic-capture kind; only the dedicated handoff
+readback can observe it. Consequently every successful version 2 handoff
+remains intentionally fail-closed until a separately reviewed continuation
+commits the exact atomic capture. Legacy force-fence behavior remains
+available without this handoff.
 
 ## Implemented Provider-Backed Writer Detach Composition
 
@@ -885,7 +960,7 @@ stateDiagram-v2
   RELEASING --> BLOCKED: typed ambiguous-outcome finalization
   ATTACHED --> FENCING: force-fence dispatch advances epoch
   BLOCKED --> FENCING: explicit recovery dispatch advances epoch
-  FENCING --> DETACHED: independent exact force-fence proof
+  FENCING --> DETACHED: exact fence proof; V2 installs prepared capture blocker
   FENCING --> BLOCKED: unavailable or ambiguous fence finalization
 ```
 
@@ -907,6 +982,11 @@ has been allocated, the old tuple is stale even for cleanup. Moving from
 `BLOCKED` to `FENCING` always requires a separately reserved force-fence
 operation and a definite typed dispatch commit.
 
+For force-fence V2, `DETACHED` retains the separately materialized prepared
+capture as `activeOperation`; that session-conflicting reservation prevents
+acquisition until a future exact capture terminal explicitly releases it. This
+foundation contains no such release transition.
+
 ## Schema for Durable Claims and Reservations
 
 Operation IDs, capture-attempt IDs, and reservation IDs are global authority
@@ -918,8 +998,9 @@ identities rather than session-volume data:
   one session and claim provenance before any external effect;
 - a registry claim is a materialized `direct-operation`, a restore or
   activation launch intent owned by its claimant operation, a V3 capture
-  intent owned by its writer-stop operation, or an immutable detached-restore
-  stable-plan claim owned directly by its restore operation identity;
+  intent owned by its writer-stop operation, a V2 atomic-capture intent owned
+  by its force-fence operation, or an immutable detached-restore stable-plan
+  claim owned directly by its restore operation identity;
 - reusing an operation ID with a different session, claim type, claimant,
   binding, kind, or request fails closed;
 - an active reservation is unique for the operation and session conflict
@@ -941,7 +1022,8 @@ database migration cannot silently invent a new lifecycle.
 
 `session_authority.operation_id_registry` is the one global namespace shared
 by every direct operation, pre-publication restore/activation launch intent,
-pre-stop V3 capture intent, and detached-restore stable plan.
+pre-stop V3 capture intent, pre-fence V2 capture intent, and detached-restore
+stable plan.
 Its relational fields retain the operation ID, session ID, `claim_type`,
 optional `claimant_operation_id`, `claimed_at`, and optional
 `materialized_at`. A direct claim has no separate `binding`; intent claims
@@ -951,22 +1033,28 @@ launch intents are claimed before their external effect and remain
 unmaterialized until the atomic handoff creates the matching launch operation.
 A V3 writer-stop claim is created in the stop dispatch transaction before
 physical stop and remains unmaterialized until the atomic stop finalizer
-creates the matching capture operation. The primary key prevents cross-type
-ID reuse, and same-session claimant relations prevent an intent from escaping
-its owning operation. A stable-plan claim has no claimant operation and remains
+creates the matching capture operation. A V2 force-fence claim follows the
+same durable cut: it is created before physical fence dispatch and remains
+unmaterialized until exact fence finalization creates the matching prepared
+atomic-capture operation. The primary key prevents cross-type ID reuse, and
+same-session claimant relations prevent an intent from escaping its owning
+operation. A stable-plan claim has no claimant operation and remains
 unmaterialized until the matching version 1 restore-generation reservation
 creates that operation. Registry rows are never deleted or released.
 
-Writer acquisition, renewal, release, force-fence, blocked finalization, and
-checkpoint capture use those existing structures without DDL. The canonical
-session JSONB stores the lease, epoch, lifecycle, attachment, active pointer,
-and terminal anchor; the existing operation and reservation JSONB records
-store each exact typed request and terminal result. Capture-attempt claims bind
-the exact operation and coordinator binding, tombstones are permanent
-non-authorizing reuse fences, and each catalogue row binds one checkpoint to
-one exact attempt and path-free committed completion. The permanent registry
-identity and active session-conflict constraints remain the admission
-boundary.
+Writer acquisition, renewal, legacy release and force-fence, blocked
+finalization, and checkpoint capture use the earlier structures without
+additional DDL. The force-fence V2 handoff extends the permanent operation-ID
+claim types and relational checks so the capture operation is preclaimed
+before dispatch and must materialize together with the committed fence. The
+canonical session JSONB stores the lease, epoch, lifecycle, attachment, active
+pointer, and terminal anchor; the existing operation and reservation JSONB
+records store each exact typed request and terminal result. Capture-attempt
+claims bind the exact operation and coordinator binding, tombstones are
+permanent non-authorizing reuse fences, and each catalogue row binds one
+checkpoint to one exact attempt and path-free committed completion. The
+permanent registry identity and active session-conflict constraints remain the
+admission boundary.
 
 The ordered migration chain treats the installed
 `session_authority.schema_migrations` ledger as an exact contiguous prefix
@@ -1076,6 +1164,38 @@ complete `(session_id, authorized_at, terminal_operation_id)` tuple. Its
 owner-first partial index and page query use the same C-collated total order.
 No local file deletion removes or weakens this PostgreSQL evidence, and this
 slice exposes no ledger-retirement API.
+
+Migration 013 adds the
+`writer-fence-atomic-capture-intent-v2` operation-ID claim type and relational
+enforcement for the durable fence-to-capture handoff. A force-fence request V2
+may transition out of `prepared` only after it has permanently claimed
+`atomicCapture.operationId` for the same session, with the force-fence
+operation as claimant and the complete `atomicCapture` record as binding. The
+claim remains unmaterialized during `starting` or `uncertain`. Exact fence
+finalization must atomically mark it materialized, create the matching
+`atomic-crash-capture-v1` operation and active reservation in `prepared`, and
+make that operation the session's active pointer. Relational checks reject an
+orphan materialization, a crossed claimant or session, or a capture operation
+whose request differs from the preclaim. A deferred commit-time constraint on
+every successful V2 fence additionally requires the exact capture operation
+and reservation to remain prepared, the fence reservation to be released, and
+the `DETACHED` session's terminal and active pointers to bind those same rows.
+The V2 fence identity and terminal record and the prepared atomic-capture row
+are immutable in this foundation. Deferred reverse checks also run when the
+claim, either reservation, or session row changes, so a later direct SQL write
+cannot hide the fence identity or remove, release, or detach the blocker while
+leaving the successful fence committed.
+The reverse checker uses a session-keyed partial index over successful V2
+fences, so claim, reservation, and session mutations do not scan unrelated
+retired operation history.
+Blocked or pre-dispatch-cancelled fences do not materialize that blocker. Thus
+even an old or direct SQL writer that remains subject to the schema triggers
+cannot commit or retain the successful fence without the complete successor
+blocker.
+The migration fails with SQLSTATE `55000` if a legacy version 2 fence has
+already left `prepared`, because later readback cannot manufacture the missing
+pre-dispatch provenance. The permanent rows then survive process loss and
+restart.
 
 These constraints are necessary but not sufficient authority. The typed
 restore-generation layer now retains the backend's exact
@@ -2810,6 +2930,14 @@ force-fence dispatch from `ATTACHED` or `BLOCKED`, single uint64 epoch
 advancement per dispatch, dedicated force-fence proof binding, manual-backend
 rejection, typed ambiguous/unavailable finalization to `BLOCKED`, retained
 tuple/target/epoch state, and explicit `BLOCKED -> FENCING` recovery.
+Force-fence-to-atomic-capture validation covers V2 request and three-way
+operation-ID separation, preclaim before provider dispatch, crossed-session
+claim rollback, synthetic exact-proof binding, same-transaction committed
+fence plus prepared capture materialization, restart readback, exact replay,
+successor rejection while `DETACHED`, ambiguous-to-`BLOCKED` retention without
+capture materialization, legacy V1 behavior, and deferred commit rejection when
+the terminal blocker relation is incomplete. The synthetic fence proof tests
+durable ordering only; it is not evidence for a real stale-writer fence.
 Image tests cover exact bytes, pre-allocation resource limits, descriptor and
 config identity, measurement drift, and one-use capability semantics. A
 separate GitHub Actions job runs the ordered migration chain,

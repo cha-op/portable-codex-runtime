@@ -69,6 +69,7 @@ const MIGRATION_URLS = Object.freeze([
   new URL("../../../migrations/authority/010-filesystem-image-provider-operations.sql", import.meta.url),
   new URL("../../../migrations/authority/011-filesystem-image-provider-state-v3-adoption.sql", import.meta.url),
   new URL("../../../migrations/authority/012-atomic-crash-capture-catalogue.sql", import.meta.url),
+  new URL("../../../migrations/authority/013-writer-fence-atomic-capture-handoff.sql", import.meta.url),
 ]);
 const LIFECYCLE_PHYSICAL_METHODS = Object.freeze([
   "captureCheckpoint",

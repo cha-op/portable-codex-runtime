@@ -322,12 +322,28 @@
   source-free committed verification; `unknown` remains blocking. No raw facet
   accessor is exported: launcher holders receive only the safe two-method
   composition and cannot forge retirement with a structural result.
-- [pending] Extend beyond that evidence and the clean/manual-fencing production
-  boundary only in separately scoped work: host, controller, and drive cache-
-  loss evidence, the physical-fence branch and public crash-prefix recovery
-  wiring, automatic stale-writer fencing, repair-gated restore and higher-epoch
-  launch, differential export/compression, content-addressed distribution,
-  encryption, retention and periodic snapshots, registry publisher/signature
-  trust, and remote image transport.
+- [done] Added the durable physical-fence-to-atomic-capture authority
+  foundation. Force-fence V2 preclaims the independent capture operation before
+  external dispatch, then atomically commits exact physical-fence proof and
+  materializes the predetermined prepared capture as the active session
+  blocker. Exact replay and restart readback preserve that blocker; this slice
+  intentionally provides no capture dispatch or release path.
+- [pending] Add a concrete automatic stale-writer fence provider and compose
+  its authentic proof into force-fence V2 without treating lease expiry,
+  database epoch advancement, or logical lifecycle state as physical evidence.
+- [pending] Dispatch and reconcile the exact prepared physical-fence-bound
+  atomic capture through a concrete provider, commit the artifact, and release
+  the durable blocker only from exact committed evidence. Keep current ext4
+  manual-fencing capabilities and public deployment unchanged until that path
+  is complete.
+- [pending] Add crash-prefix tail repair only on a separate writable
+  generation, repair-gated restore/public recovery wiring, and subsequent
+  writer admission under a strictly higher epoch and new lease.
+- [pending] Add separately scoped host, controller, and drive cache-loss
+  evidence. The current stopped-writer LVM and external-QEMU-SIGKILL harnesses
+  do not provide it.
+- [pending] Add differential export/compression, content-addressed
+  distribution, encryption, retention and periodic snapshots, registry
+  publisher/signature trust, and remote image transport.
 - [deferred] Add a read-only Git Summary for user context; it is not part of
   snapshot correctness or recovery.
