@@ -37,6 +37,10 @@ superseded_by:
 - Migration 013 enforces the reverse relation at commit time: a successful V2
   fence must retain the exact prepared capture operation and reservation,
   released fence reservation, and matching `DETACHED` session pointers.
+- The V2 fence identity and terminal row and the prepared capture operation are
+  immutable in this foundation. Claim, reservation, and session mutations each
+  schedule the same deferred reverse check, preventing later direct SQL
+  removal or detachment of the blocker while the successful fence remains.
 - The canonical lifecycle is `DETACHED` after the old attachment is physically
   fenced, but successor admission remains blocked by the active prepared
   capture across process loss, acknowledgement loss, and restart.
@@ -78,6 +82,12 @@ superseded_by:
   suite passed 24/24.
 - `git diff --check` passed for the related implementation, integration, test,
   and documentation changes, and project-journal validation passed.
+- Fresh-context local Codex review found that the original reverse constraint
+  could be bypassed by later direct SQL identity or relation changes. The fix
+  makes the V2 fence terminal and capture blocker immutable and schedules the
+  same deferred session-scoped check from operation, registry, reservation,
+  and session mutations; real-PostgreSQL coverage now exercises each tamper
+  class.
 - The full Node.js 24.18.0 suite passed with the unchanged
   `chatgptAuthTokens refreshes after 401 without writing auth.json` case
   excluded through `--test-skip-pattern`. That case independently reproduced

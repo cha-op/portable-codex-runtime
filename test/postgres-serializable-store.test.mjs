@@ -4180,6 +4180,28 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     /operation_claims_writer_fence_atomic_capture_terminal_blocker/u,
   );
   assert.match(
+    physicalFenceMigration.sql,
+    /operation_claims_writer_fence_v2_immutable/u,
+  );
+  assert.match(
+    physicalFenceMigration.sql,
+    /operation_claims_atomic_crash_capture_immutable/u,
+  );
+  for (const relation of [
+    "operation_claims",
+    "operation_id_registry",
+    "reservations",
+    "sessions",
+  ]) {
+    assert.match(
+      physicalFenceMigration.sql,
+      new RegExp(
+        `AFTER INSERT OR UPDATE OR DELETE ON session_authority\\.${relation}`,
+        "u",
+      ),
+    );
+  }
+  assert.match(
     migrations[1].sql,
     /state IN \('authorized', 'committed'\)/u,
   );

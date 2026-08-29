@@ -11908,6 +11908,109 @@ test(
         assert.deepEqual(replayed.session, handedOff.session);
         assert.equal(syntheticFenceProofCount, 1);
 
+        await assert.rejects(
+          pool.query(
+            [
+              "UPDATE session_authority.operation_claims",
+              "SET kind = 'writer-force-fence-bypass'",
+              "WHERE operation_id = $1",
+            ].join(" "),
+            [handoff.input.operationId],
+          ),
+          (error) => {
+            assert.equal(error.code, "55000");
+            assert.equal(
+              error.constraint,
+              "operation_claims_writer_fence_v2_immutable",
+            );
+            return true;
+          },
+        );
+        await assert.rejects(
+          pool.query(
+            [
+              "UPDATE session_authority.operation_claims",
+              "SET kind = 'atomic-crash-capture-bypass'",
+              "WHERE operation_id = $1",
+            ].join(" "),
+            [handoff.atomicCaptureOperationId],
+          ),
+          (error) => {
+            assert.equal(error.code, "55000");
+            assert.equal(
+              error.constraint,
+              "operation_claims_atomic_crash_capture_immutable",
+            );
+            return true;
+          },
+        );
+
+        const assertDeferredBlockerTamperRejected = async (
+          query,
+          parameters,
+        ) => {
+          const client = await pool.connect();
+          let transactionOpen = false;
+          try {
+            await client.query("BEGIN");
+            transactionOpen = true;
+            const changed = await client.query(query, parameters);
+            assert.equal(changed.rowCount, 1);
+            await assert.rejects(client.query("COMMIT"), (error) => {
+              assert.equal(error.code, "23514");
+              assert.equal(
+                error.constraint,
+                "operation_claims_writer_fence_atomic_capture_terminal_blocker",
+              );
+              return true;
+            });
+            await client.query("ROLLBACK");
+            transactionOpen = false;
+          } finally {
+            if (transactionOpen) {
+              await client.query("ROLLBACK");
+            }
+            client.release();
+          }
+        };
+        await assertDeferredBlockerTamperRejected(
+          [
+            "UPDATE session_authority.reservations",
+            "SET state = 'released',",
+            "updated_at = pg_catalog.transaction_timestamp(),",
+            "released_at = pg_catalog.transaction_timestamp()",
+            "WHERE operation_id = $1",
+          ].join(" "),
+          [handoff.atomicCaptureOperationId],
+        );
+        await assertDeferredBlockerTamperRejected(
+          [
+            "UPDATE session_authority.sessions",
+            "SET revision = revision + 1,",
+            "document = pg_catalog.jsonb_set(",
+            "document, '{activeOperation}', 'null'::pg_catalog.jsonb",
+            "), updated_at = pg_catalog.transaction_timestamp()",
+            "WHERE session_id = $1",
+          ].join(" "),
+          [sessionId],
+        );
+        await assertDeferredBlockerTamperRejected(
+          [
+            "UPDATE session_authority.operation_id_registry",
+            "SET binding = pg_catalog.jsonb_build_object(",
+            "'operationId', operation_id, 'request', '{}'::pg_catalog.jsonb",
+            ") WHERE operation_id = $1",
+          ].join(" "),
+          [handoff.atomicCaptureOperationId],
+        );
+
+        assert.deepEqual(
+          await restarted.reconcileWriterForceFenceAtomicCaptureHandoff(
+            structuredClone(handoff.input),
+          ),
+          readBack,
+        );
+
         const successorExpected = structuredClone(handedOff.session);
         successorExpected.document.activeOperation = null;
         const successorInput = writerAttachmentInput(successorExpected);

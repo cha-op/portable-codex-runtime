@@ -1176,9 +1176,15 @@ whose request differs from the preclaim. A deferred commit-time constraint on
 every successful V2 fence additionally requires the exact capture operation
 and reservation to remain prepared, the fence reservation to be released, and
 the `DETACHED` session's terminal and active pointers to bind those same rows.
+The V2 fence identity and terminal record and the prepared atomic-capture row
+are immutable in this foundation. Deferred reverse checks also run when the
+claim, either reservation, or session row changes, so a later direct SQL write
+cannot hide the fence identity or remove, release, or detach the blocker while
+leaving the successful fence committed.
 Blocked or pre-dispatch-cancelled fences do not materialize that blocker. Thus
 even an old or direct SQL writer that remains subject to the schema triggers
-cannot commit the successful fence without the complete successor blocker.
+cannot commit or retain the successful fence without the complete successor
+blocker.
 The migration fails with SQLSTATE `55000` if a legacy version 2 fence has
 already left `prepared`, because later readback cannot manufacture the missing
 pre-dispatch provenance. The permanent rows then survive process loss and

@@ -367,8 +367,12 @@ transaction it:
 Migration 013 also checks this reverse relation at commit time: a successful
 V2 fence cannot commit unless the exact prepared capture operation and
 reservation, released fence reservation, and `DETACHED` session terminal and
-active pointers all agree. Blocked or pre-dispatch-cancelled fences leave the
-preclaim unmaterialized and do not create a capture blocker.
+active pointers all agree. The fence identity and terminal row and the
+prepared capture row are immutable in this foundation, while deferred checks
+revalidate the relation after claim, reservation, or session changes. A direct
+SQL writer subject to these triggers therefore cannot later hide the fence or
+release or detach its blocker. Blocked or pre-dispatch-cancelled fences leave
+the preclaim unmaterialized and do not create a capture blocker.
 
 The `DETACHED` lifecycle therefore does not mean that a successor writer is
 admissible. The active prepared capture remains a database-authoritative,

@@ -99,6 +99,56 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $enforce_writer_fence_atomic_capture_id_claim$
 BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.kind = 'writer-force-fence-v1'
+      AND OLD.request #>> '{payload,contractVersion}' = '2'
+    THEN
+      RAISE EXCEPTION
+        'writer force-fence version 2 identity is immutable'
+        USING
+          ERRCODE = '55000',
+          CONSTRAINT = 'operation_claims_writer_fence_v2_immutable';
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF TG_OP = 'UPDATE'
+    AND (
+      (
+        OLD.kind = 'writer-force-fence-v1'
+        AND OLD.request #>> '{payload,contractVersion}' = '2'
+      )
+      OR
+      (
+        NEW.kind = 'writer-force-fence-v1'
+        AND NEW.request #>> '{payload,contractVersion}' = '2'
+      )
+    )
+    AND (
+      NEW.operation_id IS DISTINCT FROM OLD.operation_id
+      OR NEW.session_id IS DISTINCT FROM OLD.session_id
+      OR NEW.kind IS DISTINCT FROM OLD.kind
+      OR NEW.request IS DISTINCT FROM OLD.request
+      OR NEW.created_at IS DISTINCT FROM OLD.created_at
+      OR (
+        OLD.kind = 'writer-force-fence-v1'
+        AND OLD.request #>> '{payload,contractVersion}' = '2'
+        AND OLD.state <> 'prepared'
+        AND NEW.state = 'prepared'
+      )
+      OR (
+        OLD.kind = 'writer-force-fence-v1'
+        AND OLD.request #>> '{payload,contractVersion}' = '2'
+        AND OLD.state = 'committed'
+        AND NEW IS DISTINCT FROM OLD
+      )
+    )
+  THEN
+    RAISE EXCEPTION
+      'writer force-fence version 2 identity is immutable'
+      USING
+        ERRCODE = '55000',
+        CONSTRAINT = 'operation_claims_writer_fence_v2_immutable';
+  END IF;
   IF NEW.kind = 'writer-force-fence-v1'
     AND NEW.request #>> '{payload,contractVersion}' = '2'
     AND NEW.state <> 'prepared'
@@ -171,7 +221,7 @@ END
 $enforce_writer_fence_atomic_capture_id_claim$;
 
 CREATE TRIGGER operation_claims_enforce_writer_fence_atomic_capture_id_claim
-BEFORE INSERT OR UPDATE ON session_authority.operation_claims
+BEFORE INSERT OR UPDATE OR DELETE ON session_authority.operation_claims
 FOR EACH ROW
 EXECUTE FUNCTION session_authority.enforce_writer_fence_atomic_capture_id_claim();
 
@@ -181,6 +231,28 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $enforce_writer_fence_atomic_capture_materialization$
 BEGIN
+  IF TG_OP = 'DELETE' THEN
+    IF OLD.kind = 'atomic-crash-capture-v1' THEN
+      RAISE EXCEPTION
+        'atomic crash-capture blocker is immutable'
+        USING
+          ERRCODE = '55000',
+          CONSTRAINT = 'operation_claims_atomic_crash_capture_immutable';
+    END IF;
+    RETURN OLD;
+  END IF;
+  IF TG_OP = 'UPDATE'
+    AND (
+      OLD.kind = 'atomic-crash-capture-v1'
+      OR NEW.kind = 'atomic-crash-capture-v1'
+    )
+  THEN
+    RAISE EXCEPTION
+      'atomic crash-capture blocker is immutable'
+      USING
+        ERRCODE = '55000',
+        CONSTRAINT = 'operation_claims_atomic_crash_capture_immutable';
+  END IF;
   IF NEW.kind = 'atomic-crash-capture-v1' THEN
     IF TG_OP <> 'INSERT'
       OR NEW.state <> 'prepared'
@@ -244,117 +316,177 @@ END
 $enforce_writer_fence_atomic_capture_materialization$;
 
 CREATE TRIGGER operation_claims_enforce_writer_fence_atomic_capture_materialization
-BEFORE INSERT OR UPDATE ON session_authority.operation_claims
+BEFORE INSERT OR UPDATE OR DELETE ON session_authority.operation_claims
 FOR EACH ROW
 EXECUTE FUNCTION session_authority.enforce_writer_fence_atomic_capture_materialization();
 
+-- The protected property is the durable identity and access-policy role of
+-- the prepared capture blocker, not timestamp stability by itself. Immutable
+-- fence/capture rows preserve the proof and blocker identities. The reverse
+-- check below joins those identities and canonical bindings to the prepared
+-- operation/reservation, released fence reservation, and exact session
+-- pointers. Their shared timestamp proves only the intended same-transaction
+-- handoff after those stronger signals agree.
 CREATE FUNCTION session_authority.enforce_writer_fence_atomic_capture_terminal_blocker()
 RETURNS trigger
 LANGUAGE plpgsql
 SET search_path = pg_catalog
 AS $enforce_writer_fence_atomic_capture_terminal_blocker$
+DECLARE
+  affected_session_id uuid;
+  old_session_id uuid;
+  new_session_id uuid;
 BEGIN
-  IF NEW.kind = 'writer-force-fence-v1'
-    AND NEW.request #>> '{payload,contractVersion}' = '2'
-    AND NEW.state = 'committed'
-    AND NEW.result #>> '{outcome}' = 'writer-fenced'
-    AND NOT EXISTS (
-      SELECT 1
-      FROM session_authority.operation_id_registry AS registry
-      JOIN session_authority.operation_claims AS capture
-        ON capture.operation_id = registry.operation_id
-       AND capture.session_id = registry.session_id
-      JOIN session_authority.reservations AS capture_reservation
-        ON capture_reservation.operation_id = capture.operation_id
-       AND capture_reservation.session_id = capture.session_id
-      JOIN session_authority.reservations AS fence_reservation
-        ON fence_reservation.operation_id = NEW.operation_id
-       AND fence_reservation.session_id = NEW.session_id
-      JOIN session_authority.sessions AS session
-        ON session.session_id = NEW.session_id
-      WHERE registry.operation_id =
-          NEW.request #>> '{payload,atomicCapture,operationId}'
-        AND registry.session_id = NEW.session_id
-        AND registry.claim_type =
-          'writer-fence-atomic-capture-intent-v2'
-        AND registry.claimant_operation_id = NEW.operation_id
-        AND registry.binding = NEW.request #> '{payload,atomicCapture}'
-        AND registry.materialized_at = NEW.updated_at
-        AND capture.kind = 'atomic-crash-capture-v1'
-        AND capture.request #> '{payload}' = registry.binding
-        AND capture.state = 'prepared'
-        AND capture.revision = 0
-        AND capture.result IS NULL
-        AND capture.retired_at IS NULL
-        AND capture.created_at = NEW.updated_at
-        AND capture.updated_at = NEW.updated_at
-        AND capture_reservation.kind = capture.kind
-        AND capture_reservation.state = 'prepared'
-        AND capture_reservation.released_at IS NULL
-        AND capture_reservation.created_at = NEW.updated_at
-        AND capture_reservation.updated_at = NEW.updated_at
-        AND capture_reservation.expected_session_revision::pg_catalog.text =
-          capture.request #>> '{expectedSession,revision}'
-        AND capture_reservation.payload #>> '{conflictClass}' =
-          session.document #>> '{activeOperation,conflictClass}'
-        AND capture_reservation.payload #>> '{requestSha256}' =
-          session.document #>> '{activeOperation,requestSha256}'
-        AND fence_reservation.state = 'released'
-        AND fence_reservation.released_at = NEW.updated_at
-        AND fence_reservation.updated_at = NEW.updated_at
-        AND session.document #>> '{lifecycle}' = 'DETACHED'
-        AND session.document #> '{lease}' = 'null'::pg_catalog.jsonb
-        AND session.document #> '{attachment}' = 'null'::pg_catalog.jsonb
-        AND session.document #> '{launch}' = 'null'::pg_catalog.jsonb
-        AND session.document #>> '{activeOperation,operationId}' =
-          capture.operation_id
-        AND session.document #>> '{activeOperation,reservationId}' =
-          capture_reservation.reservation_id
-        AND session.document #>> '{activeOperation,kind}' = capture.kind
-        AND session.document #>> '{activeOperation,state}' = capture.state
-        AND session.document #>>
-          '{activeOperation,operationRevision}' = capture.revision::pg_catalog.text
-        AND session.document #>>
-          '{activeOperation,expectedSessionRevision}' =
-            capture.request #>> '{expectedSession,revision}'
-        AND session.document #> '{lastOperation}' =
-          capture.request #> '{expectedSession,document,lastOperation}'
-        AND session.document #>> '{lastOperation,operationId}' =
-          NEW.operation_id
-        AND session.document #>> '{lastOperation,reservationId}' =
-          fence_reservation.reservation_id
-        AND session.document #>> '{lastOperation,kind}' = NEW.kind
-        AND session.document #>> '{lastOperation,state}' = NEW.state
-        AND session.document #>> '{lastOperation,operationRevision}' =
-          NEW.revision::pg_catalog.text
-        AND session.document #>> '{lastOperation,requestSha256}' =
-          fence_reservation.payload #>> '{requestSha256}'
-        AND (
-          session.document ||
-            pg_catalog.jsonb_build_object('activeOperation', 'null'::pg_catalog.jsonb)
-        ) = capture.request #> '{expectedSession,document}'
-        AND session.revision =
-          (capture.request #>> '{expectedSession,revision}')::pg_catalog.bigint + 1
-        AND session.created_at =
-          (capture.request #>> '{expectedSession,createdAt}')::pg_catalog.timestamptz
-        AND session.updated_at = NEW.updated_at
-        AND (
-          capture.request #>> '{expectedSession,updatedAt}'
-        )::pg_catalog.timestamptz = NEW.updated_at
-    )
-  THEN
-    RAISE EXCEPTION
-      'committed writer fence requires one exact prepared atomic capture blocker'
-      USING
-        ERRCODE = '23514',
-        CONSTRAINT = 'operation_claims_writer_fence_atomic_capture_terminal_blocker';
+  IF TG_OP <> 'INSERT' THEN
+    old_session_id := OLD.session_id;
   END IF;
+  IF TG_OP <> 'DELETE' THEN
+    new_session_id := NEW.session_id;
+  END IF;
+
+  FOR affected_session_id IN
+    SELECT candidate.session_id
+    FROM (
+      SELECT old_session_id AS session_id
+      UNION
+      SELECT new_session_id AS session_id
+    ) AS candidate
+    WHERE candidate.session_id IS NOT NULL
+  LOOP
+    IF EXISTS (
+      SELECT 1
+      FROM session_authority.operation_claims AS fence
+      WHERE fence.session_id = affected_session_id
+        AND fence.kind = 'writer-force-fence-v1'
+        AND fence.request #>> '{payload,contractVersion}' = '2'
+        AND fence.state = 'committed'
+        AND fence.result #>> '{outcome}' = 'writer-fenced'
+        AND NOT EXISTS (
+          SELECT 1
+          FROM session_authority.operation_id_registry AS registry
+          JOIN session_authority.operation_claims AS capture
+            ON capture.operation_id = registry.operation_id
+           AND capture.session_id = registry.session_id
+          JOIN session_authority.reservations AS capture_reservation
+            ON capture_reservation.operation_id = capture.operation_id
+           AND capture_reservation.session_id = capture.session_id
+          JOIN session_authority.reservations AS fence_reservation
+            ON fence_reservation.operation_id = fence.operation_id
+           AND fence_reservation.session_id = fence.session_id
+          JOIN session_authority.sessions AS session
+            ON session.session_id = fence.session_id
+          WHERE registry.operation_id =
+              fence.request #>> '{payload,atomicCapture,operationId}'
+            AND registry.session_id = fence.session_id
+            AND registry.claim_type =
+              'writer-fence-atomic-capture-intent-v2'
+            AND registry.claimant_operation_id = fence.operation_id
+            AND registry.binding = fence.request #> '{payload,atomicCapture}'
+            AND registry.materialized_at = fence.updated_at
+            AND capture.kind = 'atomic-crash-capture-v1'
+            AND capture.request #> '{payload}' = registry.binding
+            AND capture.state = 'prepared'
+            AND capture.revision = 0
+            AND capture.result IS NULL
+            AND capture.retired_at IS NULL
+            AND capture.created_at = fence.updated_at
+            AND capture.updated_at = fence.updated_at
+            AND capture_reservation.kind = capture.kind
+            AND capture_reservation.state = 'prepared'
+            AND capture_reservation.released_at IS NULL
+            AND capture_reservation.created_at = fence.updated_at
+            AND capture_reservation.updated_at = fence.updated_at
+            AND capture_reservation.expected_session_revision::pg_catalog.text =
+              capture.request #>> '{expectedSession,revision}'
+            AND capture_reservation.payload #>> '{conflictClass}' =
+              session.document #>> '{activeOperation,conflictClass}'
+            AND capture_reservation.payload #>> '{requestSha256}' =
+              session.document #>> '{activeOperation,requestSha256}'
+            AND fence_reservation.kind = fence.kind
+            AND fence_reservation.expected_session_revision::pg_catalog.text =
+              fence.request #>> '{expectedSession,revision}'
+            AND fence_reservation.state = 'released'
+            AND fence_reservation.released_at = fence.updated_at
+            AND fence_reservation.updated_at = fence.updated_at
+            AND session.document #>> '{lifecycle}' = 'DETACHED'
+            AND session.document #> '{lease}' = 'null'::pg_catalog.jsonb
+            AND session.document #> '{attachment}' = 'null'::pg_catalog.jsonb
+            AND session.document #> '{launch}' = 'null'::pg_catalog.jsonb
+            AND session.document #>> '{activeOperation,operationId}' =
+              capture.operation_id
+            AND session.document #>> '{activeOperation,reservationId}' =
+              capture_reservation.reservation_id
+            AND session.document #>> '{activeOperation,kind}' = capture.kind
+            AND session.document #>> '{activeOperation,state}' = capture.state
+            AND session.document #>>
+              '{activeOperation,operationRevision}' =
+                capture.revision::pg_catalog.text
+            AND session.document #>>
+              '{activeOperation,expectedSessionRevision}' =
+                capture.request #>> '{expectedSession,revision}'
+            AND session.document #> '{lastOperation}' =
+              capture.request #> '{expectedSession,document,lastOperation}'
+            AND session.document #>> '{lastOperation,operationId}' =
+              fence.operation_id
+            AND session.document #>> '{lastOperation,reservationId}' =
+              fence_reservation.reservation_id
+            AND session.document #>> '{lastOperation,kind}' = fence.kind
+            AND session.document #>> '{lastOperation,state}' = fence.state
+            AND session.document #>> '{lastOperation,operationRevision}' =
+              fence.revision::pg_catalog.text
+            AND session.document #>> '{lastOperation,requestSha256}' =
+              fence_reservation.payload #>> '{requestSha256}'
+            AND (
+              session.document ||
+                pg_catalog.jsonb_build_object(
+                  'activeOperation',
+                  'null'::pg_catalog.jsonb
+                )
+            ) = capture.request #> '{expectedSession,document}'
+            AND session.revision =
+              (capture.request #>>
+                '{expectedSession,revision}')::pg_catalog.bigint + 1
+            AND session.created_at =
+              (capture.request #>>
+                '{expectedSession,createdAt}')::pg_catalog.timestamptz
+            AND session.updated_at = fence.updated_at
+            AND (
+              capture.request #>> '{expectedSession,updatedAt}'
+            )::pg_catalog.timestamptz = fence.updated_at
+        )
+    )
+    THEN
+      RAISE EXCEPTION
+        'committed writer fence requires one exact prepared atomic capture blocker'
+        USING
+          ERRCODE = '23514',
+          CONSTRAINT = 'operation_claims_writer_fence_atomic_capture_terminal_blocker';
+    END IF;
+  END LOOP;
   RETURN NULL;
 END
 $enforce_writer_fence_atomic_capture_terminal_blocker$;
 
 CREATE CONSTRAINT TRIGGER operation_claims_writer_fence_atomic_capture_terminal_blocker
-AFTER INSERT OR UPDATE ON session_authority.operation_claims
+AFTER INSERT OR UPDATE OR DELETE ON session_authority.operation_claims
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION session_authority.enforce_writer_fence_atomic_capture_terminal_blocker();
+
+CREATE CONSTRAINT TRIGGER operation_registry_writer_fence_capture_terminal_blocker
+AFTER INSERT OR UPDATE OR DELETE ON session_authority.operation_id_registry
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION session_authority.enforce_writer_fence_atomic_capture_terminal_blocker();
+
+CREATE CONSTRAINT TRIGGER reservations_writer_fence_capture_terminal_blocker
+AFTER INSERT OR UPDATE OR DELETE ON session_authority.reservations
+DEFERRABLE INITIALLY DEFERRED
+FOR EACH ROW
+EXECUTE FUNCTION session_authority.enforce_writer_fence_atomic_capture_terminal_blocker();
+
+CREATE CONSTRAINT TRIGGER sessions_writer_fence_capture_terminal_blocker
+AFTER INSERT OR UPDATE OR DELETE ON session_authority.sessions
 DEFERRABLE INITIALLY DEFERRED
 FOR EACH ROW
 EXECUTE FUNCTION session_authority.enforce_writer_fence_atomic_capture_terminal_blocker();
