@@ -6,8 +6,10 @@ This document defines the dormant, provider-neutral version 1 extension for
 capturing one `crash-prefix` checkpoint at an atomic storage boundary. The
 extension gives a future authority a closed request, result, and committed
 verification vocabulary. A separate durable PostgreSQL catalogue and classic
-LVM snapshot provider now implement that private boundary, but no currently
-assembled runtime or public deployment can take the checkpoint.
+LVM snapshot provider implement that private boundary. The session authority
+also has a durable force-fence-to-capture handoff foundation, but it stops at a
+prepared capture blocker: no currently assembled runtime or public deployment
+can take the checkpoint through that branch.
 
 The extension is separate from the base storage backend contract. A backend
 opts in through `captureAtomicCrashCheckpoint()` and
@@ -340,29 +342,88 @@ Exact `runCapture` or `reconcileCapture` response-loss retries return that same
 result without another stop, catalogue claim, authority consume, or snapshot;
 reuse of the capture-attempt ID with different request content remains closed.
 
+## Durable Physical-Fence Handoff Foundation
+
+Writer force-fence request version 2 adds one complete
+`atomicCapture: { operationId, request }` intent for an
+`atomic-crash-capture-v1` operation. The
+`writer-fence-atomic-capture-intent-v2` claim permanently preclaims that
+capture operation ID before force-fence dispatch. It binds the exact session
+and immutable atomic request independently of the force-fence operation ID, so
+another operation kind, session, request, or capture attempt cannot adopt the
+identity after an external fence effect.
+
+`finalizeWriterForceFenceAtomicCaptureHandoff()` accepts only the exact trusted
+provider result for the dispatched version 2 request. In one serializable
+transaction it:
+
+1. validates the opaque physical-fence proof against the revoked attachment,
+   lease, holder, old epoch, target, storage, and force-fence operation;
+2. commits the force-fence operation and enters `DETACHED`;
+3. materializes the preclaimed atomic-capture operation and its exact request
+   in `prepared`; and
+4. makes that capture operation the session's active reservation.
+
+Migration 013 also checks this reverse relation at commit time: a successful
+V2 fence cannot commit unless the exact prepared capture operation and
+reservation, released fence reservation, and `DETACHED` session terminal and
+active pointers all agree. Blocked or pre-dispatch-cancelled fences leave the
+preclaim unmaterialized and do not create a capture blocker.
+
+The `DETACHED` lifecycle therefore does not mean that a successor writer is
+admissible. The active prepared capture remains a database-authoritative,
+session-conflicting blocker across process exit, acknowledgement loss, and
+restart. Exact finalization replay and dedicated handoff readback recover only
+the same committed fence result plus the same prepared capture;
+`reconcileWriterForceFenceAtomicCaptureHandoff()` is that restart-safe read
+boundary. Neither path invokes a fence provider nor creates, replaces,
+dispatches, or retires a capture.
+
+This foundation keeps physical exclusion evidence separate from logical
+ordering. A database epoch advance, lease expiry, `FENCING`, `BLOCKED`, or
+`DETACHED` state is not an authentic physical-fence proof. Only the exact
+provider result accepted by the force-fence finalizer may materialize the
+handoff. Conversely, that proof does not prove that an atomic snapshot exists:
+the separately prepared capture must still be dispatched through a concrete
+provider and committed before any later repair or writer admission.
+
+This slice deliberately exposes no release path for the prepared blocker. It
+does not dispatch the LVM provider, reconcile a snapshot, repair a tail,
+restore a writable generation, or admit a higher-epoch writer. Until those
+later transitions exist, an exact committed handoff remains fail-closed and
+the session stays blocked from successor admission.
+
 ## Deliberate Non-Capabilities
 
-This private complete-stop composition still does not provide or select:
+The complete-stop composition and durable physical-fence handoff foundation
+still do not provide or select:
 
-- physical stale-writer fencing or fence verification; it accepts only a
-  conclusively joined complete stop for the current same-process writer;
+- a concrete automatic stale-writer fence provider or real provider evidence;
+  version 2 authenticates a proof returned by a separately trusted provider,
+  while the complete-stop path accepts only its conclusively joined local
+  writer stop;
+- dispatch or reconciliation of the prepared physical-fence-bound capture, or
+  release of that durable blocker;
 - integration with the current clean checkpoint path, lifecycle facade,
   ext4 capability discovery, or public deployment;
 - crash-prefix tail repair;
 - restore or publication of a writable restore destination; or
 - admission of a new writer lease or fencing epoch.
 
-The private composition closes only the local complete-stop branch. A future
-production recovery path must add the separate physical-fence branch required
-for stale-writer takeover and preserve the remaining ordering below. Cloud,
-filesystem-native, thin-LVM, and other snapshot adapters also remain separate
-work.
+The private composition closes only the local complete-stop branch. The
+durable version 2 handoff closes the restart-safe authority gap between an
+authenticated physical fence and a prepared atomic capture, but it does not
+perform either external effect. A future production recovery path must connect
+a real fence provider and atomic provider to that authority before stale-writer
+takeover is possible. Cloud, filesystem-native, thin-LVM, and other snapshot
+adapters also remain separate work.
 
 ## Required Future Ordering
 
 A production crash-prefix path must preserve this safety order. A conclusively
 joined complete writer boundary may satisfy the first step for a local stopped
-capture; automatic stale-writer takeover requires the physical-fence branch:
+capture; automatic stale-writer takeover must finish the provider composition
+around the durable physical-fence handoff:
 
 1. establish and authenticate either complete writer stop or a physical fence
    for the old writer;

@@ -17,7 +17,10 @@ import {
   PostgresSerializableStoreError,
 } from "../src/postgres-serializable-store.mjs";
 import {
+  ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
   CHECKPOINT_CAPTURE_OPERATION_KIND,
+  assertWriterForceFenceAtomicCaptureHandoffProof,
+  createWriterForceFenceAtomicCaptureOperationRequest,
   createCheckpointCaptureOperationRequest,
   createRestoreAttachmentActivationOperationRequest,
   createRestoreAttachmentActivationOperationRequestV2,
@@ -1504,6 +1507,98 @@ function writerForceFenceOptions(fixture, overrides = {}) {
   };
 }
 
+function atomicCrashCaptureRequestForFence(
+  expectedSession,
+  {
+    artifactId = "atomic-crash-artifact-001",
+    captureAttemptId = "atomic-crash-attempt-001",
+    checkpointId = "atomic-crash-checkpoint-001",
+    mutationOperationId = "atomic-crash-provider-operation-001",
+  } = {},
+) {
+  const document = expectedSession.document;
+  const sourceAttachment = document.attachment;
+  assert.notEqual(sourceAttachment, null);
+  return {
+    captureAttemptId,
+    checkpoint: {
+      artifactId,
+      backendId: document.storageRef.backendId,
+      checkpointClass: "crash-prefix",
+      checkpointId,
+      codexSessionId: document.manifest.codex.sessionId,
+      codexThreadId: document.manifest.codex.rootThreadId,
+      contractVersion: 1,
+      createdAt: WRITER_FINALIZE_NOW,
+      imageDigest: document.manifest.runtime.imageDigest,
+      sessionId: expectedSession.sessionId,
+      sourceFencingEpoch: sourceAttachment.fencingEpoch,
+      storageId: document.storageRef.storageId,
+    },
+    contractVersion: 1,
+    mutationRequest: {
+      backendId: document.storageRef.backendId,
+      contractVersion: 1,
+      fencingEpoch: sourceAttachment.fencingEpoch,
+      holderId: sourceAttachment.holderId,
+      leaseId: sourceAttachment.leaseId,
+      operation: "checkpoint",
+      operationId: mutationOperationId,
+      sessionId: expectedSession.sessionId,
+      storageId: document.storageRef.storageId,
+      target: {
+        artifactId,
+        checkpointId,
+        kind: "checkpoint",
+      },
+    },
+    sourceAttachment: structuredClone(sourceAttachment),
+    storageRef: structuredClone(document.storageRef),
+  };
+}
+
+function writerForceFenceAtomicCaptureOptions(
+  fixture,
+  {
+    atomicCaptureOperationId = "atomic-crash-session-operation-001",
+    atomicRequest = atomicCrashCaptureRequestForFence(
+      fixture.expectedSession,
+    ),
+    fenceOperationId = OTHER_OPERATION_ID,
+  } = {},
+) {
+  return {
+    expectedSession: fixture.expectedSession,
+    operationId: fenceOperationId,
+    kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+    request: createWriterForceFenceAtomicCaptureOperationRequest({
+      atomicCaptureOperationId,
+      atomicRequest,
+      expectedSession: fixture.expectedSession,
+      fenceOperationId,
+    }),
+  };
+}
+
+function writerFenceAtomicCaptureIdClaimRow(
+  options,
+  {
+    claimedAt = WRITER_DISPATCH_NOW,
+    materializedAt = null,
+  } = {},
+) {
+  return {
+    binding: structuredClone(options.request.atomicCapture),
+    claim_type: "writer-fence-atomic-capture-intent-v2",
+    claimant_operation_id: options.operationId,
+    claimed_at: new Date(claimedAt),
+    materialized_at:
+      materializedAt === null ? null : new Date(materializedAt),
+    operation_id: options.request.atomicCapture.operationId,
+    session_id: options.expectedSession.sessionId,
+  };
+}
+
 function writerReleaseMutationRequest(options) {
   const lease = options.expectedSession.document.lease;
   return {
@@ -1697,6 +1792,78 @@ function writerDetachedSessionRow({
   });
 }
 
+function writerForceFenceAtomicCaptureHandoffFixture(options) {
+  const writerEpoch = (
+    BigInt(options.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const fenceResult = writerForceFenceProof(options, writerEpoch);
+  const result = writerForceFenceResult(options, writerEpoch, fenceResult);
+  const fenceOperation = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options,
+    result,
+    revision: "2",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const fenceReservation = reservationRow("released", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const terminalSessionRow = writerDetachedSessionRow({
+    operationRevision: "2",
+    options,
+    result,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const terminalSession = snapshotFromSessionRow(terminalSessionRow);
+  const captureOptions = {
+    expectedSession: terminalSession,
+    kind: ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
+    operationId: options.request.atomicCapture.operationId,
+    request: structuredClone(options.request.atomicCapture),
+  };
+  const captureOperation = operationRow("prepared", {
+    options: captureOptions,
+    createdAt: WRITER_FINALIZE_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const captureReservation = reservationRow("prepared", {
+    options: captureOptions,
+    createdAt: WRITER_FINALIZE_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const captureSessionRow = sessionRow({
+    sessionId: terminalSession.sessionId,
+    revision: (BigInt(terminalSession.revision) + 1n).toString(),
+    sessionDocument: document(terminalSession.sessionId, {
+      ...structuredClone(terminalSession.document),
+      activeOperation: activeOperation("prepared", {
+        options: captureOptions,
+      }),
+    }),
+    createdAt: terminalSession.createdAt,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  return {
+    captureOperation,
+    captureOptions,
+    captureReservation,
+    captureSessionRow,
+    fenceOperation,
+    fenceReservation,
+    fenceResult,
+    materializedClaim: writerFenceAtomicCaptureIdClaimRow(options, {
+      materializedAt: WRITER_FINALIZE_NOW,
+    }),
+    result,
+    terminalSession,
+    terminalSessionRow,
+    writerEpoch,
+  };
+}
+
 function writerBlockedResult({
   options,
   lease,
@@ -1770,6 +1937,50 @@ function activeWriterSteps({
     rows(operationRow(state, { createdAt, options, updatedAt })),
     rows(reservationRow(state, { createdAt, options, updatedAt })),
     ...priorWriterTerminalSteps(fixture),
+  ];
+}
+
+function writerForceFenceAtomicActiveSteps({
+  createdAt = WRITER_PREPARED_NOW,
+  fixture,
+  options,
+  session,
+  state,
+  updatedAt =
+    state === "prepared"
+      ? WRITER_PREPARED_NOW
+      : state === "starting"
+        ? WRITER_DISPATCH_NOW
+        : WRITER_UNCERTAIN_NOW,
+}) {
+  return [
+    rows(session),
+    rows(operationRow(state, { createdAt, options, updatedAt })),
+    rows(reservationRow(state, { createdAt, options, updatedAt })),
+    state === "prepared"
+      ? rows()
+      : rows(writerFenceAtomicCaptureIdClaimRow(options)),
+    ...priorWriterTerminalSteps(fixture),
+  ];
+}
+
+function writerForceFenceAtomicCaptureRelationSteps(handoff) {
+  return [
+    rows(handoff.captureOperation),
+    rows(handoff.captureReservation),
+    rows(handoff.materializedClaim),
+    rows(handoff.fenceOperation),
+    rows(handoff.fenceReservation),
+    rows(handoff.fenceOperation),
+    rows(handoff.fenceReservation),
+    rows(handoff.materializedClaim),
+  ];
+}
+
+function writerForceFenceAtomicCaptureActiveSteps(handoff) {
+  return [
+    rows(handoff.captureSessionRow),
+    ...writerForceFenceAtomicCaptureRelationSteps(handoff),
   ];
 }
 
@@ -5246,6 +5457,7 @@ function authorityWithScripts(...scripts) {
         true,
       restoreGenerationV2FleetCompatible: true,
       store,
+      writerForceFenceV2FleetCompatible: true,
       writerLaunchStopV3FleetCompatible: true,
     }),
     clients,
@@ -8766,6 +8978,685 @@ test("an exact force-fence proof detaches the writer and replays the same epoch 
         WRITER_FINALIZE_NOW,
       ]),
     ],
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("writer force-fence V2 freezes one exact atomic crash-capture intent and rejects crossed identities", () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+
+  assert.deepEqual(options.request, {
+    atomicCapture: {
+      operationId: "atomic-crash-session-operation-001",
+      request: atomicCrashCaptureRequestForFence(
+        fixture.expectedSession,
+      ),
+    },
+    contractVersion: 2,
+    target: {
+      attachmentId: fixture.result.attachment.attachmentId,
+      kind: "attachment",
+    },
+  });
+  assertDeepFrozen(options.request);
+
+  const invalidAtomicRequests = [];
+  const wrongAttachment = atomicCrashCaptureRequestForFence(
+    fixture.expectedSession,
+  );
+  wrongAttachment.sourceAttachment.rootPath =
+    "/var/lib/portable-codex/crossed-root";
+  invalidAtomicRequests.push(wrongAttachment);
+
+  const wrongStorage = atomicCrashCaptureRequestForFence(
+    fixture.expectedSession,
+  );
+  for (const record of [
+    wrongStorage.checkpoint,
+    wrongStorage.mutationRequest,
+    wrongStorage.sourceAttachment,
+    wrongStorage.storageRef,
+  ]) {
+    record.storageId = "crossed-volume";
+  }
+  invalidAtomicRequests.push(wrongStorage);
+
+  const wrongLeaseTuple = atomicCrashCaptureRequestForFence(
+    fixture.expectedSession,
+  );
+  wrongLeaseTuple.sourceAttachment.holderId = "crossed-holder";
+  wrongLeaseTuple.mutationRequest.holderId = "crossed-holder";
+  invalidAtomicRequests.push(wrongLeaseTuple);
+
+  for (const atomicRequest of invalidAtomicRequests) {
+    assert.throws(
+      () =>
+        createWriterForceFenceAtomicCaptureOperationRequest({
+          atomicCaptureOperationId:
+            "atomic-crash-session-operation-001",
+          atomicRequest,
+          expectedSession: fixture.expectedSession,
+          fenceOperationId: OTHER_OPERATION_ID,
+        }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+
+  for (const ids of [
+    {
+      atomicCaptureOperationId: OTHER_OPERATION_ID,
+      mutationOperationId: "atomic-crash-provider-operation-001",
+    },
+    {
+      atomicCaptureOperationId: "atomic-crash-provider-operation-001",
+      mutationOperationId: "atomic-crash-provider-operation-001",
+    },
+    {
+      atomicCaptureOperationId: "atomic-crash-session-operation-001",
+      mutationOperationId: OTHER_OPERATION_ID,
+    },
+  ]) {
+    assert.throws(
+      () =>
+        writerForceFenceAtomicCaptureOptions(fixture, {
+          atomicCaptureOperationId: ids.atomicCaptureOperationId,
+          atomicRequest: atomicCrashCaptureRequestForFence(
+            fixture.expectedSession,
+            { mutationOperationId: ids.mutationOperationId },
+          ),
+        }),
+      (error) =>
+        error instanceof PostgresSessionAuthorityError &&
+        error.code === "invalid_operation_request",
+    );
+  }
+});
+
+test("writer force-fence V2 fresh reserve is default-closed while an existing prepared replay remains readable", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const preparedSession = writerForceFencePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_PREPARED_NOW,
+  });
+  const deniedClient = new ScriptedClient([
+    rows(fixture.session),
+    rows({ operation_count: 0, reservation_count: 0 }),
+    ...priorWriterTerminalSteps(fixture),
+    rows(),
+  ]);
+  const replayClient = new ScriptedClient(
+    writerForceFenceAtomicActiveSteps({
+      fixture,
+      options,
+      session: preparedSession,
+      state: "prepared",
+    }),
+  );
+  const pool = new ScriptedPool([deniedClient, replayClient]);
+  const store = new PostgresSerializableStore({
+    dedicatedPool: pool,
+    maxTransactionAttempts: 1,
+  });
+  const authority = new PostgresSessionAuthority({ store });
+
+  await assertAuthorityError(authority.reserveOperation(options), {
+    code: "writer_force_fence_v2_fleet_capability_required",
+  });
+  const replay = await authority.reserveOperation(options);
+
+  assert.equal(replay.acquired, false);
+  assert.equal(replay.operation.state, "prepared");
+  assert.equal(
+    authorityQueries(deniedClient).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  deniedClient.assertExhausted();
+  replayClient.assertExhausted();
+});
+
+test("writer force-fence V2 cannot use the legacy DETACHED finalizer or generic capture lifecycle APIs", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const handoff = writerForceFenceAtomicCaptureHandoffFixture(options);
+  const { authority, pool } = authorityWithScripts();
+
+  await assertAuthorityError(
+    authority.finalizeWriterForceFence({
+      ...options,
+      expectedOperationRevision: "1",
+      fenceResult: handoff.fenceResult,
+    }),
+    { code: "invalid_operation_request" },
+  );
+  for (const invoke of [
+    () => authority.reserveOperation(handoff.captureOptions),
+    () => authority.reconcileOperation(handoff.captureOptions),
+    () =>
+      authority.claimOperationDispatch({
+        ...handoff.captureOptions,
+        expectedOperationRevision: "0",
+      }),
+    () =>
+      authority.markOperationUncertain({
+        ...handoff.captureOptions,
+        expectedOperationRevision: "0",
+      }),
+  ]) {
+    await assertAuthorityError(invoke(), {
+      code: "invalid_operation_request",
+    });
+  }
+  await assertAuthorityError(
+    authority.cancelPreparedOperation({
+      ...handoff.captureOptions,
+      expectedOperationRevision: "0",
+      reason: "caller-abandoned-before-dispatch",
+    }),
+    { code: "operation_transition_conflict" },
+  );
+  assert.equal(pool.connectCalls, 0);
+});
+
+test("writer force-fence V2 claim preclaims the exact capture ID before publishing dispatch", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const writerEpoch = (
+    BigInt(options.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const preparedSession = writerForceFencePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_PREPARED_NOW,
+  });
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const { authority, clients } = authorityWithScripts({
+    options: { now: WRITER_DISPATCH_NOW },
+    steps: [
+      ...writerForceFenceAtomicActiveSteps({
+        fixture,
+        options,
+        session: preparedSession,
+        state: "prepared",
+      }),
+      rows(writerFenceAtomicCaptureIdClaimRow(options)),
+      rows(
+        operationRow("starting", {
+          options,
+          createdAt: WRITER_PREPARED_NOW,
+          updatedAt: WRITER_DISPATCH_NOW,
+        }),
+      ),
+      rows(
+        reservationRow("starting", {
+          options,
+          createdAt: WRITER_PREPARED_NOW,
+          updatedAt: WRITER_DISPATCH_NOW,
+        }),
+      ),
+      rows(startingSession),
+    ],
+  });
+
+  const receipt = await authority.claimWriterForceFenceDispatch({
+    ...options,
+    expectedOperationRevision: "0",
+  });
+
+  assert.equal(receipt.dispatchGranted, true);
+  assert.equal(receipt.operation.state, "starting");
+  const queries = authorityQueries(clients[0]);
+  const claimIndex = queries.findIndex((args) =>
+    queryText(args).includes(
+      "'writer-fence-atomic-capture-intent-v2'",
+    ),
+  );
+  const startIndex = queries.findIndex(
+    (args) => queryText(args) === START_OPERATION_QUERY,
+  );
+  assert.equal(claimIndex >= 0, true);
+  assert.equal(startIndex > claimIndex, true);
+  clients[0].assertExhausted();
+});
+
+test("writer force-fence V2 reports a crossed capture ID without corrupting its prepared fence", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const preparedSession = writerForceFencePhaseSessionRow("prepared", {
+    options,
+    updatedAt: WRITER_PREPARED_NOW,
+  });
+  const crossedClaim = writerFenceAtomicCaptureIdClaimRow(options);
+  crossedClaim.claimant_operation_id = "foreign-force-fence-operation";
+  crossedClaim.session_id = OTHER_SESSION_ID;
+  const { authority, clients } = authorityWithScripts({
+    options: { now: WRITER_DISPATCH_NOW },
+    steps: [
+      rows(preparedSession),
+      rows(
+        operationRow("prepared", {
+          options,
+          createdAt: WRITER_PREPARED_NOW,
+          updatedAt: WRITER_PREPARED_NOW,
+        }),
+      ),
+      rows(
+        reservationRow("prepared", {
+          options,
+          createdAt: WRITER_PREPARED_NOW,
+          updatedAt: WRITER_PREPARED_NOW,
+        }),
+      ),
+      rows(crossedClaim),
+      ...priorWriterTerminalSteps(fixture),
+      rows(),
+    ],
+  });
+
+  await assertAuthorityError(
+    authority.claimWriterForceFenceDispatch({
+      ...options,
+      expectedOperationRevision: "0",
+    }),
+    { code: "operation_identity_conflict" },
+  );
+
+  const queries = authorityQueries(clients[0]);
+  assert.equal(
+    queries.some((args) => queryText(args) === START_OPERATION_QUERY),
+    false,
+  );
+  clients[0].assertExhausted();
+});
+
+test("writer force-fence V2 atomically commits the exact fence and installs one prepared crash-capture blocker", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const handoff = writerForceFenceAtomicCaptureHandoffFixture(options);
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch: handoff.writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_FINALIZE_NOW },
+      steps: [
+        ...writerForceFenceAtomicActiveSteps({
+          fixture,
+          options,
+          session: startingSession,
+          state: "starting",
+        }),
+        rows(handoff.materializedClaim),
+        rows(handoff.fenceOperation),
+        rows(handoff.fenceReservation),
+        rows(handoff.terminalSessionRow),
+        rows(handoff.captureOperation),
+        rows(handoff.captureReservation),
+        rows(handoff.captureSessionRow),
+      ],
+    },
+    [
+      ...writerForceFenceAtomicCaptureActiveSteps(handoff),
+      ...writerForceFenceAtomicCaptureRelationSteps(handoff),
+    ],
+    [
+      ...writerForceFenceAtomicCaptureActiveSteps(handoff),
+      rows(),
+    ],
+  );
+  const finalization = {
+    ...options,
+    expectedOperationRevision: "1",
+    fenceResult: handoff.fenceResult,
+  };
+
+  const receipt =
+    await authority.finalizeWriterForceFenceAtomicCaptureHandoff(
+      finalization,
+    );
+  const replay =
+    await authority.reconcileWriterForceFenceAtomicCaptureHandoff(
+      options,
+    );
+  await assertAuthorityError(
+    authority.reserveOperation(
+      writerAcquireOptions({
+        expectedSession: handoff.terminalSession,
+        operationId: "successor-attach-operation",
+      }),
+    ),
+    { code: "session_operation_conflict" },
+  );
+
+  assert.equal(receipt.status, "prepared");
+  assert.equal(receipt.fence.finalized, true);
+  assert.equal(replay.fence.finalized, false);
+  assert.deepEqual(replay.capture, receipt.capture);
+  assert.equal(receipt.fence.operation.state, "committed");
+  assert.equal(receipt.fence.operation.result.outcome, "writer-fenced");
+  assert.equal(receipt.capture.operation.state, "prepared");
+  assert.equal(receipt.capture.reservation.state, "prepared");
+  assert.equal(receipt.session.document.lifecycle, "DETACHED");
+  assert.equal(receipt.session.document.lease, null);
+  assert.equal(receipt.session.document.attachment, null);
+  assert.equal(
+    receipt.session.document.activeOperation.operationId,
+    options.request.atomicCapture.operationId,
+  );
+  assert.equal(
+    receipt.capture.operation.createdAt,
+    receipt.fence.operation.updatedAt,
+  );
+  assert.equal(
+    receipt.capture.reservation.createdAt,
+    receipt.fence.operation.updatedAt,
+  );
+  assert.equal(receipt.session.updatedAt, receipt.fence.operation.updatedAt);
+
+  const proof = assertWriterForceFenceAtomicCaptureHandoffProof({
+    before: options.expectedSession,
+    capture: receipt.capture,
+    fence: {
+      operation: receipt.fence.operation,
+      reservation: receipt.fence.reservation,
+    },
+    session: receipt.session,
+  });
+  assert.deepEqual(proof.capture, receipt.capture);
+  assert.equal(proof.fence.operation.operationId, options.operationId);
+  assertDeepFrozen(receipt);
+  assertDeepFrozen(replay);
+  assertDeepFrozen(proof);
+
+  const crossed = structuredClone({
+    before: options.expectedSession,
+    capture: receipt.capture,
+    fence: {
+      operation: receipt.fence.operation,
+      reservation: receipt.fence.reservation,
+    },
+    session: receipt.session,
+  });
+  crossed.capture.reservation.operationId = "crossed-capture-operation";
+  assert.throws(
+    () => assertWriterForceFenceAtomicCaptureHandoffProof(crossed),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "operation_state_invalid",
+  );
+  const wrongRevision = structuredClone({
+    before: options.expectedSession,
+    capture: receipt.capture,
+    fence: {
+      operation: receipt.fence.operation,
+      reservation: receipt.fence.reservation,
+    },
+    session: receipt.session,
+  });
+  wrongRevision.session.revision = (
+    BigInt(wrongRevision.session.revision) + 1n
+  ).toString();
+  assert.throws(
+    () => assertWriterForceFenceAtomicCaptureHandoffProof(wrongRevision),
+    (error) =>
+      error instanceof PostgresSessionAuthorityError &&
+      error.code === "operation_state_invalid",
+  );
+
+  const texts = authorityQueries(clients[0]).map(queryText);
+  const materializeIndex = texts.findIndex((text) =>
+    text.includes("writer-fence-atomic-capture-intent-v2"),
+  );
+  const fenceCommitIndex = texts.indexOf(COMMIT_ACTIVE_OPERATION_QUERY);
+  const terminalSessionIndex = texts.indexOf(UPDATE_SESSION_QUERY);
+  const captureInsertIndex = texts.findIndex(
+    (text) =>
+      text.startsWith(
+        "INSERT INTO session_authority.operation_claims",
+      ) &&
+      text.includes("writer-fence-atomic-capture-intent-v2"),
+  );
+  const captureSessionIndex = texts.lastIndexOf(UPDATE_SESSION_QUERY);
+  assert.equal(materializeIndex >= 0, true);
+  assert.equal(fenceCommitIndex > materializeIndex, true);
+  assert.equal(terminalSessionIndex > fenceCommitIndex, true);
+  assert.equal(captureInsertIndex > terminalSessionIndex, true);
+  assert.equal(captureSessionIndex > captureInsertIndex, true);
+  assert.equal(
+    texts.filter((text) => text === UPDATE_SESSION_QUERY).length,
+    2,
+  );
+  assert.equal(
+    authorityQueries(clients[2]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("writer force-fence V2 handoff acknowledgement loss reads back the same prepared capture without another fence", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const handoff = writerForceFenceAtomicCaptureHandoffFixture(options);
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch: handoff.writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: {
+        commitError: new Error("fence-capture handoff acknowledgement lost"),
+        now: WRITER_FINALIZE_NOW,
+      },
+      steps: [
+        ...writerForceFenceAtomicActiveSteps({
+          fixture,
+          options,
+          session: startingSession,
+          state: "starting",
+        }),
+        rows(handoff.materializedClaim),
+        rows(handoff.fenceOperation),
+        rows(handoff.fenceReservation),
+        rows(handoff.terminalSessionRow),
+        rows(handoff.captureOperation),
+        rows(handoff.captureReservation),
+        rows(handoff.captureSessionRow),
+      ],
+    },
+    [
+      ...writerForceFenceAtomicCaptureActiveSteps(handoff),
+      ...writerForceFenceAtomicCaptureRelationSteps(handoff),
+    ],
+  );
+
+  await assert.rejects(
+    authority.finalizeWriterForceFenceAtomicCaptureHandoff({
+      ...options,
+      expectedOperationRevision: "1",
+      fenceResult: handoff.fenceResult,
+    }),
+    assertStoreCommitUncertain,
+  );
+  const reconciled =
+    await authority.reconcileWriterForceFenceAtomicCaptureHandoff(
+      options,
+    );
+
+  assert.equal(reconciled.status, "prepared");
+  assert.equal(reconciled.fence.finalized, false);
+  assert.equal(
+    reconciled.capture.operation.operationId,
+    options.request.atomicCapture.operationId,
+  );
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  clients[0].assertExhausted({ destroyed: true });
+  clients[1].assertExhausted();
+});
+
+test("writer force-fence V2 handoff failure rolls back the transient DETACHED row and leaves the starting blocker readable", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const handoff = writerForceFenceAtomicCaptureHandoffFixture(options);
+  const startingSession = writerForceFencePhaseSessionRow("starting", {
+    options,
+    writerEpoch: handoff.writerEpoch,
+    updatedAt: WRITER_DISPATCH_NOW,
+  });
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_FINALIZE_NOW },
+      steps: [
+        ...writerForceFenceAtomicActiveSteps({
+          fixture,
+          options,
+          session: startingSession,
+          state: "starting",
+        }),
+        rows(handoff.materializedClaim),
+        rows(handoff.fenceOperation),
+        rows(handoff.fenceReservation),
+        rows(handoff.terminalSessionRow),
+        rows(),
+      ],
+    },
+    writerForceFenceAtomicActiveSteps({
+      fixture,
+      options,
+      session: startingSession,
+      state: "starting",
+    }),
+  );
+
+  await assertAuthorityError(
+    authority.finalizeWriterForceFenceAtomicCaptureHandoff({
+      ...options,
+      expectedOperationRevision: "1",
+      fenceResult: handoff.fenceResult,
+    }),
+    { code: "operation_identity_conflict" },
+  );
+  const reconciled =
+    await authority.reconcileWriterForceFenceAtomicCaptureHandoff(
+      options,
+    );
+
+  assert.equal(reconciled.status, "starting");
+  assert.equal(reconciled.operation.state, "starting");
+  assert.equal(Object.hasOwn(reconciled, "capture"), false);
+  assert.equal(queryTexts(clients[0]).includes("COMMIT"), false);
+  assert.equal(queryTexts(clients[0]).at(-2), "ROLLBACK");
+  assert.equal(
+    authorityQueries(clients[1]).some((args) =>
+      /^(?:INSERT|UPDATE) /u.test(queryText(args)),
+    ),
+    false,
+  );
+  for (const client of clients) client.assertExhausted();
+});
+
+test("writer force-fence V2 unresolved outcome commits BLOCKED with its capture claim still unmaterialized", async () => {
+  const fixture = writerAcquiredFixture();
+  const options = writerForceFenceAtomicCaptureOptions(fixture);
+  const writerEpoch = (
+    BigInt(options.expectedSession.document.writerEpoch) + 1n
+  ).toString();
+  const uncertainSession = writerForceFencePhaseSessionRow("uncertain", {
+    options,
+    writerEpoch,
+    updatedAt: WRITER_UNCERTAIN_NOW,
+  });
+  const result = writerBlockedResult({
+    attachment: fixture.result.attachment,
+    lease: fixture.lease,
+    options,
+    reason: "fence-unavailable",
+    writerEpoch,
+  });
+  const committedOperation = writerTerminalOperationRow({
+    createdAt: WRITER_PREPARED_NOW,
+    options,
+    result,
+    revision: "3",
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const releasedReservation = reservationRow("released", {
+    options,
+    createdAt: WRITER_PREPARED_NOW,
+    releasedAt: WRITER_FINALIZE_NOW,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const blockedSession = writerBlockedSessionRow({
+    options,
+    result,
+    updatedAt: WRITER_FINALIZE_NOW,
+  });
+  const reservedClaim = writerFenceAtomicCaptureIdClaimRow(options);
+  const { authority, clients } = authorityWithScripts(
+    {
+      options: { now: WRITER_FINALIZE_NOW },
+      steps: [
+        ...writerForceFenceAtomicActiveSteps({
+          fixture,
+          options,
+          session: uncertainSession,
+          state: "uncertain",
+        }),
+        rows(committedOperation),
+        rows(releasedReservation),
+        rows(blockedSession),
+      ],
+    },
+    [
+      rows(blockedSession),
+      rows({ operation_count: 0, reservation_count: 0 }),
+      rows(committedOperation),
+      rows(releasedReservation),
+      rows(reservedClaim),
+    ],
+  );
+
+  const receipt = await authority.finalizeWriterOperationBlocked({
+    ...options,
+    expectedOperationRevision: "2",
+    reason: "fence-unavailable",
+  });
+  const replay =
+    await authority.reconcileWriterForceFenceAtomicCaptureHandoff(
+      options,
+    );
+
+  assert.equal(receipt.finalized, true);
+  assert.equal(receipt.operation.result.outcome, "writer-blocked");
+  assert.equal(receipt.session.document.lifecycle, "BLOCKED");
+  assert.equal(receipt.session.document.activeOperation, null);
+  assert.equal(replay.operation.result.outcome, "writer-blocked");
+  assert.equal(reservedClaim.materialized_at, null);
+  const texts = authorityQueries(clients[0]).map(queryText);
+  assert.equal(
+    texts.some((text) => text.includes("atomic-crash-capture-v1")),
+    false,
+  );
+  assert.equal(
+    texts.some((text) => text.includes("SET materialized_at")),
+    false,
   );
   for (const client of clients) client.assertExhausted();
 });

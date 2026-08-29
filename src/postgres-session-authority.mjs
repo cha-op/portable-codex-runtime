@@ -18,6 +18,7 @@ import {
 } from "./platform-image-reservation.mjs";
 import {
   assertCheckpointDescriptor,
+  assertAtomicCrashCaptureRequest,
   assertLeaseGrant,
   assertRestoreAttachmentActivationRequest,
   assertRestoreAttachmentActivationResult,
@@ -41,6 +42,8 @@ export const WRITER_ATTACHMENT_ACQUIRE_OPERATION_KIND =
 export const WRITER_LEASE_RENEW_OPERATION_KIND = "writer-lease-renew-v1";
 export const WRITER_RELEASE_OPERATION_KIND = "writer-release-v1";
 export const WRITER_FORCE_FENCE_OPERATION_KIND = "writer-force-fence-v1";
+export const ATOMIC_CRASH_CAPTURE_OPERATION_KIND =
+  "atomic-crash-capture-v1";
 export const CHECKPOINT_CAPTURE_OPERATION_KIND = "checkpoint-capture-v1";
 export const RESTORE_DESTINATION_GENERATION_OPERATION_KIND =
   "restore-destination-generation-v1";
@@ -77,6 +80,8 @@ const OPERATION_REQUEST_VERSION = 1;
 const RESERVATION_PAYLOAD_VERSION = 1;
 const OPERATION_RESULT_VERSION = 1;
 const WRITER_OPERATION_CONTRACT_VERSION = 1;
+const WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2 = 2;
+const ATOMIC_CRASH_CAPTURE_OPERATION_CONTRACT_VERSION = 1;
 const CHECKPOINT_CAPTURE_OPERATION_CONTRACT_VERSION = 1;
 const CHECKPOINT_CAPTURE_ATTEMPT_CONTRACT_VERSION = 1;
 const CHECKPOINT_CAPTURE_BINDING_CONTRACT_VERSION = 2;
@@ -96,6 +101,8 @@ const RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE =
   "restore-activation-launch-intent-v1";
 const WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE =
   "writer-stop-capture-intent-v3";
+const WRITER_FENCE_ATOMIC_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE =
+  "writer-fence-atomic-capture-intent-v2";
 const DETACHED_RESTORE_STABLE_PLAN_OPERATION_ID_CLAIM_TYPE =
   "detached-restore-stable-plan-v1";
 const WRITER_LAUNCH_ATTEMPT_OPERATION_CONTRACT_VERSION = 1;
@@ -205,6 +212,15 @@ const WRITER_FORCE_FENCE_FINALIZATION_INPUT_KEYS = Object.freeze([
   "operationId",
   "request",
 ]);
+const WRITER_FORCE_FENCE_ATOMIC_CAPTURE_HANDOFF_PROOF_KEYS =
+  Object.freeze([
+    "before",
+    "capture",
+    "fence",
+    "session",
+  ]);
+const WRITER_FORCE_FENCE_ATOMIC_CAPTURE_HANDOFF_RELATION_KEYS =
+  Object.freeze(["operation", "reservation"]);
 const WRITER_BLOCKED_FINALIZATION_INPUT_KEYS = Object.freeze([
   "expectedOperationRevision",
   "expectedSession",
@@ -734,6 +750,15 @@ const WRITER_LIFECYCLE_REQUEST_KEYS = Object.freeze([
   "contractVersion",
   "target",
 ]);
+const WRITER_FORCE_FENCE_REQUEST_V2_KEYS = Object.freeze([
+  "atomicCapture",
+  "contractVersion",
+  "target",
+]);
+const WRITER_FENCE_ATOMIC_CAPTURE_INTENT_KEYS = Object.freeze([
+  "operationId",
+  "request",
+]);
 const OPERATION_REQUEST_KEYS = Object.freeze([
   "conflictClass",
   "expectedSession",
@@ -964,6 +989,8 @@ const ERROR_MESSAGES = Object.freeze({
     "Writer supervisor state collection is not authorized",
   writer_launch_stop_v3_fleet_capability_required:
     "Writer launch stop version 3 requires confirmed fleet compatibility",
+  writer_force_fence_v2_fleet_capability_required:
+    "Writer force-fence version 2 requires confirmed fleet compatibility",
   session_identity_conflict:
     "Session ID is already bound to a different canonical document",
   session_not_found: "Session is not registered",
@@ -1477,6 +1504,18 @@ const INSERT_WRITER_STOP_CAPTURE_ID_CLAIM_QUERY = Object.freeze({
     `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
   ].join(" "),
 });
+const INSERT_WRITER_FENCE_ATOMIC_CAPTURE_ID_CLAIM_QUERY = Object.freeze({
+  queryMode: "extended",
+  text: [
+    "INSERT INTO session_authority.operation_id_registry",
+    "(operation_id, session_id, claim_type, claimant_operation_id, binding,",
+    "claimed_at, materialized_at)",
+    `VALUES ($1, $2::uuid, '${WRITER_FENCE_ATOMIC_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}',`,
+    "$3, $4::jsonb, $5, NULL)",
+    "ON CONFLICT DO NOTHING",
+    `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
+  ].join(" "),
+});
 const INSERT_PRECLAIMED_OPERATION_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
@@ -1567,6 +1606,38 @@ const MATERIALIZE_WRITER_STOP_CAPTURE_ID_CLAIM_QUERY = Object.freeze({
     `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
   ].join(" "),
 });
+const INSERT_PRECLAIMED_WRITER_FENCE_ATOMIC_CAPTURE_QUERY =
+  Object.freeze({
+    queryMode: "extended",
+    text: [
+      "INSERT INTO session_authority.operation_claims",
+      "(operation_id, session_id, kind, request, result, state, revision,",
+      "created_at, updated_at, retired_at)",
+      "SELECT $1::character varying(128), $2::uuid, $3, $4::jsonb,",
+      "NULL, 'prepared', 0, $5, $5, NULL",
+      "FROM session_authority.operation_id_registry",
+      "WHERE operation_id = $1::character varying(128)",
+      "AND session_id = $2::uuid",
+      `AND claim_type = '${WRITER_FENCE_ATOMIC_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+      "AND claimant_operation_id = $6 AND binding = $7::jsonb",
+      "AND materialized_at = $5",
+      "ON CONFLICT (operation_id) DO NOTHING",
+      `RETURNING ${OPERATION_RETURNING_COLUMNS}`,
+    ].join(" "),
+  });
+const MATERIALIZE_WRITER_FENCE_ATOMIC_CAPTURE_ID_CLAIM_QUERY =
+  Object.freeze({
+    queryMode: "extended",
+    text: [
+      "UPDATE session_authority.operation_id_registry",
+      "SET materialized_at = $3",
+      "WHERE operation_id = $1 AND session_id = $2::uuid",
+      `AND claim_type = '${WRITER_FENCE_ATOMIC_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE}'`,
+      "AND claimant_operation_id = $4 AND binding = $5::jsonb",
+      "AND materialized_at IS NULL",
+      `RETURNING ${OPERATION_ID_CLAIM_RETURNING_COLUMNS}`,
+    ].join(" "),
+  });
 const INSERT_RESERVATION_QUERY = Object.freeze({
   queryMode: "extended",
   text: [
@@ -4473,23 +4544,57 @@ function writerReleaseRequest(
   });
 }
 
+function canonicalAtomicCrashCaptureRequest(value, code) {
+  let request;
+  try {
+    request = assertAtomicCrashCaptureRequest(value);
+  } catch {
+    fail(code);
+  }
+  return request;
+}
+
+function writerFenceAtomicCaptureIntent(value, code) {
+  const intent = exactPlainObject(
+    value,
+    WRITER_FENCE_ATOMIC_CAPTURE_INTENT_KEYS,
+    code,
+  );
+  return deepFreeze({
+    operationId: canonicalOpaqueId(intent.operationId, 128, code),
+    request: canonicalAtomicCrashCaptureRequest(intent.request, code),
+  });
+}
+
 function writerForceFenceOperationRequest(
   input,
   code = "invalid_operation_request",
   epochExhaustionCode = code,
 ) {
   ensure(input.kind === WRITER_FORCE_FENCE_OPERATION_KIND, code);
+  const contractVersion = ownDataValue(
+    input.request,
+    "contractVersion",
+    code,
+  );
+  ensure(
+    contractVersion === WRITER_OPERATION_CONTRACT_VERSION ||
+      contractVersion === WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2,
+    code,
+  );
   const request = exactPlainObject(
     input.request,
-    WRITER_LIFECYCLE_REQUEST_KEYS,
+    contractVersion === WRITER_OPERATION_CONTRACT_VERSION
+      ? WRITER_LIFECYCLE_REQUEST_KEYS
+      : WRITER_FORCE_FENCE_REQUEST_V2_KEYS,
     code,
   );
   const document = input.expectedSession.document;
   const target = canonicalWriterAttachmentTarget(request.target, code);
   ensure(
-    request.contractVersion === WRITER_OPERATION_CONTRACT_VERSION &&
-      (document.lifecycle === "ATTACHED" ||
-        document.lifecycle === "BLOCKED") &&
+    (document.lifecycle === "ATTACHED" ||
+      (contractVersion === WRITER_OPERATION_CONTRACT_VERSION &&
+        document.lifecycle === "BLOCKED")) &&
       document.lease !== null,
     code,
   );
@@ -4512,9 +4617,116 @@ function writerForceFenceOperationRequest(
     BigIntConstructor(document.writerEpoch) < UINT64_MAX,
     epochExhaustionCode,
   );
+  let atomicCapture = null;
+  if (
+    contractVersion === WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2
+  ) {
+    atomicCapture = writerFenceAtomicCaptureIntent(
+      request.atomicCapture,
+      code,
+    );
+    const atomicRequest = atomicCapture.request;
+    ensure(
+      document.lifecycle === "ATTACHED" &&
+        document.attachment !== null &&
+        canonicalSerialize(
+          canonicalJsonObject(atomicRequest.sourceAttachment, code),
+        ) ===
+          canonicalSerialize(
+            canonicalJsonObject(document.attachment, code),
+          ) &&
+        canonicalSerialize(
+          canonicalJsonObject(atomicRequest.storageRef, code),
+        ) ===
+          canonicalSerialize(
+            canonicalJsonObject(document.storageRef, code),
+          ) &&
+        atomicRequest.sourceAttachment.leaseId ===
+          document.lease.leaseId &&
+        atomicRequest.sourceAttachment.holderId ===
+          document.lease.holderId &&
+        atomicRequest.sourceAttachment.fencingEpoch ===
+          document.lease.fencingEpoch &&
+        target.attachmentId ===
+          atomicRequest.sourceAttachment.attachmentId &&
+        atomicCapture.operationId !== input.operationId &&
+        atomicCapture.operationId !==
+          atomicRequest.mutationRequest.operationId &&
+        input.operationId !== atomicRequest.mutationRequest.operationId,
+      code,
+    );
+  }
   return deepFreeze({
-    contractVersion: WRITER_OPERATION_CONTRACT_VERSION,
+    ...(atomicCapture === null ? {} : { atomicCapture }),
+    contractVersion,
     target,
+  });
+}
+
+function atomicCrashCaptureOperationRequest(
+  input,
+  code = "invalid_operation_request",
+) {
+  ensure(input.kind === ATOMIC_CRASH_CAPTURE_OPERATION_KIND, code);
+  const intent = writerFenceAtomicCaptureIntent(input.request, code);
+  const document = input.expectedSession.document;
+  ensure(
+    input.operationId === intent.operationId &&
+      intent.request.contractVersion ===
+        ATOMIC_CRASH_CAPTURE_OPERATION_CONTRACT_VERSION &&
+      input.operationId !== intent.request.mutationRequest.operationId &&
+      document.lifecycle === "DETACHED" &&
+      document.activeOperation === null &&
+      document.attachment === null &&
+      document.lease === null &&
+      document.launch === null &&
+      document.lastOperation?.kind === WRITER_FORCE_FENCE_OPERATION_KIND,
+    code,
+  );
+  return intent;
+}
+
+export function createWriterForceFenceAtomicCaptureOperationRequest(
+  options,
+) {
+  const normalized = exactPlainObject(
+    options,
+    [
+      "atomicCaptureOperationId",
+      "atomicRequest",
+      "expectedSession",
+      "fenceOperationId",
+    ],
+    "invalid_operation_request",
+  );
+  const expectedSession = expectedSnapshotFromValue(
+    normalized.expectedSession,
+    "invalid_operation_request",
+  );
+  ensure(
+    expectedSession.document.attachment !== null,
+    "invalid_operation_request",
+  );
+  return writerForceFenceOperationRequest({
+    expectedSession,
+    kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+    operationId: canonicalOpaqueId(
+      normalized.fenceOperationId,
+      128,
+      "invalid_operation_request",
+    ),
+    request: {
+      atomicCapture: {
+        operationId: normalized.atomicCaptureOperationId,
+        request: normalized.atomicRequest,
+      },
+      contractVersion: WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2,
+      target: {
+        attachmentId:
+          expectedSession.document.attachment.attachmentId,
+        kind: "attachment",
+      },
+    },
   });
 }
 
@@ -4535,6 +4747,8 @@ function validateTypedOperationInput(input) {
       "invalid_operation_request",
       "writer_epoch_exhausted",
     );
+  } else if (input.kind === ATOMIC_CRASH_CAPTURE_OPERATION_KIND) {
+    atomicCrashCaptureOperationRequest(input);
   } else if (input.kind === CHECKPOINT_CAPTURE_OPERATION_KIND) {
     const request = checkpointCaptureOperationRequest(
       input.request,
@@ -7873,7 +8087,9 @@ function operationIdClaimSnapshotFromRow(row) {
         claimType ===
           RESTORE_ACTIVATION_LAUNCH_INTENT_OPERATION_ID_CLAIM_TYPE ||
         claimType ===
-          WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE) &&
+          WRITER_STOP_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE ||
+        claimType ===
+          WRITER_FENCE_ATOMIC_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE) &&
         claimantOperationId !== null &&
         claimantOperationId !== operationId &&
         binding !== null &&
@@ -8036,6 +8252,35 @@ function validateWriterStopCaptureIdClaim(
       claim.claimantOperationId === input.operationId &&
       canonicalSerialize(claim.binding) ===
         canonicalSerialize(input.request.captureIntent) &&
+      (materialization === "either" ||
+        (materialization === "reserved" &&
+          claim.materializedAt === null) ||
+        (materialization === "materialized" &&
+          claim.materializedAt !== null)),
+    "operation_state_invalid",
+  );
+  return claim;
+}
+
+function validateWriterFenceAtomicCaptureIdClaim(
+  claim,
+  input,
+  materialization,
+) {
+  const request = writerForceFenceOperationRequest(
+    input,
+    "operation_state_invalid",
+  );
+  ensure(
+    request.contractVersion ===
+        WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2 &&
+      claim.operationId === request.atomicCapture.operationId &&
+      claim.sessionId === input.expectedSession.sessionId &&
+      claim.claimType ===
+        WRITER_FENCE_ATOMIC_CAPTURE_INTENT_OPERATION_ID_CLAIM_TYPE &&
+      claim.claimantOperationId === input.operationId &&
+      canonicalSerialize(claim.binding) ===
+        canonicalSerialize(request.atomicCapture) &&
       (materialization === "either" ||
         (materialization === "reserved" &&
           claim.materializedAt === null) ||
@@ -9573,6 +9818,119 @@ export function assertWriterLaunchStopCaptureHandoffProof(...args) {
   });
 }
 
+/**
+ * Validates one physical-fence to atomic crash-capture admission handoff.
+ * The DETACHED lifecycle describes writer state only; the prepared capture
+ * reservation remains the cross-process successor-writer gate.
+ */
+export function assertWriterForceFenceAtomicCaptureHandoffProof(...args) {
+  const code = "operation_state_invalid";
+  ensure(args.length === 1, code);
+  const proof = exactPlainObject(
+    args[0],
+    WRITER_FORCE_FENCE_ATOMIC_CAPTURE_HANDOFF_PROOF_KEYS,
+    code,
+  );
+  const before = expectedSnapshotFromValue(proof.before, code);
+  const session = expectedSnapshotFromValue(proof.session, code);
+  const fenceProof = exactPlainObject(
+    proof.fence,
+    WRITER_FORCE_FENCE_ATOMIC_CAPTURE_HANDOFF_RELATION_KEYS,
+    code,
+  );
+  const captureProof = exactPlainObject(
+    proof.capture,
+    WRITER_FORCE_FENCE_ATOMIC_CAPTURE_HANDOFF_RELATION_KEYS,
+    code,
+  );
+  const normalizedFence = canonicalPublicOperationTransition(
+    fenceProof.operation,
+    code,
+  );
+  const fenceOperation = normalizedFence.operation;
+  const fenceReservation = canonicalPublicOperationReservation(
+    fenceProof.reservation,
+    code,
+  );
+  ensure(
+    normalizedFence.input.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
+      normalizedFence.input.request.contractVersion ===
+        WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2 &&
+      fenceOperation.state === "committed" &&
+      fenceOperation.result?.outcome === "writer-fenced" &&
+      canonicalSnapshotBytes(fenceOperation.expectedSession) ===
+        canonicalSnapshotBytes(before),
+    code,
+  );
+  validateOperationReservation(
+    fenceOperation,
+    fenceReservation,
+    normalizedFence.input,
+  );
+  const terminalSession =
+    writerForceFenceTerminalSessionForAtomicCaptureHandoff(
+      normalizedFence.input,
+      fenceOperation,
+      fenceReservation,
+    );
+
+  const normalizedCapture = canonicalPublicOperationTransition(
+    captureProof.operation,
+    code,
+  );
+  const captureOperation = normalizedCapture.operation;
+  const captureReservation = canonicalPublicOperationReservation(
+    captureProof.reservation,
+    code,
+  );
+  const expectedCaptureInput =
+    atomicCrashCaptureInputForWriterForceFenceHandoff(
+      normalizedFence.input,
+      terminalSession,
+    );
+  ensure(
+    captureOperation.kind === ATOMIC_CRASH_CAPTURE_OPERATION_KIND &&
+      captureOperation.state === "prepared" &&
+      captureReservation.state === "prepared" &&
+      canonicalSnapshotBytes(captureOperation.expectedSession) ===
+        canonicalSnapshotBytes(terminalSession) &&
+      captureOperation.operationId === expectedCaptureInput.operationId &&
+      canonicalSerialize(captureOperation.request) ===
+        canonicalSerialize(expectedCaptureInput.request) &&
+      captureOperation.createdAt === fenceOperation.updatedAt &&
+      captureOperation.updatedAt === fenceOperation.updatedAt &&
+      captureReservation.createdAt === fenceOperation.updatedAt &&
+      captureReservation.updatedAt === fenceOperation.updatedAt &&
+      session.sessionId === captureOperation.expectedSession.sessionId &&
+      session.revision ===
+        revisionAfter(
+          captureOperation.expectedSession.revision,
+          1,
+          "operation_state_invalid",
+        ),
+    code,
+  );
+  validateOperationIdentity(captureOperation, expectedCaptureInput);
+  validateOperationReservation(
+    captureOperation,
+    captureReservation,
+    expectedCaptureInput,
+  );
+  validateActivePointer(session, captureOperation, captureReservation);
+  return deepFreeze({
+    before,
+    capture: deepFreeze({
+      operation: captureOperation,
+      reservation: captureReservation,
+    }),
+    fence: deepFreeze({
+      operation: fenceOperation,
+      reservation: fenceReservation,
+    }),
+    session,
+  });
+}
+
 function activePointerFor(input, state, operationRevision) {
   return deepFreeze({
     conflictClass: SESSION_OPERATION_CONFLICT_CLASS,
@@ -9901,6 +10259,128 @@ function writerStopCaptureHandoffReceipt({
   });
 }
 
+function writerForceFenceTerminalSessionForAtomicCaptureHandoff(
+  input,
+  operation,
+  reservation,
+) {
+  const request = writerForceFenceOperationRequest(
+    input,
+    "operation_state_invalid",
+  );
+  ensure(
+    request.contractVersion ===
+        WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2 &&
+      operation.state === "committed" &&
+      operation.result?.outcome === "writer-fenced",
+    "operation_state_invalid",
+  );
+  const session = expectedSnapshotFromValue(
+    {
+      createdAt: input.expectedSession.createdAt,
+      document: documentWithAuthorityState(input.expectedSession.document, {
+        activeOperation: null,
+        attachment: null,
+        lastOperation: lastPointerFor(operation, reservation),
+        launch: null,
+        lease: null,
+        lifecycle: "DETACHED",
+        writerEpoch: operation.result.writerEpoch,
+      }),
+      revision: revisionAfter(
+        input.expectedSession.revision,
+        BigIntConstructor(operation.revision) + 1n,
+        "operation_state_invalid",
+      ),
+      sessionId: input.expectedSession.sessionId,
+      updatedAt: operation.updatedAt,
+    },
+    "operation_state_invalid",
+  );
+  validateLastOperationPointer(session, operation, reservation);
+  return session;
+}
+
+function atomicCrashCaptureInputForWriterForceFenceHandoff(
+  fenceInput,
+  expectedSession,
+) {
+  const request = writerForceFenceOperationRequest(
+    fenceInput,
+    "operation_state_invalid",
+  );
+  ensure(
+    request.contractVersion ===
+      WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2,
+    "operation_state_invalid",
+  );
+  return canonicalOperationInput({
+    expectedSession,
+    kind: ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
+    operationId: request.atomicCapture.operationId,
+    request: request.atomicCapture,
+  });
+}
+
+function writerForceFenceAtomicCaptureHandoffReceipt({
+  captureInput,
+  captureOperation,
+  captureReservation,
+  fenceFinalized,
+  fenceInput,
+  fenceOperation,
+  fenceReservation,
+  session,
+}) {
+  ensure(
+    captureOperation.state === "prepared" &&
+      captureReservation.state === "prepared" &&
+      captureOperation.createdAt === fenceOperation.updatedAt &&
+      captureOperation.updatedAt === fenceOperation.updatedAt &&
+      captureReservation.createdAt === fenceOperation.updatedAt &&
+      captureReservation.updatedAt === fenceOperation.updatedAt &&
+      session.sessionId === captureInput.expectedSession.sessionId &&
+      session.revision ===
+        revisionAfter(
+          captureInput.expectedSession.revision,
+          1,
+          "operation_state_invalid",
+        ),
+    "operation_state_invalid",
+  );
+  validateOperationIdentity(fenceOperation, fenceInput);
+  validateOperationReservation(
+    fenceOperation,
+    fenceReservation,
+    fenceInput,
+  );
+  validateOperationIdentity(captureOperation, captureInput);
+  validateOperationReservation(
+    captureOperation,
+    captureReservation,
+    captureInput,
+  );
+  validateLastOperationPointer(
+    captureInput.expectedSession,
+    fenceOperation,
+    fenceReservation,
+  );
+  validateActivePointer(session, captureOperation, captureReservation);
+  return deepFreeze({
+    capture: deepFreeze({
+      operation: captureOperation,
+      reservation: captureReservation,
+    }),
+    fence: deepFreeze({
+      finalized: fenceFinalized,
+      operation: fenceOperation,
+      reservation: fenceReservation,
+    }),
+    session,
+    status: "prepared",
+  });
+}
+
 function restoreAttachmentActivationHandoffReceipt({
   activationFinalized,
   activationInput,
@@ -10225,6 +10705,65 @@ function isAtomicWriterStopCaptureHandoff(session, observed) {
   return true;
 }
 
+function isAtomicWriterForceFenceCaptureHandoff(session, observed) {
+  const active = observed.active;
+  if (
+    active === null ||
+    active.operation.kind !== ATOMIC_CRASH_CAPTURE_OPERATION_KIND
+  ) {
+    return false;
+  }
+  const terminal = observed.terminal;
+  const forceFence = terminal?.forceFence;
+  if (
+    forceFence?.input.request.contractVersion !==
+    WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2
+  ) {
+    return false;
+  }
+  ensure(
+    terminal !== null &&
+      terminal.operation.state === "committed" &&
+      terminal.operation.result?.outcome === "writer-fenced" &&
+      forceFence.captureIdClaim !== null &&
+      active.atomicCrashCapture !== null,
+    "operation_state_invalid",
+  );
+  const terminalSession =
+    writerForceFenceTerminalSessionForAtomicCaptureHandoff(
+      forceFence.input,
+      terminal.operation,
+      terminal.reservation,
+    );
+  const captureInput =
+    atomicCrashCaptureInputForWriterForceFenceHandoff(
+      forceFence.input,
+      terminalSession,
+    );
+  ensure(
+    canonicalSerialize(active.atomicCrashCapture.input) ===
+        canonicalSerialize(captureInput) &&
+      active.atomicCrashCapture.fenceOperation.operationId ===
+        terminal.operation.operationId &&
+      forceFence.captureIdClaim.materializedAt ===
+        active.operation.createdAt &&
+      forceFence.captureIdClaim.materializedAt ===
+        terminal.operation.updatedAt,
+    "operation_state_invalid",
+  );
+  writerForceFenceAtomicCaptureHandoffReceipt({
+    captureInput,
+    captureOperation: active.operation,
+    captureReservation: active.reservation,
+    fenceFinalized: false,
+    fenceInput: forceFence.input,
+    fenceOperation: terminal.operation,
+    fenceReservation: terminal.reservation,
+    session,
+  });
+  return true;
+}
+
 async function readRestoreLaunchHandoffReplay(
   transaction,
   session,
@@ -10412,6 +10951,62 @@ async function readWriterStopCaptureHandoffReplay(
     stopInput: input,
     stopOperation,
     stopReservation,
+  });
+}
+
+async function readWriterForceFenceAtomicCaptureHandoffReplay(
+  transaction,
+  session,
+  input,
+  observed,
+) {
+  const fenceOperation = observed.operation;
+  const fenceReservation = observed.reservation;
+  const relation = observed.forceFence;
+  ensure(
+    fenceOperation !== null &&
+      fenceReservation !== null &&
+      relation !== null &&
+      relation.captureIdClaim !== null &&
+      fenceOperation.state === "committed" &&
+      fenceOperation.result?.outcome === "writer-fenced",
+    "operation_transition_conflict",
+  );
+  const terminalSession =
+    writerForceFenceTerminalSessionForAtomicCaptureHandoff(
+      input,
+      fenceOperation,
+      fenceReservation,
+    );
+  const captureInput =
+    atomicCrashCaptureInputForWriterForceFenceHandoff(
+      input,
+      terminalSession,
+    );
+  const captureObserved = await readRequestedOperation(
+    transaction,
+    session,
+    captureInput,
+    true,
+  );
+  ensure(
+    captureObserved.operation !== null &&
+      captureObserved.reservation !== null &&
+      captureObserved.atomicCrashCapture !== null &&
+      relation.captureIdClaim.materializedAt ===
+        captureObserved.operation.createdAt &&
+      relation.captureIdClaim.materializedAt === fenceOperation.updatedAt,
+    "operation_transition_conflict",
+  );
+  return writerForceFenceAtomicCaptureHandoffReceipt({
+    captureInput,
+    captureOperation: captureObserved.operation,
+    captureReservation: captureObserved.reservation,
+    fenceFinalized: false,
+    fenceInput: input,
+    fenceOperation,
+    fenceReservation,
+    session,
   });
 }
 
@@ -11748,6 +12343,154 @@ async function validateWriterLaunchStopRelations(
   return deepFreeze({ captureIdClaim, input, originalLaunch });
 }
 
+async function validateWriterForceFenceAtomicCaptureRelations(
+  transaction,
+  operation,
+  forUpdate,
+) {
+  if (operation.kind !== WRITER_FORCE_FENCE_OPERATION_KIND) {
+    return null;
+  }
+  const input = canonicalOperationInput(
+    inputForOperation(operation),
+    OPERATION_INPUT_KEYS,
+  );
+  const request = writerForceFenceOperationRequest(
+    input,
+    "operation_state_invalid",
+  );
+  if (
+    request.contractVersion !==
+    WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2
+  ) {
+    return null;
+  }
+  const captureIdClaim = await readOperationIdClaim(
+    transaction,
+    request.atomicCapture.operationId,
+    forUpdate,
+  );
+  if (
+    operation.state === "prepared" ||
+    operation.result?.outcome === "cancelled-before-dispatch"
+  ) {
+    // A globally crossed capture ID is a future transition conflict, not
+    // corruption of this still-prepared fence. Keep the operation readable
+    // and cancellable so claim can report the identity conflict without
+    // wedging the session. A claim owned by this fence cannot coexist with a
+    // prepared/cancelled state because claim and dispatch start atomically.
+    ensure(
+      captureIdClaim === null ||
+        captureIdClaim.claimantOperationId !== input.operationId,
+      "operation_state_invalid",
+    );
+    return deepFreeze({ captureIdClaim: null, input });
+  }
+  ensure(captureIdClaim !== null, "operation_state_invalid");
+  const successfulHandoff =
+    operation.state === "committed" &&
+    operation.result?.outcome === "writer-fenced";
+  validateWriterFenceAtomicCaptureIdClaim(
+    captureIdClaim,
+    input,
+    successfulHandoff ? "materialized" : "reserved",
+  );
+  ensure(
+    timestampMilliseconds(captureIdClaim.claimedAt) >=
+        timestampMilliseconds(operation.createdAt) &&
+      timestampMilliseconds(captureIdClaim.claimedAt) <=
+        timestampMilliseconds(operation.updatedAt) &&
+      (operation.state !== "starting" ||
+        captureIdClaim.claimedAt === operation.updatedAt) &&
+      (operation.state !== "committed" ||
+        (successfulHandoff
+          ? captureIdClaim.materializedAt === operation.updatedAt
+          : operation.result?.outcome === "writer-blocked" &&
+            captureIdClaim.materializedAt === null)),
+    "operation_state_invalid",
+  );
+  return deepFreeze({ captureIdClaim, input });
+}
+
+async function validateAtomicCrashCaptureHandoffRelations(
+  transaction,
+  operation,
+  currentSession,
+  forUpdate,
+) {
+  if (operation.kind !== ATOMIC_CRASH_CAPTURE_OPERATION_KIND) {
+    return null;
+  }
+  const input = canonicalOperationInput(
+    inputForOperation(operation),
+    OPERATION_INPUT_KEYS,
+  );
+  ensure(operation.state === "prepared", "operation_state_invalid");
+  const captureIdClaim = await readOperationIdClaim(
+    transaction,
+    input.operationId,
+    forUpdate,
+  );
+  ensure(captureIdClaim !== null, "operation_state_invalid");
+  const fenceOperation = await readOperationSnapshot(
+    transaction,
+    captureIdClaim.claimantOperationId,
+    false,
+  );
+  ensure(
+    fenceOperation !== null &&
+      fenceOperation.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
+      fenceOperation.state === "committed" &&
+      fenceOperation.result?.outcome === "writer-fenced",
+    "operation_state_invalid",
+  );
+  const fenceInput = canonicalOperationInput(
+    inputForOperation(fenceOperation),
+    OPERATION_INPUT_KEYS,
+  );
+  validateWriterFenceAtomicCaptureIdClaim(
+    captureIdClaim,
+    fenceInput,
+    "materialized",
+  );
+  const fenceReservation = await readReservationSnapshot(
+    transaction,
+    fenceOperation.operationId,
+    false,
+  );
+  ensure(fenceReservation !== null, "operation_state_invalid");
+  validateOperationReservation(
+    fenceOperation,
+    fenceReservation,
+    fenceInput,
+  );
+  const terminalSession =
+    writerForceFenceTerminalSessionForAtomicCaptureHandoff(
+      fenceInput,
+      fenceOperation,
+      fenceReservation,
+    );
+  ensure(
+    canonicalSnapshotBytes(input.expectedSession) ===
+        canonicalSnapshotBytes(terminalSession) &&
+      canonicalSerialize(input.request) ===
+        canonicalSerialize(fenceInput.request.atomicCapture) &&
+      captureIdClaim.materializedAt === fenceOperation.updatedAt &&
+      captureIdClaim.materializedAt === operation.createdAt &&
+      operation.updatedAt === operation.createdAt &&
+      canonicalIdentityBytes(currentSession.document) ===
+        canonicalIdentityBytes(input.expectedSession.document),
+    "operation_state_invalid",
+  );
+  return deepFreeze({
+    captureIdClaim,
+    fenceInput,
+    fenceOperation,
+    fenceReservation,
+    input,
+  });
+}
+
 async function validateCurrentWriterLaunchRelation(
   transaction,
   session,
@@ -11854,9 +12597,24 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       session,
       forUpdate,
     );
+    const forceFence =
+      await validateWriterForceFenceAtomicCaptureRelations(
+        transaction,
+        operation,
+        forUpdate,
+      );
+    const atomicCrashCapture =
+      await validateAtomicCrashCaptureHandoffRelations(
+        transaction,
+        operation,
+        session,
+        forUpdate,
+      );
     active = deepFreeze({
       activation,
+      atomicCrashCapture,
       checkpoint,
+      forceFence,
       generation,
       launchAttempt,
       launchStop,
@@ -11919,9 +12677,24 @@ async function validateSessionRelations(transaction, session, forUpdate) {
       session,
       false,
     );
+    const forceFence =
+      await validateWriterForceFenceAtomicCaptureRelations(
+        transaction,
+        operation,
+        false,
+      );
+    const atomicCrashCapture =
+      await validateAtomicCrashCaptureHandoffRelations(
+        transaction,
+        operation,
+        terminalBase,
+        false,
+      );
     terminal = deepFreeze({
       activation,
+      atomicCrashCapture,
       checkpoint,
+      forceFence,
       generation,
       launchAttempt,
       launchStop,
@@ -11936,6 +12709,19 @@ async function validateSessionRelations(transaction, session, forUpdate) {
   ) {
     ensure(
       isAtomicWriterStopCaptureHandoff(
+        session,
+        deepFreeze({ active, terminal }),
+      ),
+      "operation_state_invalid",
+    );
+  }
+  if (
+    terminal?.forceFence?.input.request.contractVersion ===
+      WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2 &&
+    terminal.operation.result?.outcome === "writer-fenced"
+  ) {
+    ensure(
+      isAtomicWriterForceFenceCaptureHandoff(
         session,
         deepFreeze({ active, terminal }),
       ),
@@ -11996,7 +12782,9 @@ async function readRequestedOperation(
     return deepFreeze({
       active: relations.active,
       activation: null,
+      atomicCrashCapture: null,
       checkpoint: null,
+      forceFence: null,
       generation: null,
       launchAttempt: null,
       launchStop: null,
@@ -12063,13 +12851,32 @@ async function readRequestedOperation(
           false,
         )
       : current.launchStop;
+  const forceFence =
+    current === null
+      ? await validateWriterForceFenceAtomicCaptureRelations(
+          transaction,
+          operation,
+          false,
+        )
+      : current.forceFence;
+  const atomicCrashCapture =
+    current === null
+      ? await validateAtomicCrashCaptureHandoffRelations(
+          transaction,
+          operation,
+          session,
+          false,
+        )
+      : current.atomicCrashCapture;
   if (operation.state !== "committed") {
     validateActivePointer(session, operation, reservation);
   }
   return deepFreeze({
     active: relations.active,
     activation,
+    atomicCrashCapture,
     checkpoint,
+    forceFence,
     generation,
     launchAttempt,
     launchStop,
@@ -13021,6 +13828,8 @@ export class PostgresSessionAuthority {
 
   #writerLaunchStopV3FleetCompatible;
 
+  #writerForceFenceV2FleetCompatible;
+
   #store;
 
   constructor(options) {
@@ -13060,6 +13869,11 @@ export class PostgresSessionAuthority {
       arrayIncludesIntrinsic,
       optionKeys,
       ["writerLaunchStopV3FleetCompatible"],
+    );
+    const hasWriterForceFenceV2FleetCompatible = reflectApply(
+      arrayIncludesIntrinsic,
+      optionKeys,
+      ["writerForceFenceV2FleetCompatible"],
     );
     const baseExpectedOptionKeys =
       hasRestoreAttachmentActivationV2FleetCompatible
@@ -13112,6 +13926,21 @@ export class PostgresSessionAuthority {
       expectedOptionKeys[baseExpectedOptionKeys.length] =
         "writerLaunchStopV3FleetCompatible";
     }
+    if (hasWriterForceFenceV2FleetCompatible) {
+      const priorExpectedOptionKeys = expectedOptionKeys;
+      expectedOptionKeys = new ArrayConstructor(
+        priorExpectedOptionKeys.length + 1,
+      );
+      for (
+        let index = 0;
+        index < priorExpectedOptionKeys.length;
+        index += 1
+      ) {
+        expectedOptionKeys[index] = priorExpectedOptionKeys[index];
+      }
+      expectedOptionKeys[priorExpectedOptionKeys.length] =
+        "writerForceFenceV2FleetCompatible";
+    }
     const normalized = exactPlainObject(
       options,
       expectedOptionKeys,
@@ -13146,6 +13975,9 @@ export class PostgresSessionAuthority {
             "boolean") &&
         (!hasWriterLaunchStopV3FleetCompatible ||
           typeof normalized.writerLaunchStopV3FleetCompatible ===
+            "boolean") &&
+        (!hasWriterForceFenceV2FleetCompatible ||
+          typeof normalized.writerForceFenceV2FleetCompatible ===
             "boolean"),
       "invalid_authority_options",
     );
@@ -13158,6 +13990,8 @@ export class PostgresSessionAuthority {
       normalized.restoreGenerationV2FleetCompatible === true;
     this.#writerLaunchStopV3FleetCompatible =
       normalized.writerLaunchStopV3FleetCompatible === true;
+    this.#writerForceFenceV2FleetCompatible =
+      normalized.writerForceFenceV2FleetCompatible === true;
     this.#store = normalized.store;
     objectFreeze(this);
   }
@@ -13745,7 +14579,8 @@ export class PostgresSessionAuthority {
   async reserveOperation(options) {
     const input = canonicalOperationInput(options);
     ensure(
-      input.kind !== WRITER_LEASE_RENEW_OPERATION_KIND,
+      input.kind !== WRITER_LEASE_RENEW_OPERATION_KIND &&
+        input.kind !== ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
       "invalid_operation_request",
     );
     const reserve = () =>
@@ -13789,6 +14624,13 @@ export class PostgresSessionAuthority {
               WRITER_LAUNCH_STOP_OPERATION_CONTRACT_VERSION_V3 ||
             this.#writerLaunchStopV3FleetCompatible,
           "writer_launch_stop_v3_fleet_capability_required",
+        );
+        ensure(
+          input.kind !== WRITER_FORCE_FENCE_OPERATION_KIND ||
+            input.request.contractVersion !==
+              WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2 ||
+            this.#writerForceFenceV2FleetCompatible,
+          "writer_force_fence_v2_fleet_capability_required",
         );
         if (
           input.kind === WRITER_FORCE_FENCE_OPERATION_KIND &&
@@ -13931,6 +14773,10 @@ export class PostgresSessionAuthority {
 
   async reconcileOperation(options) {
     const input = canonicalOperationInput(options);
+    ensure(
+      input.kind !== ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
+      "invalid_operation_request",
+    );
     return runSerializable(this.#store, async (transaction) => {
       const session = await readSessionSnapshot(
         transaction,
@@ -13951,6 +14797,67 @@ export class PostgresSessionAuthority {
         });
       }
       ensure(observed.active === null, "session_operation_conflict");
+      ensureExactExpectedSession(session, input.expectedSession);
+      return operationReceipt({
+        operation: null,
+        reservation: null,
+        session,
+        status: "absent",
+      });
+    });
+  }
+
+  async reconcileWriterForceFenceAtomicCaptureHandoff(options) {
+    const input = canonicalOperationInput(options);
+    const request = writerForceFenceOperationRequest(input);
+    ensure(
+      request.contractVersion ===
+        WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2,
+      "invalid_operation_request",
+    );
+    return runSerializable(this.#store, async (transaction) => {
+      // Lock the session before proving absence so ambiguous durable commits
+      // are observed before any caller considers redispatching the fence.
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      if (observed.operation !== null) {
+        ensure(
+          observed.reservation !== null && observed.forceFence !== null,
+          "operation_state_invalid",
+        );
+        if (
+          observed.operation.state === "committed" &&
+          observed.operation.result?.outcome === "writer-fenced"
+        ) {
+          return readWriterForceFenceAtomicCaptureHandoffReplay(
+            transaction,
+            session,
+            input,
+            observed,
+          );
+        }
+        return operationReceipt({
+          operation: observed.operation,
+          reservation: observed.reservation,
+          session,
+        });
+      }
+      ensure(observed.active === null, "session_operation_conflict");
+      const operationIdClaim = await readOperationIdClaim(
+        transaction,
+        input.operationId,
+        false,
+      );
+      ensure(operationIdClaim === null, "operation_identity_conflict");
       ensureExactExpectedSession(session, input.expectedSession);
       return operationReceipt({
         operation: null,
@@ -14059,6 +14966,7 @@ export class PostgresSessionAuthority {
         input.kind !== WRITER_LEASE_RENEW_OPERATION_KIND &&
         input.kind !== WRITER_RELEASE_OPERATION_KIND &&
         input.kind !== WRITER_FORCE_FENCE_OPERATION_KIND &&
+        input.kind !== ATOMIC_CRASH_CAPTURE_OPERATION_KIND &&
         input.kind !== CHECKPOINT_CAPTURE_OPERATION_KIND &&
         input.kind !== RESTORE_DESTINATION_GENERATION_OPERATION_KIND &&
         input.kind !== RESTORE_ATTACHMENT_ACTIVATION_OPERATION_KIND &&
@@ -16998,7 +17906,7 @@ export class PostgresSessionAuthority {
 
   async claimWriterForceFenceDispatch(options) {
     const input = operationInputWithExpectedRevision(options, "0");
-    writerForceFenceOperationRequest(input);
+    const request = writerForceFenceOperationRequest(input);
     return runSerializable(this.#store, async (transaction) => {
       const session = await readSessionSnapshot(
         transaction,
@@ -17049,13 +17957,45 @@ export class PostgresSessionAuthority {
         observed.terminal,
         "operation_transition_conflict",
       );
-      revisionAfter(session.revision, 3);
+      revisionAfter(
+        session.revision,
+        request.contractVersion ===
+          WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2
+          ? 4
+          : 3,
+      );
       const writerEpoch = nextWriterEpoch(session.document.writerEpoch);
       const fenceRequest = forceFenceRequestFor(
         input,
         writerEpoch,
         "operation_state_invalid",
       );
+      let captureIdClaim = null;
+      if (
+        request.contractVersion ===
+        WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2
+      ) {
+        const claimRows = rowsFromResult(
+          await transaction.query(
+            INSERT_WRITER_FENCE_ATOMIC_CAPTURE_ID_CLAIM_QUERY.text,
+            [
+              request.atomicCapture.operationId,
+              session.sessionId,
+              input.operationId,
+              canonicalSerialize(request.atomicCapture),
+              transaction.now,
+            ],
+          ),
+          "operation_state_invalid",
+        );
+        ensure(claimRows.length === 1, "operation_identity_conflict");
+        captureIdClaim = operationIdClaimSnapshotFromRow(claimRows[0]);
+        validateWriterFenceAtomicCaptureIdClaim(
+          captureIdClaim,
+          input,
+          "reserved",
+        );
+      }
       const operationRows = rowsFromResult(
         await transaction.query(START_OPERATION_QUERY.text, [
           input.operationId,
@@ -17079,6 +18019,12 @@ export class PostgresSessionAuthority {
       );
       validateOperationIdentity(operation, input);
       validateOperationReservation(operation, reservation, input);
+      if (captureIdClaim !== null) {
+        ensure(
+          captureIdClaim.claimedAt === operation.updatedAt,
+          "operation_state_invalid",
+        );
+      }
       const nextDocument = documentWithAuthorityState(
         session.document,
         {
@@ -17107,6 +18053,10 @@ export class PostgresSessionAuthority {
 
   async finalizeWriterForceFence(options) {
     const input = writerForceFenceFinalizationInput(options);
+    ensure(
+      input.request.contractVersion === WRITER_OPERATION_CONTRACT_VERSION,
+      "invalid_operation_request",
+    );
     ensure(
       input.expectedSession.document.backendCapabilities.fencing !==
         "manual",
@@ -17236,6 +18186,263 @@ export class PostgresSessionAuthority {
         finalized: true,
         operation,
         reservation,
+        session: updatedSession,
+      });
+    });
+  }
+
+  async finalizeWriterForceFenceAtomicCaptureHandoff(options) {
+    const input = writerForceFenceFinalizationInput(options);
+    const request = writerForceFenceOperationRequest(input);
+    ensure(
+      request.contractVersion ===
+        WRITER_FORCE_FENCE_OPERATION_CONTRACT_VERSION_V2,
+      "invalid_operation_request",
+    );
+    ensure(
+      input.expectedSession.document.backendCapabilities.fencing !==
+        "manual",
+      "writer_fence_unsupported",
+    );
+    return runSerializable(this.#store, async (transaction) => {
+      const session = await readSessionSnapshot(
+        transaction,
+        input.expectedSession.sessionId,
+        true,
+      );
+      const observed = await readRequestedOperation(
+        transaction,
+        session,
+        input,
+        true,
+      );
+      ensure(
+        observed.operation !== null &&
+          observed.reservation !== null &&
+          observed.forceFence !== null,
+        "operation_transition_conflict",
+      );
+      if (observed.operation.state === "committed") {
+        ensure(
+          observed.operation.result?.outcome === "writer-fenced" &&
+            BigIntConstructor(input.expectedOperationRevision) + 1n ===
+              BigIntConstructor(observed.operation.revision),
+          "operation_transition_conflict",
+        );
+        const candidate = canonicalWriterForceFenceResult(
+          {
+            attachment: observed.operation.result.attachment,
+            fenceResult: input.fenceResult,
+            input,
+            lease: observed.operation.result.lease,
+            writerEpoch: observed.operation.result.writerEpoch,
+          },
+          "invalid_operation_request",
+        );
+        ensure(
+          canonicalSerialize(candidate) ===
+            canonicalSerialize(observed.operation.result),
+          "operation_result_conflict",
+        );
+        return readWriterForceFenceAtomicCaptureHandoffReplay(
+          transaction,
+          session,
+          input,
+          observed,
+        );
+      }
+      ensure(
+        (observed.operation.state === "starting" ||
+          observed.operation.state === "uncertain") &&
+          observed.operation.revision ===
+            input.expectedOperationRevision &&
+          observed.forceFence.captureIdClaim !== null &&
+          session.document.lifecycle === "FENCING" &&
+          session.document.lease !== null,
+        "operation_transition_conflict",
+      );
+      revisionAfter(session.revision, 2);
+
+      const materializedRows = rowsFromResult(
+        await transaction.query(
+          MATERIALIZE_WRITER_FENCE_ATOMIC_CAPTURE_ID_CLAIM_QUERY.text,
+          [
+            request.atomicCapture.operationId,
+            session.sessionId,
+            transaction.now,
+            input.operationId,
+            canonicalSerialize(request.atomicCapture),
+          ],
+        ),
+        "operation_state_invalid",
+      );
+      ensure(
+        materializedRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const materializedClaim = operationIdClaimSnapshotFromRow(
+        materializedRows[0],
+      );
+      validateWriterFenceAtomicCaptureIdClaim(
+        materializedClaim,
+        input,
+        "materialized",
+      );
+      ensure(
+        materializedClaim.claimedAt ===
+          observed.forceFence.captureIdClaim.claimedAt,
+        "operation_state_invalid",
+      );
+
+      const result = canonicalWriterForceFenceResult(
+        {
+          attachment: session.document.attachment,
+          fenceResult: input.fenceResult,
+          input,
+          lease: session.document.lease,
+          writerEpoch: session.document.writerEpoch,
+        },
+        "invalid_operation_request",
+      );
+      const serializedResult = canonicalSerialize(result);
+      const predecessorState = observed.operation.state;
+      const operationRows = rowsFromResult(
+        await transaction.query(COMMIT_ACTIVE_OPERATION_QUERY.text, [
+          input.operationId,
+          input.expectedOperationRevision,
+          serializedResult,
+          transaction.now,
+          predecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(operationRows.length === 1, "operation_transition_conflict");
+      const reservationRows = rowsFromResult(
+        await transaction.query(RELEASE_ACTIVE_RESERVATION_QUERY.text, [
+          input.operationId,
+          transaction.now,
+          predecessorState,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        reservationRows.length === 1,
+        "operation_transition_conflict",
+      );
+      const operation = operationSnapshotFromRow(operationRows[0]);
+      const reservation = reservationSnapshotFromRow(
+        reservationRows[0],
+      );
+      validateOperationIdentity(operation, input);
+      validateOperationReservation(operation, reservation, input);
+      ensure(
+        canonicalSerialize(operation.result) === serializedResult &&
+          materializedClaim.materializedAt === operation.updatedAt,
+        "operation_result_conflict",
+      );
+
+      const terminalDocument = documentWithAuthorityState(
+        session.document,
+        {
+          activeOperation: null,
+          attachment: null,
+          lastOperation: lastPointerFor(operation, reservation),
+          launch: null,
+          lease: null,
+          lifecycle: "DETACHED",
+          writerEpoch: result.writerEpoch,
+        },
+      );
+      const terminalSession = await updateSessionDocument(
+        transaction,
+        session,
+        input,
+        terminalDocument,
+      );
+      validateLastOperationPointer(
+        terminalSession,
+        operation,
+        reservation,
+      );
+
+      const captureInput =
+        atomicCrashCaptureInputForWriterForceFenceHandoff(
+          input,
+          terminalSession,
+        );
+      const captureOperationRows = rowsFromResult(
+        await transaction.query(
+          INSERT_PRECLAIMED_WRITER_FENCE_ATOMIC_CAPTURE_QUERY.text,
+          [
+            captureInput.operationId,
+            terminalSession.sessionId,
+            captureInput.kind,
+            captureInput.serializedEnvelope,
+            transaction.now,
+            input.operationId,
+            canonicalSerialize(request.atomicCapture),
+          ],
+        ),
+        "operation_state_invalid",
+      );
+      ensure(
+        captureOperationRows.length === 1,
+        "operation_identity_conflict",
+      );
+      const captureOperation = operationSnapshotFromRow(
+        captureOperationRows[0],
+      );
+      validateOperationIdentity(captureOperation, captureInput);
+
+      const captureReservationRows = rowsFromResult(
+        await transaction.query(INSERT_RESERVATION_QUERY.text, [
+          captureInput.reservationId,
+          captureInput.operationId,
+          terminalSession.sessionId,
+          captureInput.kind,
+          terminalSession.revision,
+          canonicalSerialize(reservationPayload(captureInput)),
+          transaction.now,
+        ]),
+        "operation_state_invalid",
+      );
+      ensure(
+        captureReservationRows.length === 1,
+        "operation_state_invalid",
+      );
+      const captureReservation = reservationSnapshotFromRow(
+        captureReservationRows[0],
+      );
+      validateOperationReservation(
+        captureOperation,
+        captureReservation,
+        captureInput,
+      );
+      ensure(
+        captureOperation.createdAt === operation.updatedAt &&
+          captureReservation.createdAt === operation.updatedAt,
+        "operation_state_invalid",
+      );
+
+      const updatedSession = await updateSessionPhase(
+        transaction,
+        terminalSession,
+        captureInput,
+        activePointerFor(captureInput, "prepared", "0"),
+      );
+      validateActivePointer(
+        updatedSession,
+        captureOperation,
+        captureReservation,
+      );
+      return writerForceFenceAtomicCaptureHandoffReceipt({
+        captureInput,
+        captureOperation,
+        captureReservation,
+        fenceFinalized: true,
+        fenceInput: input,
+        fenceOperation: operation,
+        fenceReservation: reservation,
         session: updatedSession,
       });
     });
@@ -17373,6 +18580,10 @@ export class PostgresSessionAuthority {
 
   async markOperationUncertain(options) {
     const input = operationInputWithExpectedRevision(options, "1");
+    ensure(
+      input.kind !== ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
+      "invalid_operation_request",
+    );
     return runSerializable(this.#store, async (transaction) => {
       const session = await readSessionSnapshot(
         transaction,
@@ -17463,7 +18674,8 @@ export class PostgresSessionAuthority {
   async cancelPreparedOperation(options) {
     const input = cancellationInput(options);
     ensure(
-      input.expectedSession.document.lifecycle !== "BLOCKED",
+      input.expectedSession.document.lifecycle !== "BLOCKED" &&
+        input.kind !== ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
       "operation_transition_conflict",
     );
     return runSerializable(this.#store, async (transaction) => {
@@ -17510,6 +18722,10 @@ export class PostgresSessionAuthority {
       );
       ensure(
         !isAtomicWriterStopCaptureHandoff(session, observed),
+        "operation_transition_conflict",
+      );
+      ensure(
+        !isAtomicWriterForceFenceCaptureHandoff(session, observed),
         "operation_transition_conflict",
       );
       const atomicRestoreLaunchHandoff =

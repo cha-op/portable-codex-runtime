@@ -91,6 +91,7 @@ import {
   createPostgresLogicalWriterLauncher,
 } from "../src/postgres-logical-writer-launcher.mjs";
 import {
+  ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
   CHECKPOINT_CAPTURE_OPERATION_KIND,
   PostgresSessionAuthority,
   PostgresSessionAuthorityError,
@@ -103,6 +104,9 @@ import {
   WRITER_LAUNCH_STOP_OPERATION_KIND,
   WRITER_LEASE_RENEW_OPERATION_KIND,
   WRITER_RELEASE_OPERATION_KIND,
+  assertSessionOperationTransitionProof,
+  assertWriterForceFenceAtomicCaptureHandoffProof,
+  assertWriterLaunchStopCaptureHandoffProof,
   createCheckpointCaptureOperationRequest,
   createRestoreAttachmentActivationOperationRequest,
   createRestoreAttachmentActivationOperationRequestV2,
@@ -110,8 +114,7 @@ import {
   createRestoreDestinationGenerationOperationRequestV2,
   createWriterLaunchAttemptOperationRequest,
   createWriterLaunchStopOperationRequest,
-  assertSessionOperationTransitionProof,
-  assertWriterLaunchStopCaptureHandoffProof,
+  createWriterForceFenceAtomicCaptureOperationRequest,
 } from "../src/postgres-session-authority.mjs";
 import {
   PostgresSerializableStore,
@@ -138,6 +141,7 @@ import {
   createPostgresRestoreRecoveryCursorStore,
 } from "../src/postgres-restore-recovery-cursor-store.mjs";
 import {
+  ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_ACTIVATION_CONTRACT_VERSION,
   RESTORE_ATTACHMENT_RECONCILIATION_CONTRACT_VERSION,
   createSessionManifest,
@@ -247,6 +251,13 @@ const AUTHORITY_MIGRATIONS = Object.freeze([
       import.meta.url,
     ),
     version: 12,
+  }),
+  Object.freeze({
+    url: new URL(
+      "../migrations/authority/013-writer-fence-atomic-capture-handoff.sql",
+      import.meta.url,
+    ),
+    version: 13,
   }),
 ]);
 
@@ -1261,7 +1272,7 @@ async function assertFilesystemImageProviderStateAuthoritySchemaAndStore(
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 12,
+    version: 13,
   });
   const forgedLifecycleAnchorIds = [];
   for (const retiredExpression of ["NULL", "pg_current_xact_id()"]) {
@@ -5370,7 +5381,7 @@ async function assertLegacyRestoreV2MigrationGate(
   assert.deepEqual(upgraded, {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 12,
+    version: 13,
   });
   const registry = await pool.query(
     [
@@ -5724,7 +5735,7 @@ async function assertWriterSupervisorStateOwnerMigrationGate(
   assert.deepEqual(await store.migrate(), {
     applied: true,
     checksum: trackedMigrations.at(-1).checksum,
-    version: 12,
+    version: 13,
   });
   const legacyTerminal = await pool.query(
     [
@@ -8072,6 +8083,85 @@ function forceFenceEvidence(fenceRequest) {
   };
 }
 
+function atomicCrashCaptureRequestForForceFence(
+  expectedSession,
+  {
+    artifactId = `atomic-artifact-${randomUUID()}`,
+    captureAttemptId = `atomic-attempt-${randomUUID()}`,
+    checkpointId = `atomic-checkpoint-${randomUUID()}`,
+    mutationOperationId = `atomic-mutation-${randomUUID()}`,
+  } = {},
+) {
+  const { attachment, lease, manifest, storageRef } =
+    expectedSession.document;
+  assert.notEqual(attachment, null);
+  assert.notEqual(lease, null);
+  return {
+    captureAttemptId,
+    checkpoint: {
+      artifactId,
+      backendId: storageRef.backendId,
+      checkpointClass: "crash-prefix",
+      checkpointId,
+      codexSessionId: manifest.codex.sessionId,
+      codexThreadId: manifest.codex.rootThreadId,
+      contractVersion: 1,
+      createdAt: new Date().toISOString(),
+      imageDigest: manifest.runtime.imageDigest,
+      sessionId: expectedSession.sessionId,
+      sourceFencingEpoch: attachment.fencingEpoch,
+      storageId: storageRef.storageId,
+    },
+    contractVersion: ATOMIC_CRASH_CAPTURE_CONTRACT_VERSION,
+    mutationRequest: {
+      backendId: storageRef.backendId,
+      contractVersion: 1,
+      fencingEpoch: lease.fencingEpoch,
+      holderId: lease.holderId,
+      leaseId: lease.leaseId,
+      operation: "checkpoint",
+      operationId: mutationOperationId,
+      sessionId: expectedSession.sessionId,
+      storageId: storageRef.storageId,
+      target: {
+        artifactId,
+        checkpointId,
+        kind: "checkpoint",
+      },
+    },
+    sourceAttachment: attachment,
+    storageRef,
+  };
+}
+
+function writerForceFenceAtomicCaptureInput(
+  expectedSession,
+  {
+    atomicCaptureOperationId =
+      `atomic-capture-operation-${randomUUID()}`,
+    atomicRequest = atomicCrashCaptureRequestForForceFence(
+      expectedSession,
+    ),
+    fenceOperationId = `operation-${randomUUID()}`,
+  } = {},
+) {
+  return {
+    atomicCaptureOperationId,
+    atomicRequest,
+    input: {
+      expectedSession,
+      kind: WRITER_FORCE_FENCE_OPERATION_KIND,
+      operationId: fenceOperationId,
+      request: createWriterForceFenceAtomicCaptureOperationRequest({
+        atomicCaptureOperationId,
+        atomicRequest,
+        expectedSession,
+        fenceOperationId,
+      }),
+    },
+  };
+}
+
 function writerDetachCompositionRequest(
   expectedSession,
   {
@@ -9255,10 +9345,10 @@ test(
 
     const trackedMigrations = await readTrackedAuthorityMigrations();
     const latestMigration = trackedMigrations.at(-1);
-    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 12);
+    assert.equal(SESSION_AUTHORITY_MIGRATION_VERSION, 13);
     assert.deepEqual(
       trackedMigrations.map(({ version }) => version),
-      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+      [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
     );
 
     await pool.query(
@@ -9268,7 +9358,7 @@ test(
     assert.deepEqual(freshMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 12,
+      version: 13,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -9281,7 +9371,7 @@ test(
     assert.deepEqual(freshNoOpMigration, {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 12,
+      version: 13,
     });
 
     await pool.query("DROP SCHEMA session_authority CASCADE");
@@ -9296,7 +9386,7 @@ test(
     assert.deepEqual(upgradeMigration, {
       applied: true,
       checksum: latestMigration.checksum,
-      version: 12,
+      version: 13,
     });
     assert.deepEqual(
       await readMigrationLedger(pool),
@@ -9308,7 +9398,7 @@ test(
     assert.deepEqual(await store.migrate(), {
       applied: false,
       checksum: latestMigration.checksum,
-      version: 12,
+      version: 13,
     });
     await assertFilesystemImageProviderHeadAnchorSchemaAndStore(pool, store);
     await assertFilesystemImageProviderStateAuthoritySchemaAndStore(
@@ -9831,7 +9921,8 @@ test(
                 "AND claim_type IN (",
                 "'restore-launch-intent-v2',",
                 "'restore-activation-launch-intent-v1',",
-                "'writer-stop-capture-intent-v3'",
+                "'writer-stop-capture-intent-v3',",
+                "'writer-fence-atomic-capture-intent-v2'",
                 ")",
                 ")",
               ].join(" "),
@@ -9844,7 +9935,8 @@ test(
                 "AND claim_type IN (",
                 "'restore-launch-intent-v2',",
                 "'restore-activation-launch-intent-v1',",
-                "'writer-stop-capture-intent-v3'",
+                "'writer-stop-capture-intent-v3',",
+                "'writer-fence-atomic-capture-intent-v2'",
                 ")",
               ].join(" "),
               [sessionIds],
@@ -9898,6 +9990,7 @@ test(
         true,
       restoreGenerationV2FleetCompatible: true,
       store,
+      writerForceFenceV2FleetCompatible: true,
       writerLaunchStopV3FleetCompatible: true,
     });
     const operationGuard = new PostgresOperationGuard({
@@ -11571,6 +11664,505 @@ test(
         assert.equal(fenceReplay.finalized, false);
         assert.deepEqual(fenceReplay.operation, fenced.operation);
         assert.deepEqual(fenceReplay.session, fenced.session);
+      },
+    );
+
+    await t.test(
+      "force-fence V2 hands synthetic exact proof to one durable atomic-capture blocker",
+      async () => {
+        const sessionId = randomUUID();
+        const crossedSessionId = randomUUID();
+        const incompleteSessionId = randomUUID();
+        const blockedSessionId = randomUUID();
+        const versionOneSessionId = randomUUID();
+        sessionIds.push(
+          sessionId,
+          crossedSessionId,
+          incompleteSessionId,
+          blockedSessionId,
+          versionOneSessionId,
+        );
+
+        const registered = await authority.registerSession(
+          registrationInput(sessionId),
+        );
+        const attached = await attachWriter(authority, registered);
+        const handoff = writerForceFenceAtomicCaptureInput(
+          attached.session,
+        );
+        const reserved = await authority.reserveOperation(handoff.input);
+        assertOperationReceipt(reserved, "prepared");
+        assert.equal(reserved.acquired, true);
+
+        const starting = await authority.claimWriterForceFenceDispatch({
+          ...structuredClone(handoff.input),
+          expectedOperationRevision: "0",
+        });
+        assertOperationReceipt(starting, "starting");
+        assert.equal(starting.dispatchGranted, true);
+        assert.equal(starting.session.document.lifecycle, "FENCING");
+
+        const reservedCaptureClaim = await pool.query(
+          [
+            "SELECT claim_type, claimant_operation_id, binding,",
+            "claimed_at, materialized_at",
+            "FROM session_authority.operation_id_registry",
+            "WHERE operation_id = $1",
+          ].join(" "),
+          [handoff.atomicCaptureOperationId],
+        );
+        assert.equal(reservedCaptureClaim.rows.length, 1);
+        assert.equal(
+          reservedCaptureClaim.rows[0].claim_type,
+          "writer-fence-atomic-capture-intent-v2",
+        );
+        assert.equal(
+          reservedCaptureClaim.rows[0].claimant_operation_id,
+          handoff.input.operationId,
+        );
+        assert.deepEqual(
+          reservedCaptureClaim.rows[0].binding,
+          handoff.input.request.atomicCapture,
+        );
+        assert.equal(
+          reservedCaptureClaim.rows[0].claimed_at.toISOString(),
+          starting.operation.updatedAt,
+        );
+        assert.equal(
+          reservedCaptureClaim.rows[0].materialized_at,
+          null,
+        );
+
+        const crossedRegistered = await authority.registerSession(
+          registrationInput(crossedSessionId),
+        );
+        const crossedAttached = await attachWriter(
+          authority,
+          crossedRegistered,
+        );
+        const crossed = writerForceFenceAtomicCaptureInput(
+          crossedAttached.session,
+          {
+            atomicCaptureOperationId:
+              handoff.atomicCaptureOperationId,
+          },
+        );
+        const crossedReserved = await authority.reserveOperation(
+          crossed.input,
+        );
+        assertOperationReceipt(crossedReserved, "prepared");
+        const crossedBeforeClaim = await authority.readSession({
+          sessionId: crossedSessionId,
+        });
+        await assert.rejects(
+          authority.claimWriterForceFenceDispatch({
+            ...structuredClone(crossed.input),
+            expectedOperationRevision: "0",
+          }),
+          assertAuthorityCode("operation_identity_conflict"),
+        );
+        assert.deepEqual(
+          await authority.readSession({ sessionId: crossedSessionId }),
+          crossedBeforeClaim,
+        );
+        const crossedReconciled = await authority.reconcileOperation(
+          crossed.input,
+        );
+        assertOperationReceipt(crossedReconciled, "prepared");
+
+        // This is deliberately synthetic provider evidence. The database
+        // test proves exact proof binding and durable ordering, not a real
+        // host, controller, or drive-level stale-writer fence.
+        let syntheticFenceProofCount = 0;
+        const fenceResult = (() => {
+          syntheticFenceProofCount += 1;
+          return forceFenceEvidence(starting.fenceRequest);
+        })();
+        const finalization = {
+          ...structuredClone(handoff.input),
+          expectedOperationRevision: "1",
+          fenceResult,
+        };
+        const handedOff =
+          await authority.finalizeWriterForceFenceAtomicCaptureHandoff(
+            finalization,
+          );
+        assert.equal(syntheticFenceProofCount, 1);
+        assert.equal(handedOff.status, "prepared");
+        assert.equal(handedOff.fence.finalized, true);
+        assert.equal(handedOff.fence.operation.state, "committed");
+        assert.equal(
+          handedOff.fence.operation.result.outcome,
+          "writer-fenced",
+        );
+        assert.deepEqual(
+          handedOff.fence.operation.result.fenceResult,
+          fenceResult,
+        );
+        assert.equal(
+          handedOff.capture.operation.kind,
+          ATOMIC_CRASH_CAPTURE_OPERATION_KIND,
+        );
+        assert.equal(handedOff.capture.operation.state, "prepared");
+        assert.equal(handedOff.capture.reservation.state, "prepared");
+        assert.equal(
+          handedOff.capture.operation.operationId,
+          handoff.atomicCaptureOperationId,
+        );
+        assert.equal(handedOff.session.document.lifecycle, "DETACHED");
+        assert.equal(handedOff.session.document.lease, null);
+        assert.equal(handedOff.session.document.attachment, null);
+        assert.equal(
+          handedOff.session.document.activeOperation.operationId,
+          handoff.atomicCaptureOperationId,
+        );
+        assertWriterForceFenceAtomicCaptureHandoffProof({
+          before: handoff.input.expectedSession,
+          capture: handedOff.capture,
+          fence: {
+            operation: handedOff.fence.operation,
+            reservation: handedOff.fence.reservation,
+          },
+          session: handedOff.session,
+        });
+
+        const transactionEvidence = await pool.query(
+          [
+            "SELECT s.xmin::text AS session_xid,",
+            "fo.xmin::text AS fence_operation_xid,",
+            "fr.xmin::text AS fence_reservation_xid,",
+            "co.xmin::text AS capture_operation_xid,",
+            "cr.xmin::text AS capture_reservation_xid,",
+            "ci.xmin::text AS capture_claim_xid,",
+            "fo.updated_at AS fence_updated_at,",
+            "co.created_at AS capture_created_at,",
+            "cr.created_at AS capture_reservation_created_at,",
+            "ci.materialized_at AS capture_materialized_at",
+            "FROM session_authority.sessions s",
+            "JOIN session_authority.operation_claims fo",
+            "ON fo.operation_id = $2 AND fo.session_id = s.session_id",
+            "JOIN session_authority.reservations fr",
+            "ON fr.operation_id = fo.operation_id",
+            "JOIN session_authority.operation_claims co",
+            "ON co.operation_id = $3 AND co.session_id = s.session_id",
+            "JOIN session_authority.reservations cr",
+            "ON cr.operation_id = co.operation_id",
+            "JOIN session_authority.operation_id_registry ci",
+            "ON ci.operation_id = co.operation_id",
+            "WHERE s.session_id = $1",
+          ].join(" "),
+          [
+            sessionId,
+            handoff.input.operationId,
+            handoff.atomicCaptureOperationId,
+          ],
+        );
+        assert.equal(transactionEvidence.rows.length, 1);
+        const transactionRow = transactionEvidence.rows[0];
+        assert.equal(
+          new Set([
+            transactionRow.session_xid,
+            transactionRow.fence_operation_xid,
+            transactionRow.fence_reservation_xid,
+            transactionRow.capture_operation_xid,
+            transactionRow.capture_reservation_xid,
+            transactionRow.capture_claim_xid,
+          ]).size,
+          1,
+        );
+        assert.equal(
+          transactionRow.capture_created_at.toISOString(),
+          transactionRow.fence_updated_at.toISOString(),
+        );
+        assert.equal(
+          transactionRow.capture_reservation_created_at.toISOString(),
+          transactionRow.fence_updated_at.toISOString(),
+        );
+        assert.equal(
+          transactionRow.capture_materialized_at.toISOString(),
+          transactionRow.fence_updated_at.toISOString(),
+        );
+
+        const restarted = new PostgresSessionAuthority({
+          store,
+          writerForceFenceV2FleetCompatible: true,
+        });
+        const readBack =
+          await restarted.reconcileWriterForceFenceAtomicCaptureHandoff(
+            structuredClone(handoff.input),
+          );
+        assert.equal(readBack.fence.finalized, false);
+        assert.deepEqual(readBack.capture, handedOff.capture);
+        assert.deepEqual(readBack.fence.operation, handedOff.fence.operation);
+        assert.deepEqual(
+          readBack.fence.reservation,
+          handedOff.fence.reservation,
+        );
+        assert.deepEqual(readBack.session, handedOff.session);
+        const replayed =
+          await restarted.finalizeWriterForceFenceAtomicCaptureHandoff(
+            structuredClone(finalization),
+          );
+        assert.equal(replayed.fence.finalized, false);
+        assert.deepEqual(replayed.capture, handedOff.capture);
+        assert.deepEqual(replayed.session, handedOff.session);
+        assert.equal(syntheticFenceProofCount, 1);
+
+        const successorExpected = structuredClone(handedOff.session);
+        successorExpected.document.activeOperation = null;
+        const successorInput = writerAttachmentInput(successorExpected);
+        const beforeSuccessorReserve = await authority.readSession({
+          sessionId,
+        });
+        await assert.rejects(
+          authority.reserveOperation(successorInput),
+          assertAuthorityCode("session_operation_conflict"),
+        );
+        assert.deepEqual(
+          await authority.readSession({ sessionId }),
+          beforeSuccessorReserve,
+        );
+        const absentSuccessor = await pool.query(
+          [
+            "SELECT count(*)::integer AS row_count FROM (",
+            "SELECT operation_id FROM session_authority.operation_claims",
+            "WHERE operation_id = $1",
+            "UNION ALL SELECT operation_id",
+            "FROM session_authority.operation_id_registry",
+            "WHERE operation_id = $1",
+            ") AS matched",
+          ].join(" "),
+          [successorInput.operationId],
+        );
+        assert.equal(absentSuccessor.rows[0].row_count, 0);
+
+        const captureCatalogue = await pool.query(
+          [
+            "SELECT count(*)::integer AS row_count",
+            "FROM session_authority.atomic_crash_captures",
+            "WHERE capture_attempt_id = $1 OR operation_id = $2",
+          ].join(" "),
+          [
+            handoff.atomicRequest.captureAttemptId,
+            handoff.atomicRequest.mutationRequest.operationId,
+          ],
+        );
+        assert.equal(captureCatalogue.rows[0].row_count, 0);
+
+        const incompleteRegistered = await authority.registerSession(
+          registrationInput(incompleteSessionId),
+        );
+        const incompleteAttached = await attachWriter(
+          authority,
+          incompleteRegistered,
+        );
+        const incomplete = writerForceFenceAtomicCaptureInput(
+          incompleteAttached.session,
+        );
+        await authority.reserveOperation(incomplete.input);
+        const incompleteStarting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(incomplete.input),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(incompleteStarting, "starting");
+        const incompleteFenceResult = forceFenceEvidence(
+          incompleteStarting.fenceRequest,
+        );
+        const incompleteStoredResult = {
+          attachment: incompleteAttached.session.document.attachment,
+          fenceResult: incompleteFenceResult,
+          fenceTarget: incomplete.input.request.target,
+          lease: incompleteAttached.session.document.lease,
+          outcome: "writer-fenced",
+          resultVersion: 1,
+          writerEpoch: incompleteStarting.writerEpoch,
+        };
+
+        const incompleteHandoffClient = await pool.connect();
+        let incompleteHandoffTransactionOpen = false;
+        try {
+          await incompleteHandoffClient.query("BEGIN");
+          incompleteHandoffTransactionOpen = true;
+          const transactionClock = await incompleteHandoffClient.query(
+            [
+              "SELECT pg_catalog.transaction_timestamp()",
+              "AS transaction_now",
+            ].join(" "),
+          );
+          const transactionNow =
+            transactionClock.rows[0].transaction_now;
+          const materialized = await incompleteHandoffClient.query(
+            [
+              "UPDATE session_authority.operation_id_registry",
+              "SET materialized_at = $2",
+              "WHERE operation_id = $1",
+            ].join(" "),
+            [incomplete.atomicCaptureOperationId, transactionNow],
+          );
+          assert.equal(materialized.rowCount, 1);
+          const forcedTerminal = await incompleteHandoffClient.query(
+            [
+              "UPDATE session_authority.operation_claims",
+              "SET state = 'committed', result = $2::jsonb,",
+              "revision = 2, updated_at = $3, retired_at = $3",
+              "WHERE operation_id = $1 AND state = 'starting'",
+              "AND revision = 1",
+            ].join(" "),
+            [
+              incomplete.input.operationId,
+              JSON.stringify(incompleteStoredResult),
+              transactionNow,
+            ],
+          );
+          assert.equal(forcedTerminal.rowCount, 1);
+          await assert.rejects(
+            incompleteHandoffClient.query("COMMIT"),
+            (error) => {
+              assert.equal(error.code, "23514");
+              assert.equal(
+                error.constraint,
+                "operation_claims_writer_fence_atomic_capture_terminal_blocker",
+              );
+              return true;
+            },
+          );
+          await incompleteHandoffClient.query("ROLLBACK");
+          incompleteHandoffTransactionOpen = false;
+        } finally {
+          if (incompleteHandoffTransactionOpen) {
+            await incompleteHandoffClient.query("ROLLBACK");
+          }
+          incompleteHandoffClient.release();
+        }
+        const incompleteReadBack =
+          await authority.reconcileWriterForceFenceAtomicCaptureHandoff(
+            incomplete.input,
+          );
+        assertOperationReceipt(incompleteReadBack, "starting");
+        assert.equal(
+          incompleteReadBack.session.document.lifecycle,
+          "FENCING",
+        );
+        const incompleteDurableState = await pool.query(
+          [
+            "SELECT ci.materialized_at,",
+            "count(co.operation_id)::integer AS operation_count",
+            "FROM session_authority.operation_id_registry ci",
+            "LEFT JOIN session_authority.operation_claims co",
+            "ON co.operation_id = ci.operation_id",
+            "WHERE ci.operation_id = $1",
+            "GROUP BY ci.materialized_at",
+          ].join(" "),
+          [incomplete.atomicCaptureOperationId],
+        );
+        assert.deepEqual(incompleteDurableState.rows, [
+          { materialized_at: null, operation_count: 0 },
+        ]);
+        assert.deepEqual(
+          await authority.readSession({ sessionId: incompleteSessionId }),
+          incompleteStarting.session,
+        );
+
+        const blockedRegistered = await authority.registerSession(
+          registrationInput(blockedSessionId),
+        );
+        const blockedAttached = await attachWriter(
+          authority,
+          blockedRegistered,
+        );
+        const unresolved = writerForceFenceAtomicCaptureInput(
+          blockedAttached.session,
+        );
+        await authority.reserveOperation(unresolved.input);
+        const unresolvedStarting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(unresolved.input),
+            expectedOperationRevision: "0",
+          });
+        assertOperationReceipt(unresolvedStarting, "starting");
+        const unresolvedUncertain = await authority.markOperationUncertain({
+          ...structuredClone(unresolved.input),
+          expectedOperationRevision: "1",
+        });
+        assertOperationReceipt(unresolvedUncertain, "uncertain");
+        const unresolvedBlocked =
+          await authority.finalizeWriterOperationBlocked({
+            ...structuredClone(unresolved.input),
+            expectedOperationRevision: "2",
+            reason: "fence-unavailable",
+          });
+        assertOperationReceipt(unresolvedBlocked, "committed");
+        assert.equal(
+          unresolvedBlocked.operation.result.outcome,
+          "writer-blocked",
+        );
+        assert.equal(
+          unresolvedBlocked.session.document.lifecycle,
+          "BLOCKED",
+        );
+        assert.equal(
+          unresolvedBlocked.session.document.activeOperation,
+          null,
+        );
+        const unresolvedCapture = await pool.query(
+          [
+            "SELECT ci.materialized_at,",
+            "count(co.operation_id)::integer AS operation_count",
+            "FROM session_authority.operation_id_registry ci",
+            "LEFT JOIN session_authority.operation_claims co",
+            "ON co.operation_id = ci.operation_id",
+            "WHERE ci.operation_id = $1",
+            "GROUP BY ci.materialized_at",
+          ].join(" "),
+          [unresolved.atomicCaptureOperationId],
+        );
+        assert.deepEqual(unresolvedCapture.rows, [
+          { materialized_at: null, operation_count: 0 },
+        ]);
+
+        const versionOneRegistered = await authority.registerSession(
+          registrationInput(versionOneSessionId),
+        );
+        const versionOneAttached = await attachWriter(
+          authority,
+          versionOneRegistered,
+        );
+        const versionOneInput = writerForceFenceInput(
+          versionOneAttached.session,
+        );
+        await authority.reserveOperation(versionOneInput);
+        const versionOneStarting =
+          await authority.claimWriterForceFenceDispatch({
+            ...structuredClone(versionOneInput),
+            expectedOperationRevision: "0",
+          });
+        const versionOneTerminal = await authority.finalizeWriterForceFence({
+          ...structuredClone(versionOneInput),
+          expectedOperationRevision: "1",
+          fenceResult: forceFenceEvidence(
+            versionOneStarting.fenceRequest,
+          ),
+        });
+        assertOperationReceipt(versionOneTerminal, "committed");
+        assert.equal(versionOneTerminal.session.document.lifecycle, "DETACHED");
+        assert.equal(versionOneTerminal.session.document.activeOperation, null);
+        assert.equal(
+          versionOneTerminal.session.document.lastOperation.operationId,
+          versionOneInput.operationId,
+        );
+        const versionOneAtomicOperations = await pool.query(
+          [
+            "SELECT count(*)::integer AS operation_count",
+            "FROM session_authority.operation_claims",
+            "WHERE session_id = $1 AND kind = $2",
+          ].join(" "),
+          [versionOneSessionId, ATOMIC_CRASH_CAPTURE_OPERATION_KIND],
+        );
+        assert.equal(
+          versionOneAtomicOperations.rows[0].operation_count,
+          0,
+        );
       },
     );
 
@@ -16132,7 +16724,7 @@ test(
         );
         assert.deepEqual(
           (await readMigrationLedger(pool)).map(({ version }) => version),
-          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+          [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
         );
 
         const input = writerLaunchAttemptInput(
