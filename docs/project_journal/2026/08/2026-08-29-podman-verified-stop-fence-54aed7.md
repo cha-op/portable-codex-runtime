@@ -5,7 +5,7 @@ status: completed
 created: 2026-08-29
 updated: 2026-08-29
 branch: wip/atomic-crash-capture-stale-writer-fence
-pr:
+pr: https://github.com/cha-op/portable-codex-runtime/pull/64
 supersedes: []
 superseded_by:
 ---
