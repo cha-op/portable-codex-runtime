@@ -1297,7 +1297,11 @@ export function createLvmAtomicCrashCaptureDriver(options) {
       devicePath,
     ]);
     const line = stringTrim(stdout);
-    const pieces = callIntrinsic(stringSplitIntrinsic, line, [":"]);
+    const rawPieces = callIntrinsic(stringSplitIntrinsic, line, [":"]);
+    const pieces = [];
+    for (let index = 0; index < rawPieces.length; index += 1) {
+      arrayPush(pieces, stringTrim(rawPieces[index]));
+    }
     ensure(
       pieces.length === 3 &&
         regexpTest(DM_UUID_PATTERN, pieces[0]) &&

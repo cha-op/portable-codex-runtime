@@ -98,7 +98,8 @@ superseded_by:
   modules and their focused tests.
 - Catalogue and LVM focused tests passed: 53 passed and the one privileged LVM
   integration case skipped by default on macOS. The LVM-only unit suite passed
-  all 37 tests after also exercising whitespace-padded LVM report fields.
+  all 37 tests after also exercising whitespace-padded LVM report and
+  `dmsetup --columns` fields.
 - The changed serializable-store and runtime-controller suites passed 176
   tests, and the detached deployment suite passed 35 tests.
 - The unfiltered repository suite ran 3,534 tests: 3,497 passed, 36 skipped,

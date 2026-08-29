@@ -773,7 +773,7 @@ function createCommandDriverFixture() {
         state.mode === "dm-uuid"
           ? "LVM-WRONG"
           : "LVM-VG0000SNAPSHOT1234567890";
-      return { stderr: "", stdout: `${uuid}:253:7\n` };
+      return { stderr: "", stdout: `  ${uuid}  :  253  :  7  \n` };
     }
     if (executable === "/fixed/blockdev") {
       if (args[0] === "--getro") {
