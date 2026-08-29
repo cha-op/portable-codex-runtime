@@ -5,7 +5,7 @@ import { isPromise, isProxy } from "node:util/types";
 
 import { DatabaseError, Query } from "pg";
 
-export const SESSION_AUTHORITY_MIGRATION_VERSION = 11;
+export const SESSION_AUTHORITY_MIGRATION_VERSION = 12;
 export const DEFAULT_TRANSACTION_ATTEMPTS = 3;
 export const MAX_TRANSACTION_ATTEMPTS = 16;
 
@@ -275,6 +275,13 @@ const MIGRATION_SOURCES = objectFreeze([
       import.meta.url,
     ),
     version: 11,
+  }),
+  objectFreeze({
+    url: new URL(
+      "../migrations/authority/012-atomic-crash-capture-catalogue.sql",
+      import.meta.url,
+    ),
+    version: 12,
   }),
 ]);
 
