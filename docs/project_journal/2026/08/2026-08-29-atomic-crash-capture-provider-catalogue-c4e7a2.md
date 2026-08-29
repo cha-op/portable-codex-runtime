@@ -58,10 +58,11 @@ superseded_by:
   `lvm-lv-uuid-v1`. Name, tag, and origin UUID bind the provider plan, while
   device-mapper UUID and major/minor are attachment observations for the same
   read window rather than substitutes for persistent object identity.
-- Content stability is the exact LVM/block-device visible length plus a full
-  streaming SHA-256. The driver observes the snapshot before and after hashing;
-  a same-name replacement, size mismatch, digest mismatch, or unreadable
-  observation is `unknown`.
+- Content stability is the exact read-only block-device visible length plus a
+  full streaming SHA-256. LVM's classic-snapshot `lv_size` instead validates
+  the bound COW allocation. The driver observes the snapshot before and after
+  hashing; a same-name replacement, selected size mismatch, digest mismatch,
+  or unreadable observation is `unknown`.
 - Access policy requires both read-only LVM attributes and
   `blockdev --getro=1`. Stable identity and bytes cannot compensate for a
   writable artifact.
@@ -96,10 +97,10 @@ superseded_by:
 
 - `node --check` passed for the new catalogue, provider/driver, and integration
   modules and their focused tests.
-- Catalogue and LVM focused tests passed: 53 passed and the one privileged LVM
+- Catalogue and LVM focused tests passed: 54 passed and the one privileged LVM
   integration case skipped by default on macOS. The LVM-only unit suite passed
-  all 37 tests after also exercising whitespace-padded LVM report and
-  `dmsetup --columns` fields.
+  all 38 tests after also exercising distinct COW-allocation and visible sizes,
+  whitespace-padded LVM reports, and `dmsetup --columns` fields.
 - The changed serializable-store and runtime-controller suites passed 176
   tests, and the detached deployment suite passed 35 tests.
 - The unfiltered repository suite ran 3,534 tests: 3,497 passed, 36 skipped,

@@ -740,7 +740,7 @@ function createCommandDriverFixture() {
       lv_dm_path: "/dev/mapper/pcrvg-snapshot",
       lv_name: state.snapshotName,
       lv_path: "/dev/pcrvg/snapshot",
-      lv_size: mode === "size" ? "9" : "8",
+      lv_size: mode === "cow-allocation" ? "5" : "4",
       lv_tags: `unrelated,${state.snapshotTag},metadata-churn`,
       lv_uuid: mode === "uuid" ? "SNAPSHOT-9999999999" : SNAPSHOT_LV_UUID,
       origin_uuid: mode === "origin" ? "ORIGIN-9999999999" : ORIGIN_LV_UUID,
@@ -779,7 +779,10 @@ function createCommandDriverFixture() {
       if (args[0] === "--getro") {
         return { stderr: "", stdout: state.mode === "block-read-only" ? "0\n" : "1\n" };
       }
-      return { stderr: "", stdout: state.mode === "size" ? "9\n" : "8\n" };
+      return {
+        stderr: "",
+        stdout: state.mode === "visible-size" ? "9\n" : "8\n",
+      };
     }
     throw new Error(`unexpected executable: ${executable}`);
   };
@@ -788,7 +791,9 @@ function createCommandDriverFixture() {
     commandRunner,
     createSnapshotReadStream() {
       const fill = state.mode === "digest" ? 2 : 1;
-      return Readable.from([Buffer.alloc(state.mode === "size" ? 9 : 8, fill)]);
+      return Readable.from([
+        Buffer.alloc(state.mode === "visible-size" ? 9 : 8, fill),
+      ]);
     },
     dmsetupExecutable: "/fixed/dmsetup",
     lvcreateExecutable: "/fixed/lvcreate",
@@ -848,7 +853,8 @@ test("driver verification separates persistent identity, content, and access pol
     "uuid",
     "origin",
     "digest",
-    "size",
+    "visible-size",
+    "cow-allocation",
     "read-only",
     "block-read-only",
     "cow-full",

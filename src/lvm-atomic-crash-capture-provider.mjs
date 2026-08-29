@@ -1367,7 +1367,7 @@ export function createLvmAtomicCrashCaptureDriver(options) {
       stringTrim(row.lv_path),
       "lvm_atomic_crash_capture_outcome_uncertain",
     );
-    const lvmSize = parseLvmSize(
+    const cowAllocationBytes = parseLvmSize(
       row.lv_size,
       "lvm_atomic_crash_capture_outcome_uncertain",
     );
@@ -1382,13 +1382,13 @@ export function createLvmAtomicCrashCaptureDriver(options) {
     );
     ensure(
       stringTrim(readOnlyOutput) === "1" &&
-        byteLength === lvmSize &&
+        cowAllocationBytes === providerBinding.snapshotSizeBytes &&
         regexpTest(MAJOR_MINOR_PATTERN, dmIdentity.majorMinor),
       "lvm_atomic_crash_capture_outcome_uncertain",
     );
     return exactFrozenRecord({
       byteLength,
-      cowAllocationBytes: providerBinding.snapshotSizeBytes,
+      cowAllocationBytes,
       cowPercent,
       devicePath,
       dmUuid: dmIdentity.dmUuid,
