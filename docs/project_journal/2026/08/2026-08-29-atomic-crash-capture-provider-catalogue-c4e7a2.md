@@ -42,8 +42,9 @@ superseded_by:
 - The LVM wrapper delegates all seven lifecycle methods and changes only its
   private capability snapshot to `atomicPointInTimeCheckpoint: true`. Its
   deterministic binding records the origin LV UUID, snapshot name and tag, and
-  COW allocation. COW allocation is deliberately distinct from the artifact's
-  origin-visible block length.
+  VG-extent-rounded COW allocation. Normalization occurs before durable claim
+  and physical dispatch, and overflow fails closed. COW allocation is
+  deliberately distinct from the artifact's origin-visible block length.
 - Fresh capture invokes one injected authority consumer with the exact opaque
   stopped-writer handle and request. Existing or uncertain attempts never call
   authority or `lvcreate`. A failed provider dispatch is durably uncertain;
@@ -60,9 +61,11 @@ superseded_by:
   read window rather than substitutes for persistent object identity.
 - Content stability is the exact read-only block-device visible length plus a
   full streaming SHA-256. LVM's classic-snapshot `lv_size` instead validates
-  the bound COW allocation. The driver observes the snapshot before and after
-  hashing; a same-name replacement, selected size mismatch, digest mismatch,
-  or unreadable observation is `unknown`.
+  the canonical bound COW allocation; the origin VG extent size only
+  normalizes that provider plan before admission and dispatch. The driver
+  observes the snapshot before and after hashing; a same-name replacement,
+  selected size mismatch, digest mismatch, or unreadable observation is
+  `unknown`.
 - Access policy requires both read-only LVM attributes and
   `blockdev --getro=1`. Stable identity and bytes cannot compensate for a
   writable artifact.
@@ -97,10 +100,11 @@ superseded_by:
 
 - `node --check` passed for the new catalogue, provider/driver, and integration
   modules and their focused tests.
-- Catalogue and LVM focused tests passed: 54 passed and the one privileged LVM
+- Catalogue and LVM focused tests passed: 57 passed and the one privileged LVM
   integration case skipped by default on macOS. The LVM-only unit suite passed
-  all 38 tests after also exercising distinct COW-allocation and visible sizes,
-  whitespace-padded LVM reports, and `dmsetup --columns` fields.
+  all 41 tests after also exercising VG-extent-normalized COW allocation and
+  overflow rejection, captured `BigInt` intrinsics, distinct COW-allocation and
+  visible sizes, whitespace-padded LVM reports, and `dmsetup --columns` fields.
 - The changed serializable-store and runtime-controller suites passed 176
   tests, and the detached deployment suite passed 35 tests.
 - The unfiltered repository suite ran 3,534 tests: 3,497 passed, 36 skipped,

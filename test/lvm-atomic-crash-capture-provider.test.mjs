@@ -708,7 +708,11 @@ function lvsJson(rows) {
   });
 }
 
-function createCommandDriverFixture() {
+function createCommandDriverFixture({
+  observedCowAllocationBytes = "4",
+  requestedSnapshotSizeBytes = "4",
+  vgExtentSizeBytes = "4",
+} = {}) {
   const state = {
     calls: [],
     mode: "capture",
@@ -727,6 +731,7 @@ function createCommandDriverFixture() {
     lv_uuid: ORIGIN_LV_UUID,
     origin_uuid: "",
     snap_percent: "",
+    vg_extent_size: vgExtentSizeBytes,
   });
   const snapshotRow = () => {
     state.snapshotObservations += 1;
@@ -740,13 +745,15 @@ function createCommandDriverFixture() {
       lv_dm_path: "/dev/mapper/pcrvg-snapshot",
       lv_name: state.snapshotName,
       lv_path: "/dev/pcrvg/snapshot",
-      lv_size: mode === "cow-allocation" ? "5" : "4",
+      lv_size:
+        mode === "cow-allocation" ? "5" : observedCowAllocationBytes,
       lv_tags: `unrelated,${state.snapshotTag},metadata-churn`,
       lv_uuid: mode === "uuid" ? "SNAPSHOT-9999999999" : SNAPSHOT_LV_UUID,
       origin_uuid: mode === "origin" ? "ORIGIN-9999999999" : ORIGIN_LV_UUID,
       snap_percent:
         mode === "cow-full" ? "100.00" :
           benign && state.snapshotObservations % 2 === 0 ? "9.75" : "1.25",
+      vg_extent_size: vgExtentSizeBytes,
     };
   };
   const commandRunner = async (executable, args, options) => {
@@ -801,7 +808,7 @@ function createCommandDriverFixture() {
     resolveOrigin() {
       return exact({
         originLvUuid: ORIGIN_LV_UUID,
-        snapshotSizeBytes: "4",
+        snapshotSizeBytes: requestedSnapshotSizeBytes,
       });
     },
   });
@@ -846,6 +853,77 @@ test("fixed-command driver captures a stable read-only classic snapshot", async 
     fixture.state.calls.some(({ executable }) => !executable.startsWith("/")),
     false,
   );
+});
+
+test("driver binds VG-extent-rounded COW allocation before dispatch", async () => {
+  const fixture = createCommandDriverFixture({
+    observedCowAllocationBytes: "8",
+    requestedSnapshotSizeBytes: "5",
+    vgExtentSizeBytes: "4",
+  });
+  const request = captureRequest();
+  const binding = await fixture.driver.resolveProviderBinding(exact({ request }));
+
+  assert.equal(binding.snapshotSizeBytes, "8");
+  assert.equal(
+    fixture.state.calls.some(({ executable }) => executable === "/fixed/lvcreate"),
+    false,
+  );
+
+  await fixture.driver.captureSnapshot(exact({ providerBinding: binding, request }));
+  const lvcreate = fixture.state.calls.find(
+    ({ executable }) => executable === "/fixed/lvcreate",
+  );
+  assert.equal(lvcreate.args[lvcreate.args.indexOf("--size") + 1], "8B");
+});
+
+test("driver rejects COW extent rounding overflow before dispatch", async () => {
+  const fixture = createCommandDriverFixture({
+    requestedSnapshotSizeBytes: "18446744073709551615",
+    vgExtentSizeBytes: "4",
+  });
+
+  await assert.rejects(
+    fixture.driver.resolveProviderBinding(exact({ request: captureRequest() })),
+    assertUncertain,
+  );
+  assert.equal(
+    fixture.state.calls.some(({ executable }) => executable === "/fixed/lvcreate"),
+    false,
+  );
+});
+
+test("driver retains the captured BigInt intrinsic", async () => {
+  const fixture = createCommandDriverFixture();
+  const descriptor = Object.getOwnPropertyDescriptor(globalThis, "BigInt");
+  let hostileCalls = 0;
+  Object.defineProperty(globalThis, "BigInt", {
+    ...descriptor,
+    value() {
+      hostileCalls += 1;
+      return 1n;
+    },
+  });
+  try {
+    assert.throws(
+      () => assertLvmAtomicCrashCaptureProviderBinding(providerBinding({
+        snapshotSizeBytes: "18446744073709551616",
+      })),
+      LvmAtomicCrashCaptureProviderError,
+    );
+    const request = captureRequest();
+    const binding = await fixture.driver.resolveProviderBinding(exact({ request }));
+    const result = await fixture.driver.captureSnapshot(
+      exact({ providerBinding: binding, request }),
+    );
+    assert.equal(
+      await fixture.driver.verifySnapshot(exact({ providerBinding: binding, result })),
+      true,
+    );
+  } finally {
+    Object.defineProperty(globalThis, "BigInt", descriptor);
+  }
+  assert.equal(hostileCalls, 0);
 });
 
 test("driver verification separates persistent identity, content, and access policy", async (t) => {

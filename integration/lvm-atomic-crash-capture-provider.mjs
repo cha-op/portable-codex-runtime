@@ -76,7 +76,7 @@ const EXECUTABLES = Object.freeze({
   vgremove: process.env.LVM_VGREMOVE_EXECUTABLE ?? "/usr/sbin/vgremove",
 });
 const ORIGIN_SIZE_BYTES = 64 * 1024 * 1024;
-const SNAPSHOT_COW_BYTES = 16 * 1024 * 1024;
+const SNAPSHOT_COW_REQUEST_BYTES = 16 * 1024 * 1024 + 1;
 const BACKING_SIZE_BYTES = 160 * 1024 * 1024;
 const MAX_DIAGNOSTIC_TEXT_BYTES = 1024;
 const MAX_COMMAND_DIAGNOSTICS = 32;
@@ -438,7 +438,7 @@ test(
         assert.equal(presented.captureAttemptId, request.captureAttemptId);
         return exact({
           originLvUuid: persistentOriginUuid,
-          snapshotSizeBytes: String(SNAPSHOT_COW_BYTES),
+          snapshotSizeBytes: String(SNAPSHOT_COW_REQUEST_BYTES),
         });
       },
     });
@@ -508,7 +508,7 @@ test(
       assert.equal(captured.artifact.byteLength, String(ORIGIN_SIZE_BYTES));
       assert.notEqual(
         captured.artifact.byteLength,
-        String(SNAPSHOT_COW_BYTES),
+        String(SNAPSHOT_COW_REQUEST_BYTES),
       );
       assert.equal(snapshotLvcreateCalls, 1);
       assert.equal(authorityCalls, 1);

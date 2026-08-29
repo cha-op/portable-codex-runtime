@@ -18,7 +18,8 @@ const arrayFilterIntrinsic = Array.prototype.filter;
 const arrayIsArrayIntrinsic = Array.isArray;
 const arrayPushIntrinsic = Array.prototype.push;
 const arraySliceIntrinsic = Array.prototype.slice;
-const bigIntToStringIntrinsic = BigInt.prototype.toString;
+const BigIntConstructor = BigInt;
+const bigIntToStringIntrinsic = BigIntConstructor.prototype.toString;
 const bufferByteLengthIntrinsic = Buffer.byteLength;
 const bufferIsBufferIntrinsic = Buffer.isBuffer;
 const bufferToStringIntrinsic = Buffer.prototype.toString;
@@ -123,6 +124,7 @@ const LVS_ROW_KEYS = objectFreezeIntrinsic([
   "lv_uuid",
   "origin_uuid",
   "snap_percent",
+  "vg_extent_size",
 ]);
 const DEFAULT_EXECUTABLES = objectFreezeIntrinsic({
   blockdev: "/usr/sbin/blockdev",
@@ -434,19 +436,33 @@ function invokeNativePromise(receiver, method, input, code) {
   return pending;
 }
 
-function positiveUint64Decimal(value, code) {
+function positiveUint64BigInt(value, code) {
   ensure(
     typeof value === "string" && regexpTest(POSITIVE_DECIMAL_PATTERN, value),
     code,
   );
   let parsed;
   try {
-    parsed = BigInt(value);
+    parsed = callIntrinsic(BigIntConstructor, undefined, [value]);
   } catch {
     fail(code);
   }
   ensure(parsed > 0n && parsed <= UINT64_MAX, code);
+  return parsed;
+}
+
+function positiveUint64Decimal(value, code) {
+  positiveUint64BigInt(value, code);
   return value;
+}
+
+function roundUpUint64Decimal(value, alignment, code) {
+  const parsed = positiveUint64BigInt(value, code);
+  const quantum = positiveUint64BigInt(alignment, code);
+  const remainder = parsed % quantum;
+  const rounded = remainder === 0n ? parsed : parsed + (quantum - remainder);
+  ensure(rounded <= UINT64_MAX, code);
+  return callIntrinsic(bigIntToStringIntrinsic, rounded, []);
 }
 
 function opaqueLvmUuid(value, code) {
@@ -1277,7 +1293,7 @@ export function createLvmAtomicCrashCaptureDriver(options) {
       "b",
       "--nosuffix",
       "--options",
-      "lv_uuid,origin_uuid,lv_name,lv_path,lv_size,lv_attr,snap_percent,lv_tags,lv_dm_path",
+      "lv_uuid,origin_uuid,lv_name,lv_path,lv_size,lv_attr,snap_percent,lv_tags,lv_dm_path,vg_extent_size",
       "--select",
       selector,
     ]);
@@ -1414,6 +1430,10 @@ export function createLvmAtomicCrashCaptureDriver(options) {
         "lvm_atomic_crash_capture_outcome_uncertain",
       ),
       lvUuid: originLvUuid,
+      vgExtentSizeBytes: parseLvmSize(
+        rows[0].vg_extent_size,
+        "lvm_atomic_crash_capture_outcome_uncertain",
+      ),
     });
   };
 
@@ -1436,7 +1456,9 @@ export function createLvmAtomicCrashCaptureDriver(options) {
           bufferIsBufferIntrinsic(chunk) || chunk instanceof Uint8Array,
           "lvm_atomic_crash_capture_outcome_uncertain",
         );
-        bytes += BigInt(chunk.byteLength);
+        bytes += callIntrinsic(BigIntConstructor, undefined, [
+          chunk.byteLength,
+        ]);
         ensure(
           bytes <= UINT64_MAX,
           "lvm_atomic_crash_capture_outcome_uncertain",
@@ -1512,7 +1534,16 @@ export function createLvmAtomicCrashCaptureDriver(options) {
     } catch {
       fail("lvm_atomic_crash_capture_outcome_uncertain");
     }
-    return deterministicBinding(request, parseOriginResolution(raw));
+    const resolvedOrigin = parseOriginResolution(raw);
+    const observedOrigin = await observeOrigin(resolvedOrigin.originLvUuid);
+    return deterministicBinding(request, exactFrozenRecord({
+      originLvUuid: resolvedOrigin.originLvUuid,
+      snapshotSizeBytes: roundUpUint64Decimal(
+        resolvedOrigin.snapshotSizeBytes,
+        observedOrigin.vgExtentSizeBytes,
+        "lvm_atomic_crash_capture_outcome_uncertain",
+      ),
+    }));
   };
   objectFreezeIntrinsic(resolveProviderBinding);
 
@@ -1531,6 +1562,14 @@ export function createLvmAtomicCrashCaptureDriver(options) {
       record.providerBinding,
     );
     const origin = await observeOrigin(providerBinding.originLvUuid);
+    ensure(
+      roundUpUint64Decimal(
+        providerBinding.snapshotSizeBytes,
+        origin.vgExtentSizeBytes,
+        "lvm_atomic_crash_capture_outcome_uncertain",
+      ) === providerBinding.snapshotSizeBytes,
+      "lvm_atomic_crash_capture_outcome_uncertain",
+    );
     // Once lvcreate has been invoked, every failure is outcome-uncertain and
     // this driver deliberately performs no speculative snapshot deletion.
     await runCommand(executables.lvcreate, [

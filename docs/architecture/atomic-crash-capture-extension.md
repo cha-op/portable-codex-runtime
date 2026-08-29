@@ -205,8 +205,10 @@ acknowledgement loss cannot reopen physical dispatch.
 The dormant LVM wrapper delegates all seven base lifecycle methods and changes
 only its private capability snapshot to
 `atomicPointInTimeCheckpoint: true`. Before claiming, its injected origin
-resolver derives a deterministic classic-snapshot binding from a stable origin
-LV UUID and a COW allocation. After the claim, an injected authority consumer
+resolver supplies a stable origin LV UUID and requested COW byte count. The
+driver reads that origin's VG extent size, rounds the request upward without
+crossing uint64, and derives the deterministic classic-snapshot binding from
+the canonical COW allocation. After the claim, an injected authority consumer
 must authenticate the exact opaque stopped-writer authority and request in the
 same callback that performs the one permitted `lvcreate`.
 
@@ -217,10 +219,10 @@ policy requires both read-only LVM attributes and a read-only block device.
 The snapshot name, tag, origin UUID, active-valid classic-snapshot state, COW
 usage below 100 percent, device-mapper UUID, and a same-observation-window
 major/minor pair provide provider and attachment checks. COW allocation is not
-the snapshot's visible byte length: LVM reports the former for the snapshot LV
-and the driver matches it to the bound COW plan, while the read-only block
-device exposes the origin-sized latter and a complete stream confirms that
-artifact length.
+the snapshot's visible byte length: the VG extent size canonicalizes the former
+before durable admission, LVM must report that exact allocation for the
+snapshot LV, and the read-only block device exposes the origin-sized latter
+while a complete stream confirms that artifact length.
 
 Committed replay physically revalidates the retained LV before returning its
 result. Source-free verification reads only the catalogue and retained
