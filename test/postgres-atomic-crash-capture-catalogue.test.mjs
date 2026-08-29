@@ -637,6 +637,10 @@ test("catalogue persists exact canonical provider-binding JSON", async () => {
   assert.equal((await claim(fixture, request, binding)).outcome, "dispatch");
   const canonical = '{"a":["é",true],"z":0}';
   assert.equal(fixture.harness.trace[0].values[11], canonical);
+  assert.match(
+    fixture.harness.trace[0].text,
+    /\(\$12::pg_catalog\.text\)::pg_catalog\.jsonb, \$12::pg_catalog\.text/u,
+  );
   assert.equal(
     fixture.harness.rows.get(request.captureAttemptId).provider_binding_json,
     canonical,
