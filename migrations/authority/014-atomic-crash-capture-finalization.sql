@@ -10,6 +10,62 @@ LOCK TABLE session_authority.reservations IN ACCESS EXCLUSIVE MODE;
 
 LOCK TABLE session_authority.atomic_crash_captures IN ACCESS EXCLUSIVE MODE;
 
+-- Provider identities are globally unique, while the terminal blocker is
+-- session-scoped. Reject any legacy provider row that intersects a prepared
+-- capture's four physical identities without being that capture's exact,
+-- same-session request. Otherwise a row inserted after the version 13 handoff
+-- could survive this upgrade and permanently deny the intended provider row.
+DO $validate_atomic_crash_capture_operation_bindings$
+BEGIN
+  IF EXISTS (
+    SELECT 1
+    FROM session_authority.atomic_crash_captures AS provider
+    JOIN session_authority.operation_claims AS capture
+      ON capture.kind = 'atomic-crash-capture-v1'
+     AND (
+       provider.capture_attempt_id =
+         capture.request #>> '{payload,request,captureAttemptId}'
+       OR provider.operation_id =
+         capture.request #>>
+           '{payload,request,mutationRequest,operationId}'
+       OR provider.checkpoint_id =
+         capture.request #>> '{payload,request,checkpoint,checkpointId}'
+       OR provider.artifact_id =
+         capture.request #>> '{payload,request,checkpoint,artifactId}'
+     )
+    WHERE (
+      provider.capture_attempt_id =
+        capture.request #>> '{payload,request,captureAttemptId}'
+      AND provider.operation_id =
+        capture.request #>>
+          '{payload,request,mutationRequest,operationId}'
+      AND provider.checkpoint_id =
+        capture.request #>> '{payload,request,checkpoint,checkpointId}'
+      AND provider.artifact_id =
+        capture.request #>> '{payload,request,checkpoint,artifactId}'
+      AND provider.contract_version = 1
+      AND provider.backend_id =
+        capture.request #>> '{payload,request,storageRef,backendId}'
+      AND provider.session_id = capture.session_id::pg_catalog.text
+      AND provider.storage_id =
+        capture.request #>> '{payload,request,storageRef,storageId}'
+      AND provider.source_fencing_epoch::pg_catalog.text =
+        capture.request #>>
+          '{payload,request,checkpoint,sourceFencingEpoch}'
+      AND provider.request_json = capture.request #> '{payload,request}'
+      AND provider.claimed_at >= capture.created_at
+    ) IS NOT TRUE
+  )
+  THEN
+    RAISE EXCEPTION
+      'atomic crash-capture provider identity intersects another operation'
+      USING
+        ERRCODE = '23514',
+        CONSTRAINT = 'atomic_crash_captures_operation_identity_binding';
+  END IF;
+END
+$validate_atomic_crash_capture_operation_bindings$;
+
 -- The protected properties are the capture operation's object identity and
 -- request content, plus the reservation/session access-policy blocker. A
 -- provider timestamp is only an ordering signal after the exact provider row,
@@ -410,6 +466,14 @@ DECLARE
   affected_session_id uuid;
   old_session_id uuid;
   new_session_id uuid;
+  old_provider_capture_attempt_id text;
+  old_provider_operation_id text;
+  old_provider_checkpoint_id text;
+  old_provider_artifact_id text;
+  new_provider_capture_attempt_id text;
+  new_provider_operation_id text;
+  new_provider_checkpoint_id text;
+  new_provider_artifact_id text;
 BEGIN
   IF TG_OP <> 'INSERT' THEN
     old_session_id := OLD.session_id::pg_catalog.uuid;
@@ -418,12 +482,57 @@ BEGIN
     new_session_id := NEW.session_id::pg_catalog.uuid;
   END IF;
 
+  IF TG_TABLE_SCHEMA = 'session_authority'
+    AND TG_TABLE_NAME = 'atomic_crash_captures'
+  THEN
+    IF TG_OP <> 'INSERT' THEN
+      old_provider_capture_attempt_id := OLD.capture_attempt_id;
+      old_provider_operation_id := OLD.operation_id;
+      old_provider_checkpoint_id := OLD.checkpoint_id;
+      old_provider_artifact_id := OLD.artifact_id;
+    END IF;
+    IF TG_OP <> 'DELETE' THEN
+      new_provider_capture_attempt_id := NEW.capture_attempt_id;
+      new_provider_operation_id := NEW.operation_id;
+      new_provider_checkpoint_id := NEW.checkpoint_id;
+      new_provider_artifact_id := NEW.artifact_id;
+    END IF;
+  END IF;
+
   FOR affected_session_id IN
     SELECT candidate.session_id
     FROM (
       SELECT old_session_id AS session_id
       UNION
       SELECT new_session_id AS session_id
+      UNION
+      SELECT capture.session_id
+      FROM session_authority.operation_claims AS capture
+      WHERE capture.kind = 'atomic-crash-capture-v1'
+        AND (
+          old_provider_capture_attempt_id =
+            capture.request #>> '{payload,request,captureAttemptId}'
+          OR old_provider_operation_id =
+            capture.request #>>
+              '{payload,request,mutationRequest,operationId}'
+          OR old_provider_checkpoint_id =
+            capture.request #>>
+              '{payload,request,checkpoint,checkpointId}'
+          OR old_provider_artifact_id =
+            capture.request #>>
+              '{payload,request,checkpoint,artifactId}'
+          OR new_provider_capture_attempt_id =
+            capture.request #>> '{payload,request,captureAttemptId}'
+          OR new_provider_operation_id =
+            capture.request #>>
+              '{payload,request,mutationRequest,operationId}'
+          OR new_provider_checkpoint_id =
+            capture.request #>>
+              '{payload,request,checkpoint,checkpointId}'
+          OR new_provider_artifact_id =
+            capture.request #>>
+              '{payload,request,checkpoint,artifactId}'
+        )
     ) AS candidate
     WHERE candidate.session_id IS NOT NULL
   LOOP
@@ -596,7 +705,7 @@ BEGIN
                       capture.request #>>
                         '{payload,request,checkpoint,artifactId}'
                   )
-                  AND NOT (
+                  AND (
                     provider.capture_attempt_id =
                       capture.request #>>
                         '{payload,request,captureAttemptId}'
@@ -624,7 +733,7 @@ BEGIN
                     AND provider.request_json =
                       capture.request #> '{payload,request}'
                     AND provider.claimed_at >= capture.created_at
-                  )
+                  ) IS NOT TRUE
                 )
               )
               OR

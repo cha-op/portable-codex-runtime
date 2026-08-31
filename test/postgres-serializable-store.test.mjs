@@ -4235,11 +4235,23 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   );
   assert.match(
     captureFinalizationMigration.sql,
+    /DO \$validate_atomic_crash_capture_operation_bindings\$[\s\S]+provider\.request_json = capture\.request #> '\{payload,request\}'[\s\S]+provider\.claimed_at >= capture\.created_at[\s\S]+\) IS NOT TRUE[\s\S]+atomic_crash_captures_operation_identity_binding/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /TG_TABLE_SCHEMA = 'session_authority'[\s\S]+TG_TABLE_NAME = 'atomic_crash_captures'[\s\S]+SELECT capture\.session_id[\s\S]+capture\.kind = 'atomic-crash-capture-v1'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
     /provider\.request_json = OLD\.request #> '\{payload,request\}'[\s\S]+provider\.state = 'committed'[\s\S]+provider\.result_sha256 =[\s\S]+NEW\.result #>> '\{captureResultSha256\}'/u,
   );
   assert.match(
     captureFinalizationMigration.sql,
     /capture\.state = 'prepared'[\s\S]+capture_reservation\.state = 'prepared'[\s\S]+session\.document #>> '\{lifecycle\}' = 'DETACHED'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /capture\.state = 'prepared'[\s\S]+provider\.request_json =[\s\S]+capture\.request #> '\{payload,request\}'[\s\S]+provider\.claimed_at >= capture\.created_at[\s\S]+\) IS NOT TRUE/u,
   );
   assert.match(
     captureFinalizationMigration.sql,

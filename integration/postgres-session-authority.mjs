@@ -5470,6 +5470,100 @@ async function assertLegacyRestoreV2MigrationGate(
   );
 }
 
+async function assertAtomicCrashCaptureProviderBindingMigrationGate(
+  pool,
+  store,
+  trackedMigrations,
+) {
+  await pool.query("DROP SCHEMA IF EXISTS session_authority CASCADE");
+  await installAuthorityMigrations(pool, trackedMigrations.slice(0, 13));
+  const createVersionThirteenHandoff = async () => {
+    const authority = new PostgresSessionAuthority({
+      atomicCrashCaptureV1FleetCompatible: true,
+      store,
+      writerForceFenceV2FleetCompatible: true,
+    });
+    const sessionId = randomUUID();
+    const registered = await authority.registerSession(
+      registrationInput(sessionId),
+    );
+    const attached = await attachWriter(authority, registered);
+    const handoff = writerForceFenceAtomicCaptureInput(attached.session);
+    await authority.reserveOperation(handoff.input);
+    const starting = await authority.claimWriterForceFenceDispatch({
+      ...structuredClone(handoff.input),
+      expectedOperationRevision: "0",
+    });
+    await authority.finalizeWriterForceFenceAtomicCaptureHandoff({
+      ...structuredClone(handoff.input),
+      expectedOperationRevision: "1",
+      fenceResult: forceFenceEvidence(starting.fenceRequest),
+    });
+    return { authority, handoff };
+  };
+
+  const { authority, handoff } = await createVersionThirteenHandoff();
+
+  const crossedSessionId = randomUUID();
+  const crossedRegistered = await authority.registerSession(
+    registrationInput(crossedSessionId),
+  );
+  const crossedAttached = await attachWriter(authority, crossedRegistered);
+  const crossedProviderRequest = atomicCrashCaptureRequestForForceFence(
+    crossedAttached.session,
+    { captureAttemptId: handoff.atomicRequest.captureAttemptId },
+  );
+  const inserted = await insertAtomicCrashCaptureStartingRow(
+    pool,
+    crossedProviderRequest,
+  );
+  assert.equal(inserted.rowCount, 1);
+
+  await assert.rejects(store.migrate(), (error) => {
+    assert.ok(error instanceof PostgresSerializableStoreError);
+    assert.equal(error.code, "migration_failed");
+    assert.equal(error.commitState, "not-committed");
+    return true;
+  });
+  assert.deepEqual(
+    await readMigrationLedger(pool),
+    trackedMigrations.slice(0, 13).map(({ checksum, version }) => ({
+      checksum,
+      version,
+    })),
+  );
+  const absentProviderTrigger = await pool.query(
+    [
+      "SELECT count(*)::integer AS trigger_count",
+      "FROM pg_catalog.pg_trigger AS trigger",
+      "JOIN pg_catalog.pg_class AS relation",
+      "ON relation.oid = trigger.tgrelid",
+      "JOIN pg_catalog.pg_namespace AS namespace",
+      "ON namespace.oid = relation.relnamespace",
+      "WHERE namespace.nspname = 'session_authority'",
+      "AND relation.relname = 'atomic_crash_captures'",
+      "AND trigger.tgname =",
+      "'atomic_crash_captures_writer_fence_terminal_blocker'",
+      "AND trigger.tgisinternal = false",
+    ].join(" "),
+  );
+  assert.equal(absentProviderTrigger.rows[0].trigger_count, 0);
+
+  await pool.query("DROP SCHEMA session_authority CASCADE");
+  await installAuthorityMigrations(pool, trackedMigrations.slice(0, 13));
+  const exact = await createVersionThirteenHandoff();
+  const insertedExactProvider = await insertAtomicCrashCaptureStartingRow(
+    pool,
+    exact.handoff.atomicRequest,
+  );
+  assert.equal(insertedExactProvider.rowCount, 1);
+  assert.deepEqual(await store.migrate(), {
+    applied: true,
+    checksum: trackedMigrations.at(-1).checksum,
+    version: 14,
+  });
+}
+
 async function assertWriterSupervisorStateOwnerMigrationGate(
   pool,
   store,
@@ -8184,6 +8278,40 @@ function atomicCrashCaptureProviderBinding(request) {
   };
 }
 
+async function insertAtomicCrashCaptureStartingRow(queryable, request) {
+  const providerBinding = atomicCrashCaptureProviderBinding(request);
+  const providerBindingJson = canonicalJsonForPodmanFixture(providerBinding);
+  const requestJson = canonicalJsonForPodmanFixture(request);
+  return queryable.query(
+    [
+      "INSERT INTO session_authority.atomic_crash_captures",
+      "(capture_attempt_id, operation_id, checkpoint_id, artifact_id,",
+      "contract_version, backend_id, session_id, storage_id,",
+      "source_fencing_epoch, request_json, request_sha256,",
+      "provider_binding, provider_binding_json,",
+      "provider_binding_sha256, state, result_json, result_sha256)",
+      "VALUES ($1, $2, $3, $4, 1, $5, $6, $7,",
+      "$8::pg_catalog.numeric, $9::pg_catalog.jsonb, $10,",
+      "$11::pg_catalog.jsonb, $12, $13, 'starting', NULL, NULL)",
+    ].join(" "),
+    [
+      request.captureAttemptId,
+      request.mutationRequest.operationId,
+      request.checkpoint.checkpointId,
+      request.checkpoint.artifactId,
+      request.storageRef.backendId,
+      request.storageRef.sessionId,
+      request.storageRef.storageId,
+      request.checkpoint.sourceFencingEpoch,
+      requestJson,
+      sha256Text(requestJson),
+      providerBindingJson,
+      providerBindingJson,
+      sha256Text(providerBindingJson),
+    ],
+  );
+}
+
 function atomicCrashCaptureResult(request) {
   return {
     artifact: {
@@ -9452,6 +9580,11 @@ test(
       trackedMigrations,
     );
     await assertLegacyRestoreV2MigrationGate(
+      pool,
+      store,
+      trackedMigrations,
+    );
+    await assertAtomicCrashCaptureProviderBindingMigrationGate(
       pool,
       store,
       trackedMigrations,
@@ -11927,16 +12060,13 @@ test(
           },
         );
 
-        const assertDeferredBlockerTamperRejected = async (
-          query,
-          parameters,
-        ) => {
+        const assertDeferredBlockerActionRejected = async (action) => {
           const client = await pool.connect();
           let transactionOpen = false;
           try {
             await client.query("BEGIN");
             transactionOpen = true;
-            const changed = await client.query(query, parameters);
+            const changed = await action(client);
             assert.equal(changed.rowCount, 1);
             await assert.rejects(client.query("COMMIT"), (error) => {
               assert.equal(error.code, "23514");
@@ -11955,6 +12085,10 @@ test(
             client.release();
           }
         };
+        const assertDeferredBlockerTamperRejected = (query, parameters) =>
+          assertDeferredBlockerActionRejected((client) =>
+            client.query(query, parameters),
+          );
         await assertDeferredBlockerTamperRejected(
           [
             "UPDATE session_authority.reservations",
@@ -12044,6 +12178,44 @@ test(
         assertOperationReceipt(absentCapture, "prepared");
         assert.equal(absentCapture.providerState, "absent");
         assert.equal(absentCapture.captureResult, null);
+
+        const crossSessionProviderIdentityCases = [
+          {
+            captureAttemptId:
+              handoff.atomicRequest.captureAttemptId,
+          },
+          {
+            mutationOperationId:
+              handoff.atomicRequest.mutationRequest.operationId,
+          },
+          {
+            checkpointId:
+              handoff.atomicRequest.checkpoint.checkpointId,
+          },
+          {
+            artifactId:
+              handoff.atomicRequest.checkpoint.artifactId,
+          },
+        ];
+        for (const identityOverride of crossSessionProviderIdentityCases) {
+          const crossSessionProviderRequest =
+            atomicCrashCaptureRequestForForceFence(
+              crossedAttached.session,
+              identityOverride,
+            );
+          await assertDeferredBlockerActionRejected((client) =>
+            insertAtomicCrashCaptureStartingRow(
+              client,
+              crossSessionProviderRequest,
+            ),
+          );
+          assert.deepEqual(
+            await authority.readAtomicCrashCapture(
+              structuredClone(captureReadRequest),
+            ),
+            absentCapture,
+          );
+        }
 
         const crossedProviderRequest = structuredClone(
           handoff.atomicRequest,

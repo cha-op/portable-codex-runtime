@@ -3,7 +3,7 @@ id: 20260829-b6e2d4
 title: Physical-Fence LVM Capture Finalization
 status: completed
 created: 2026-08-29
-updated: 2026-08-29
+updated: 2026-08-31
 branch: wip/atomic-crash-capture-dispatch-reconcile
 pr:
 supersedes: []
@@ -44,7 +44,10 @@ superseded_by:
   capture is physically reverified and never redispatched.
 - Migration 14 permits only `prepared@0 -> committed@1` for the session
   capture, requires the independently committed provider row, and extends the
-  deferred reverse invariant to provider-row changes.
+  deferred reverse invariant to provider-row changes. A provider change
+  derives every affected capture session from all four globally unique
+  catalogue identities, while the v13-to-v14 migration rejects any legacy row
+  that intersects another capture without the complete exact binding.
 
 ## Protected Properties
 
