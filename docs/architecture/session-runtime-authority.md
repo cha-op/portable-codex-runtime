@@ -53,7 +53,8 @@ operation-ID claim and one active session reservation before any external
 dispatch can begin. The typed writer lifecycle turns the
 lease, attachment, detach, and force-fence records in
 `session-storage-contracts.mjs` into serializable decisions for
-`ATTACHING`, `ATTACHED`, `RELEASING`, `FENCING`, `BLOCKED`, and `DETACHED`.
+`ATTACHING`, `ATTACHED`, `RELEASING`, `FENCING`, `BLOCKED`, `DETACHED`, and
+`RECOVERY_REQUIRED`.
 The checkpoint slice binds stopped-writer clean capture to the operation,
 reservation, capture-attempt, tombstone, and catalogue tables. The migration
 chain also installs the permanent relational identities and constraints needed
@@ -74,8 +75,10 @@ Force-fence request V2 applies the same durable-handoff principle to a
 different authority source: it preclaims the independent atomic-capture
 operation before external fence dispatch, then one exact-proof finalization
 both detaches the old writer and materializes that capture as the session's
-active prepared blocker. This slice has no capture dispatch or blocker-release
-path, so the committed handoff remains fail-closed across restart.
+active prepared blocker. A separate private classic-LVM continuation now
+dispatches or source-free reconciles that exact capture and releases the
+reservation only into `RECOVERY_REQUIRED`, so both the prepared handoff and
+the committed artifact remain fail-closed across restart.
 Detached-destination activation can now materialize an executable prepared
 launch from a clean detached intent, and bounded no-relaunch recovery is
 implemented under the database-global shared/exclusive lifecycle guard and
@@ -513,16 +516,38 @@ creation. Readback derives the exact fence terminal document and changes only
 its active pointer to the prepared capture; the document version and complete
 fence `lastOperation` history cannot be substituted independently.
 
-This foundation does not authorize physical capture. It exposes no snapshot
-dispatch, source-free capture reconciliation, capture finalization, or release
-of the prepared blocker. It also adds no tail repair, writable restore,
-higher-epoch writer launch, provider selection, or public deployment wiring.
-Generic reserve, reconciliation, uncertainty, and pre-dispatch cancellation
-also reject the materialized atomic-capture kind; only the dedicated handoff
-readback can observe it. Consequently every successful version 2 handoff
-remains intentionally fail-closed until a separately reviewed continuation
-commits the exact atomic capture. Legacy force-fence behavior remains
-available without this handoff.
+The handoff itself does not authorize physical capture. Generic reserve,
+reconciliation, uncertainty, dispatch, and pre-dispatch cancellation continue
+to reject the materialized atomic-capture kind. A separate private continuation
+uses only `readAtomicCrashCapture()` and `finalizeAtomicCrashCapture()` around
+the independent atomic provider catalogue and LVM provider; those dedicated
+methods do not widen the generic lifecycle.
+
+The capture operation stays `prepared@0` while the provider catalogue is
+absent, `starting`, `uncertain`, or `committed`. The catalogue is the sole
+single-dispatch authority for the physical snapshot, while the session
+authority remains the sole writer-admission authority. An existing provider
+row therefore never authorizes another fresh dispatch. Reconciliation reads
+only committed retained-artifact evidence and cannot resolve or reopen the
+source attachment.
+
+Migration 14 admits only the direct session-authority transition
+`prepared@0 -> committed@1`. `finalizeAtomicCrashCapture()` is default-closed
+behind `atomicCrashCaptureV1FleetCompatible`, locks the complete relation,
+requires the exact committed provider request and result digest, commits the
+capture, releases its reservation, and changes the session to
+`RECOVERY_REQUIRED` in one serializable transaction. Finalizer acknowledgement
+loss reads back that exact terminal relation; it does not redispatch the
+provider.
+
+`RECOVERY_REQUIRED` is deliberately distinct from `DETACHED`. It has no
+lease, attachment, launch, or active operation, and its exact last-operation
+pointer names the committed atomic capture. Writer-acquire request validation
+accepts only `DETACHED`, so the released reservation cannot create a successor
+admission gap. Tail repair must later replace this terminal with its own
+explicit writable-copy authority before any higher-epoch writer may attach.
+Legacy force-fence behavior remains available without this handoff, and public
+deployment wiring remains unchanged.
 
 ## Implemented Provider-Backed Writer Detach Composition
 
@@ -607,7 +632,10 @@ Success therefore ends at `DETACHED` with the predetermined atomic capture in
 `prepared` as the active reservation. This composition does not dispatch a
 snapshot, release that blocker, repair a tail, or admit a successor. The ext4
 backend and public deployment retain their manual-fencing capability; the
-private adapter does not alter their discovery or runtime surface.
+private adapter does not alter their discovery or runtime surface. The
+separate private classic-LVM capture composition may consume this exact
+prepared handoff and finish at `RECOVERY_REQUIRED`; it remains outside this
+verified-stop adapter and public deployment.
 
 ## Implemented PostgreSQL Transaction Boundary
 
@@ -1021,8 +1049,10 @@ operation and a definite typed dispatch commit.
 
 For force-fence V2, `DETACHED` retains the separately materialized prepared
 capture as `activeOperation`; that session-conflicting reservation prevents
-acquisition until a future exact capture terminal explicitly releases it. This
-foundation contains no such release transition.
+acquisition. Exact committed and physically verified provider evidence may now
+finalize that capture into `RECOVERY_REQUIRED`, which remains non-writable even
+though the capture reservation is released. A future repair transition must
+establish the separate writable-copy gate before successor admission.
 
 ## Schema for Durable Claims and Reservations
 

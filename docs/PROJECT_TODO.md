@@ -338,11 +338,14 @@
   lifecycle state, pathname absence, and an unbound process exit remain
   non-evidence. The scope does not cover remote or unsupervised writers,
   block-device isolation, or host/controller/drive cache loss.
-- [pending] Dispatch and reconcile the exact prepared physical-fence-bound
-  atomic capture through a concrete provider, commit the artifact, and release
-  the durable blocker only from exact committed evidence. Keep current ext4
-  manual-fencing capabilities and public deployment unchanged until that path
-  is complete.
+- [done] Dispatch and reconcile the exact prepared physical-fence-bound atomic
+  capture through the private classic-LVM provider. The session capture remains
+  `prepared@0` across provider `starting`, `uncertain`, and committed crash
+  windows; exact source-free physical verification and the committed catalogue
+  result are both required before direct `committed@1` finalization. Release
+  enters `RECOVERY_REQUIRED`, which has no active writer tuple and rejects
+  successor admission until a later writable-copy repair transition. Current
+  ext4 manual-fencing capabilities and public deployment remain unchanged.
 - [pending] Add crash-prefix tail repair only on a separate writable
   generation, repair-gated restore/public recovery wiring, and subsequent
   writer admission under a strictly higher epoch and new lease.

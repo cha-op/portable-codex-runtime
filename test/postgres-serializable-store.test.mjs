@@ -89,6 +89,10 @@ const AUTHORITY_MIGRATION_URLS = Object.freeze([
     "../migrations/authority/013-writer-fence-atomic-capture-handoff.sql",
     import.meta.url,
   ),
+  new URL(
+    "../migrations/authority/014-atomic-crash-capture-finalization.sql",
+    import.meta.url,
+  ),
 ]);
 
 class FakeClient {
@@ -3991,13 +3995,16 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
   const operationIndexMigration = migrations[9];
   const latestMigration = migrations[10];
   const atomicCatalogueMigration = migrations[11];
-  const physicalFenceMigration = migrations.at(-1);
+  const physicalFenceMigration = migrations[12];
+  const captureFinalizationMigration = migrations.at(-1);
   const client = new FakeClient([
     {},
     {},
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
@@ -4034,7 +4041,7 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
 
   assert.deepEqual(result, {
     applied: true,
-    checksum: physicalFenceMigration.checksum,
+    checksum: captureFinalizationMigration.checksum,
     version: SESSION_AUTHORITY_MIGRATION_VERSION,
   });
   assert.equal(Object.isFrozen(result), true);
@@ -4119,7 +4126,12 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
     "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
     [13, physicalFenceMigration.checksum],
   ]);
-  assert.deepEqual(migrationQueries[32], ["COMMIT"]);
+  assert.deepEqual(migrationQueries[32], [captureFinalizationMigration.sql]);
+  assert.deepEqual(migrationQueries[33], [
+    "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+    [14, captureFinalizationMigration.checksum],
+  ]);
+  assert.deepEqual(migrationQueries[34], ["COMMIT"]);
   assert.deepEqual(client.queries.at(0), ["DISCARD ALL"]);
   assert.deepEqual(client.queries.at(-1), ["DISCARD ALL"]);
   assert.deepEqual(client.releaseCalls, [[]]);
@@ -4205,6 +4217,58 @@ test("migrate applies the checksum-bound migration chain in one transaction", as
       ),
     );
   }
+  assert.match(
+    captureFinalizationMigration.sql,
+    /CREATE OR REPLACE FUNCTION session_authority\.enforce_writer_fence_atomic_capture_materialization/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /OLD\.state = 'prepared'[\s\S]+OLD\.revision = 0[\s\S]+NEW\.state = 'committed'[\s\S]+NEW\.revision = 1/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /NEW\.result #>> '\{outcome\}' = 'atomic-crash-captured'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /ADD CONSTRAINT atomic_crash_captures_result_sha256_exact[\s\S]+result_json - ARRAY\[[\s\S]+'artifact'[\s\S]+'storageId'[\s\S]+\(result_json -> 'artifact'\) - ARRAY\[[\s\S]+'byteLength'[\s\S]+'readOnly'[\s\S]+result_sha256 = pg_catalog\.encode\([\s\S]+pg_catalog\.sha256\([\s\S]+pg_catalog\.convert_to\(/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /DO \$validate_atomic_crash_capture_operation_bindings\$[\s\S]+provider\.request_json = capture\.request #> '\{payload,request\}'[\s\S]+provider\.claimed_at >= capture\.created_at[\s\S]+\) IS NOT TRUE[\s\S]+atomic_crash_captures_operation_identity_binding/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /TG_TABLE_SCHEMA = 'session_authority'[\s\S]+TG_TABLE_NAME = 'atomic_crash_captures'[\s\S]+SELECT capture\.session_id[\s\S]+capture\.kind = 'atomic-crash-capture-v1'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /provider\.request_json = OLD\.request #> '\{payload,request\}'[\s\S]+provider\.state = 'committed'[\s\S]+provider\.result_sha256 =[\s\S]+NEW\.result #>> '\{captureResultSha256\}'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /capture\.state = 'prepared'[\s\S]+capture_reservation\.state = 'prepared'[\s\S]+session\.document #>> '\{lifecycle\}' = 'DETACHED'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /capture\.state = 'prepared'[\s\S]+provider\.request_json =[\s\S]+capture\.request #> '\{payload,request\}'[\s\S]+provider\.claimed_at >= capture\.created_at[\s\S]+\) IS NOT TRUE/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /capture\.state = 'committed'[\s\S]+capture_reservation\.state = 'released'[\s\S]+session\.document #>> '\{lifecycle\}' =[\s\S]+'RECOVERY_REQUIRED'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /'\{"captureResultSha256":"' \|\|\s*\(capture\.result #>> '\{captureResultSha256\}'\) \|\|/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /provider\.request_json =[\s\S]+capture\.request #> '\{payload,request\}'[\s\S]+provider\.result_sha256 =[\s\S]+capture\.result #>> '\{captureResultSha256\}'/u,
+  );
+  assert.match(
+    captureFinalizationMigration.sql,
+    /AFTER INSERT OR UPDATE OR DELETE ON session_authority\.atomic_crash_captures[\s\S]+DEFERRABLE INITIALLY DEFERRED/u,
+  );
   assert.match(
     migrations[1].sql,
     /state IN \('authorized', 'committed'\)/u,
@@ -5047,6 +5111,8 @@ test("migrate destroys a client when its post-COMMIT reset fails", async () => {
       {},
       {},
       {},
+      {},
+      {},
       COMMIT_RESULT,
     ],
     { resetSteps: [DISCARD_RESULT, resetFailure] },
@@ -5103,7 +5169,7 @@ test("migrate accepts the exact installed checksum without reapplying SQL", asyn
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v1 ledger through v13", async () => {
+test("migrate upgrades an exact v1 ledger through v14", async () => {
   const migrations = await readAuthorityMigrations();
   const firstMigration = migrations[0];
   const latestMigration = migrations.at(-1);
@@ -5120,6 +5186,8 @@ test("migrate upgrades an exact v1 ledger through v13", async () => {
         },
       ],
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -5211,6 +5279,11 @@ test("migrate upgrades an exact v1 ledger through v13", async () => {
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[11].version, migrations[11].checksum],
     ],
+    [migrations[12].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[12].version, migrations[12].checksum],
+    ],
     [latestMigration.sql],
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
@@ -5222,7 +5295,7 @@ test("migrate upgrades an exact v1 ledger through v13", async () => {
   client.assertExhausted();
 });
 
-test("migrate upgrades an exact v2 ledger through v13", async () => {
+test("migrate upgrades an exact v2 ledger through v14", async () => {
   const migrations = await readAuthorityMigrations();
   const latestMigration = migrations.at(-1);
   const client = new FakeClient([
@@ -5236,6 +5309,8 @@ test("migrate upgrades an exact v2 ledger through v13", async () => {
         version,
       })),
     },
+    {},
+    {},
     {},
     {},
     {},
@@ -5319,6 +5394,11 @@ test("migrate upgrades an exact v2 ledger through v13", async () => {
     [
       "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
       [migrations[11].version, migrations[11].checksum],
+    ],
+    [migrations[12].sql],
+    [
+      "INSERT INTO session_authority.schema_migrations (version, checksum, applied_at) VALUES ($1, $2, pg_catalog.transaction_timestamp())",
+      [migrations[12].version, migrations[12].checksum],
     ],
     [latestMigration.sql],
     [
@@ -5664,6 +5744,8 @@ test("migrate rejects a COMMIT acknowledgement that reports ROLLBACK", async () 
     {},
     {},
     {},
+    {},
+    {},
     { command: "ROLLBACK" },
   ]);
   const store = new PostgresSerializableStore({
@@ -5687,6 +5769,8 @@ test("migrate treats a failed COMMIT as uncertain and never reapplies", async ()
     {},
     {},
     { rows: [] },
+    {},
+    {},
     {},
     {},
     {},
